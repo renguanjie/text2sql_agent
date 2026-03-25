@@ -1,0 +1,1884 @@
+{
+  "employees": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "name",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "email",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "department",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "position",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "join_date",
+        "type": "TIMESTAMP",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "users": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "username",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "email",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "hashed_password",
+        "type": "VARCHAR(255)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "full_name",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "is_active",
+        "type": "BOOLEAN",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "is_superuser",
+        "type": "BOOLEAN",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "uploaded_files": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "filename",
+        "type": "VARCHAR(255)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "original_filename",
+        "type": "VARCHAR(255)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "file_path",
+        "type": "VARCHAR(500)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "file_size",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "content_type",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "description",
+        "type": "VARCHAR(500)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "owner_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": [
+      {
+        "constrained_columns": [
+          "owner_id"
+        ],
+        "referred_table": "users",
+        "referred_columns": [
+          "id"
+        ]
+      }
+    ]
+  },
+  "bank_customer": {
+    "columns": [
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_name",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "id_card",
+        "type": "VARCHAR(18)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "phone",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "email",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "gender",
+        "type": "VARCHAR(2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "age",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "city",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "province",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "occupation",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "income_level",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "education",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "marital_status",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "customer_level",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "register_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "last_login_date",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "customer_interaction": {
+    "columns": [
+      {
+        "name": "interaction_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "interaction_type",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "interaction_channel",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "interaction_date",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "duration_seconds",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "content_summary",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "sentiment_score",
+        "type": "NUMERIC(3, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "follow_up_required",
+        "type": "BOOLEAN",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "staff_id",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "branch_code",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": [
+      {
+        "constrained_columns": [
+          "customer_id"
+        ],
+        "referred_table": "bank_customer",
+        "referred_columns": [
+          "customer_id"
+        ]
+      }
+    ]
+  },
+  "business_transaction": {
+    "columns": [
+      {
+        "name": "transaction_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "product_id",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "transaction_type",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "amount",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "transaction_date",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "channel",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "fee",
+        "type": "NUMERIC(10, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "staff_id",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "branch_code",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "notes",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": [
+      {
+        "constrained_columns": [
+          "customer_id"
+        ],
+        "referred_table": "bank_customer",
+        "referred_columns": [
+          "customer_id"
+        ]
+      },
+      {
+        "constrained_columns": [
+          "product_id"
+        ],
+        "referred_table": "financial_product",
+        "referred_columns": [
+          "product_id"
+        ]
+      }
+    ]
+  },
+  "financial_product": {
+    "columns": [
+      {
+        "name": "product_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "product_name",
+        "type": "VARCHAR(200)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "product_code",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "product_type",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "risk_level",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "expected_return",
+        "type": "NUMERIC(5, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "min_amount",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "max_amount",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "term_days",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "currency",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "issue_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "maturity_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "description",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "customer_account": {
+    "columns": [
+      {
+        "name": "account_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "account_number",
+        "type": "VARCHAR(30)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "account_type",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "currency",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "balance",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "open_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "last_transaction_date",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": [
+      {
+        "constrained_columns": [
+          "customer_id"
+        ],
+        "referred_table": "bank_customer",
+        "referred_columns": [
+          "customer_id"
+        ]
+      }
+    ]
+  },
+  "customer_tag_mapping": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "tag_codes",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "tag_names",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "match_score",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "bank_product": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "product_code",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "product_name",
+        "type": "VARCHAR(200)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "product_type",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "sub_type",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "risk_level",
+        "type": "VARCHAR(10)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "expected_return",
+        "type": "NUMERIC(10, 4)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "min_amount",
+        "type": "NUMERIC(20, 2)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "max_amount",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "term_days",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "currency",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "issue_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "maturity_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "description",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "features",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "target_customer",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "interest_rate",
+        "type": "NUMERIC(10, 4)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "fee_rate",
+        "type": "NUMERIC(10, 4)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_by",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "remarks",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "bank_branch_activity": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "activity_code",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "activity_name",
+        "type": "VARCHAR(200)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "activity_type",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "theme",
+        "type": "VARCHAR(200)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "start_time",
+        "type": "TIMESTAMP",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "end_time",
+        "type": "TIMESTAMP",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "branch_name",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "branch_code",
+        "type": "VARCHAR(20)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "target_customer",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "min_customer_level",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "description",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "speaker",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "max_participants",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "current_participants",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "registration_method",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "registration_deadline",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "activity_status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "contact_person",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "contact_phone",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_by",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "remarks",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "user_credit_report": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "report_no",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "report_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "name",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "id_card",
+        "type": "VARCHAR(18)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "id_card_type",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "phone",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "work_unit",
+        "type": "VARCHAR(200)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "occupation",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "annual_income",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "marital_status",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "address",
+        "type": "VARCHAR(200)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "credit_score",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "credit_level",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "total_loan_amount",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "total_loan_balance",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "total_credit_limit",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "total_card_used",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "overdue_count",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "query_count_3m",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "query_count_6m",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "public_record_count",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "has_doubt_record",
+        "type": "BOOLEAN",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "risk_level",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "report_summary",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "credit_loan_records": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "loan_type",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "loan_amount",
+        "type": "NUMERIC(15, 2)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "loan_balance",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "loan_currency",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "start_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "end_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "loan_status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "monthly_payment",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "overdue_times",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "max_overdue_level",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "five_year_history",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "loan_org",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "credit_card_records": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "card_type",
+        "type": "VARCHAR(20)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "card_brand",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "open_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "credit_limit",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "used_amount",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "card_status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "overdue_times",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "max_overdue_level",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "six_month_avg_used",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "repayment_history",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "card_org",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "credit_query_records": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "query_date",
+        "type": "DATE",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "query_org",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "query_reason",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "credit_public_records": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "record_type",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "record_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "record_amount",
+        "type": "NUMERIC(15, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "record_status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "record_org",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "customer_sessions": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_name",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "customer_level",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "age_group",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "session_date",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "channel",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "conversation_type",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "content",
+        "type": "TEXT",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "agent_id",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "agent_response",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "sentiment_score",
+        "type": "NUMERIC(3, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "follow_up_required",
+        "type": "BOOLEAN",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "bank_wechat_sop_tags_v2": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "tag_code",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "tag_name",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "category",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "sub_category",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "description",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "applicable_scenario",
+        "type": "VARCHAR(300)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "target_customer",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "priority",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "usage_count",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_by",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "remarks",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": []
+  },
+  "corporate_customer": {
+    "columns": [
+      {
+        "name": "id",
+        "type": "INTEGER",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "customer_id",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "customer_no",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "company_name",
+        "type": "VARCHAR(200)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "unified_social_credit_code",
+        "type": "VARCHAR(20)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "company_type",
+        "type": "VARCHAR(50)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "industry",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "sub_industry",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "registered_capital",
+        "type": "NUMERIC(20, 2)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "paid_in_capital",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "establishment_date",
+        "type": "DATE",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "registration_address",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "business_address",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "business_scope",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "legal_representative",
+        "type": "VARCHAR(100)",
+        "nullable": false,
+        "comment": null
+      },
+      {
+        "name": "legal_rep_id_card",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "legal_rep_phone",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "financial_contact",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "financial_phone",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "financial_email",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "annual_revenue",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "annual_profit",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "total_assets",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "total_liabilities",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "employee_count",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "basic_account_no",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "basic_account_bank",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "account_balance",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "credit_line",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "used_credit",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "loan_balance",
+        "type": "NUMERIC(20, 2)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "credit_rating",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "internal_rating",
+        "type": "VARCHAR(10)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "risk_level",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "risk_score",
+        "type": "INTEGER",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "customer_level",
+        "type": "VARCHAR(50)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "kyc_status",
+        "type": "VARCHAR(20)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "kyc_date",
+        "type": "DATE",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "updated_at",
+        "type": "TIMESTAMP",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "created_by",
+        "type": "VARCHAR(100)",
+        "nullable": true,
+        "comment": null
+      },
+      {
+        "name": "remarks",
+        "type": "TEXT",
+        "nullable": true,
+        "comment": null
+      }
+    ],
+    "foreign_keys": [
+      {
+        "constrained_columns": [
+          "customer_id"
+        ],
+        "referred_table": "bank_customer",
+        "referred_columns": [
+          "customer_id"
+        ]
+      }
+    ]
+  }
+}
