@@ -1,0 +1,88 @@
+{
+  "timestamp": "2026-03-22T20:53:50.481948",
+  "total": 10,
+  "success": 10,
+  "failed": 0,
+  "results": [
+    {
+      "query": "查询所有客户的基本信息",
+      "success": true,
+      "sql": "SELECT \n    customer_id, \n    customer_name, \n    gender, \n    age, \n    marital_status, \n    occupation, \n    education, \n    income_level, \n    phone, \n    email, \n    city, \n    province, \n    register_date, \n    last_login_date, \n    status, \n    customer_level\nFROM \n    bank_customer",
+      "rows": 524,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "查找高收入水平的客户",
+      "success": true,
+      "sql": "SELECT customer_id, customer_name, income_level\nFROM bank_customer\nWHERE income_level = '高收入'",
+      "rows": 0,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "统计每个城市的客户数量",
+      "success": true,
+      "sql": "SELECT city, COUNT(*) AS customer_count\nFROM bank_customer\nGROUP BY city",
+      "rows": 16,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "查询客户及其账户信息",
+      "success": true,
+      "sql": "SELECT \n    bc.customer_id,\n    bc.customer_name,\n    bc.email,\n    bc.phone,\n    ca.account_id,\n    ca.account_number,\n    ca.account_type,\n    ca.balance,\n    ca.currency,\n    ca.open_date,\n    ca.status\nFROM \n    bank_customer bc\nJOIN \n    customer_account ca ON bc.customer_id = ca.customer_id",
+      "rows": 1037,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "查找有贷款记录的客户",
+      "success": true,
+      "sql": "SELECT DISTINCT bc.customer_id, bc.customer_name\nFROM bank_customer bc\nJOIN credit_loan_records clr ON bc.customer_id = clr.customer_id",
+      "rows": 348,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "查询客户的信用卡额度和使用情况",
+      "success": true,
+      "sql": "SELECT \n    c.customer_name,\n    cc.credit_limit,\n    cc.used_amount,\n    cc.six_month_avg_used\nFROM \n    bank_customer c\nJOIN \n    credit_card_records cc ON c.customer_id = cc.customer_id",
+      "rows": 1398,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "统计每个客户等级的平均贷款余额",
+      "success": true,
+      "sql": "SELECT \n    bc.customer_level, \n    AVG(clr.loan_balance) AS avg_loan_balance\nFROM \n    bank_customer bc\nJOIN \n    credit_loan_records clr ON bc.customer_id = clr.customer_id\nGROUP BY \n    bc.customer_level",
+      "rows": 5,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "查找年营收超过 1000 万的企业客户及其法定代表人",
+      "success": true,
+      "sql": "SELECT \n    c.company_name, \n    c.legal_representative\nFROM \n    corporate_customer c\nWHERE \n    c.annual_revenue > 10000000",
+      "rows": 18,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "查询近 3 个月有交易记录的客户",
+      "success": true,
+      "sql": "SELECT DISTINCT bc.customer_id\nFROM bank_customer bc\nJOIN business_transaction bt ON bc.customer_id = bt.customer_id\nWHERE bt.transaction_date >= CURRENT_DATE - INTERVAL '3 months'",
+      "rows": 262,
+      "tables_matched": false,
+      "content_matched": true
+    },
+    {
+      "query": "查询信用评分低于 600 的客户及其贷款记录",
+      "success": true,
+      "sql": "SELECT \n    bc.customer_id,\n    bc.customer_name,\n    clr.loan_amount,\n    clr.loan_balance,\n    clr.loan_type,\n    clr.loan_status,\n    clr.start_date,\n    clr.end_date\nFROM \n    bank_customer bc\nJOIN \n    user_credit_report ucr ON bc.customer_id = ucr.customer_id\nJOIN \n    credit_loan_records clr ON bc.customer_id = clr.customer_id\nWHERE \n    ucr.credit_score < 600",
+      "rows": 0,
+      "tables_matched": false,
+      "content_matched": true
+    }
+  ]
+}
