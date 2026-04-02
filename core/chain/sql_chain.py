@@ -73,7 +73,26 @@ class SQLGenerationChain:
 
             # 4. 调用 LLM
             logger.info(f"调用 LLM 生成 SQL, query={user_query[:50]}...")
-            response = self.llm.invoke(messages)
+
+            # 增加重试机制
+            max_retries = 2
+            retry_count = 0
+            last_error = None
+
+            while retry_count <= max_retries:
+                try:
+                    response = self.llm.invoke(messages)
+                    break  # 成功则退出循环
+                except Exception as e:
+                    retry_count += 1
+                    last_error = e
+                    if retry_count <= max_retries:
+                        logger.warning(f"LLM 调用失败，第 {retry_count} 次重试...: {e}")
+                        import time
+                        time.sleep(1 * retry_count)  # 递增延迟
+                    else:
+                        logger.error(f"LLM 调用失败，已重试 {max_retries} 次：{e}")
+                        raise
 
             # 5. 提取 SQL 和思考过程
             sql = self._extract_sql(response.content)

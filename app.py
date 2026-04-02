@@ -15,8 +15,7 @@ from config import (
     NEO4J_ENABLED, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE,
     LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL,
     RETRIEVAL_TOP_K, SQL_DIALECT,
-    BM25_K1, BM25_B, TFIDF_MAX_FEATURES,
-    BM25_WEIGHT, TFIDF_WEIGHT, DENSE_WEIGHT,
+    BM25_K1, BM25_B, BM25_WEIGHT, DENSE_WEIGHT,
     FAISS_ENABLED, FAISS_EMBEDDING_DIM, FAISS_INDEX_TYPE,
     EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_API_KEY,
     FEW_SHOT_ENABLED, FEW_SHOT_TOP_K,
@@ -47,7 +46,7 @@ st.set_page_config(
     menu_items={
         'Get Help': 'https://github.com/renguanjie/text2sql-agent',
         'Report a bug': 'https://github.com/renguanjie/text2sql-agent/issues',
-        'About': '# Text2SQL 智能体\n基于本地知识库的 SQL 智能生成系统\n\n核心技术：BM25+TF-IDF 检索 + LangChain + SQLFluff'
+        'About': '# Text2SQL 智能体\n基于本地知识库的 SQL 智能生成系统\n\n核心技术：BM25+FAISS 检索 + LangChain + SQLFluff'
     }
 )
 
@@ -143,7 +142,6 @@ if 'last_result' not in st.session_state:
 
 
 # ==================== 初始化函数 ====================
-@st.cache_resource
 def initialize_system():
     """初始化系统组件"""
     logger.info("开始初始化系统...")
@@ -200,14 +198,12 @@ def initialize_system():
     )
     logger.info(f"Embedding 工厂初始化：{EMBEDDING_PROVIDER}/{EMBEDDING_MODEL}")
 
-    # 5. 创建知识检索器 - 三路混合检索 (BM25 + TF-IDF + FAISS)
+    # 5. 创建知识检索器 - 混合检索 (BM25 + FAISS)
     knowledge_retriever = KnowledgeRetriever(
         config={
             'bm25_k1': BM25_K1,
             'bm25_b': BM25_B,
-            'tfidf_max_features': TFIDF_MAX_FEATURES,
             'bm25_weight': BM25_WEIGHT,
-            'tfidf_weight': TFIDF_WEIGHT,
             'dense_weight': DENSE_WEIGHT,
             'embedding_dim': FAISS_EMBEDDING_DIM,
             'index_type': FAISS_INDEX_TYPE if FAISS_ENABLED else None,
@@ -277,7 +273,8 @@ def initialize_system():
             'enable_rewrite': False,
             'few_shot_enabled': FEW_SHOT_ENABLED,
             'few_shot_top_k': FEW_SHOT_TOP_K
-        }
+        },
+        neo4j_client=neo4j_client
     )
 
     st.session_state.sql_generator = generator
@@ -319,15 +316,28 @@ with st.sidebar:
         st.caption(f"{'已启用' if FEW_SHOT_ENABLED else '禁用'} (top {FEW_SHOT_TOP_K})")
     else:
         st.warning("⚠️ 系统未初始化")
-        if st.button("🚀 初始化系统", use_container_width=True, type="primary"):
-            with st.spinner("初始化中..."):
-                initialize_system()
-                if st.session_state.initialized:
-                    st.success("✅ 初始化成功!")
-                    st.rerun()
+        # 自动初始化
+        with st.spinner("正在初始化系统..."):
+            init_result = initialize_system()
+            if init_result:
+                st.success("✅ 初始化成功!")
+                st.rerun()
+            else:
+                st.error("初始化失败，请检查配置")
 
     st.divider()
-    
+
+    # 重新初始化系统按钮
+    if st.button("🔄 重新初始化系统", use_container_width=True, type="secondary"):
+        # 清除所有相关状态
+        for key in ['initialized', 'sql_generator', 'neo4j_client', 'mysql_client']:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.success("系统状态已重置，正在重新初始化...")
+        st.rerun()
+
+    st.divider()
+
     # 会话信息
     st.markdown("### 💬 会话信息")
     st.code(f"{st.session_state.session_id[:12]}...", language="text")
@@ -343,16 +353,113 @@ with st.sidebar:
         st.metric("会话数", len(st.session_state.get('history', [])))
 
     st.divider()
-    
+
+    # 知识库管理
+    st.markdown("### 🗄️ 知识库管理")
+
+    if NEO4J_ENABLED and hasattr(st.session_state, 'neo4j_client') and st.session_state.neo4j_client:
+        # 获取知识库统计
+        try:
+            stats = st.session_state.neo4j_client.execute_query("""
+                MATCH (n)
+                OPTIONAL MATCH ()-[r]-()
+                RETURN
+                    count(DISTINCT n) as nodes,
+                    count(r) as relationships
+            """)
+            if stats:
+                st.caption(f"节点：{stats[0].get('nodes', 0)} | 关系：{stats[0].get('relationships', 0)}")
+        except Exception as e:
+            st.caption(f"无法获取知识库统计")
+
+        # 导出/导入按钮
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📤 导出", use_container_width=True, type="secondary"):
+                if st.session_state.initialized and st.session_state.neo4j_client:
+                    with st.spinner("正在导出知识库..."):
+                        export_data = st.session_state.neo4j_client.export_knowledge_graph()
+                        if export_data:
+                            import json
+                            json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+                            st.download_button(
+                                label="📥 点击下载 JSON 文件",
+                                data=json_str,
+                                file_name=f"knowledge_graph_{st.session_state.session_id[:8]}.json",
+                                mime="application/json",
+                                use_container_width=True
+                            )
+        with col2:
+            if st.button("📥 导入", use_container_width=True, type="secondary"):
+                pass  # 导入由下面的文件上传处理
+
+        # 文件上传导入
+        uploaded_file = st.file_uploader(
+            "上传知识库 JSON 文件",
+            type=["json"],
+            accept_multiple_files=False,
+            help="上传之前导出的知识库 JSON 文件进行恢复"
+        )
+
+        if uploaded_file is not None:
+            if st.checkbox("✓ 我已了解风险，确认导入将覆盖现有知识图谱", key="confirm_import_kg"):
+                with st.spinner("正在导入知识库..."):
+                    try:
+                        import json
+                        content = uploaded_file.read().decode('utf-8')
+                        import_data = json.loads(content)
+                        result = st.session_state.neo4j_client.import_knowledge_graph(import_data)
+                        if "error" in result:
+                            st.error(f"导入失败：{result['error']}")
+                        else:
+                            st.success(f"✅ 导入完成：{result['nodes']} 个节点，{result['relationships']} 个关系")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"导入失败：{e}")
+
+        # 清除知识库按钮
+        col_clear1, col_clear2 = st.columns([3, 1])
+        with col_clear1:
+            # 初始化 checkbox 状态
+            if "confirm_clear_kg" not in st.session_state:
+                st.session_state.confirm_clear_kg = False
+            clear_confirm = st.checkbox("✓ 确认清除", key="confirm_clear_kg",
+                                        help="勾选后点击清除按钮将删除所有知识图谱数据")
+        with col_clear2:
+            clear_btn = st.button("🗑️ 清除知识库", use_container_width=True, type="secondary",
+                                 disabled=not clear_confirm)
+
+        if clear_btn:
+            if st.session_state.initialized and st.session_state.neo4j_client:
+                with st.spinner("正在清除知识库..."):
+                    result = st.session_state.neo4j_client.clear_knowledge_graph()
+                    if "error" in result:
+                        st.error(f"清除失败：{result['error']}")
+                    else:
+                        st.success(f"✅ 已删除 {result['nodes']} 个节点，{result['relationships']} 个关系")
+                        # 清除所有相关状态
+                        for key in ['initialized', 'sql_generator', 'neo4j_client', 'mysql_client']:
+                            if key in st.session_state:
+                                del st.session_state[key]
+                        # 重置确认框状态
+                        if "confirm_clear_kg" in st.session_state:
+                            del st.session_state.confirm_clear_kg
+                        st.success("知识库已清除，系统将重新初始化...")
+                        st.rerun()
+    else:
+        st.caption("Neo4j 未启用")
+
+    st.divider()
+
     # 关于
     st.markdown("### ℹ️ 关于")
     st.markdown("""
     **Text2SQL 智能体 v1.0**
-    
+
     基于本地知识库的 SQL 智能生成系统
-    
+
     **核心技术**:
-    - 🔍 BM25 + TF-IDF 混合检索
+    - 🔍 BM25 + FAISS 混合检索
     - 🤖 LangChain + LLM 智能生成
     - ✅ SQLFluff 语法校验
     - 💾 Neo4j/MySQL 双模式
@@ -368,14 +475,46 @@ st.markdown('<p class="main-title">📊 Text2SQL 智能体</p>', unsafe_allow_ht
 st.markdown('<p class="subtitle">基于本地知识库的 SQL 智能生成系统</p>', unsafe_allow_html=True)
 
 # 选项卡
-tab1, tab2, tab3 = st.tabs(["🔮 SQL 生成", "📜 执行历史", "ℹ️ 系统信息"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔮 SQL 生成", "📜 执行历史", "🏗️ 知识图谱构建", "ℹ️ 系统信息"])
 
 # ==================== Tab 1: SQL 生成 ====================
 with tab1:
     # 输入区域 - 使用卡片样式
     st.markdown("### 📝 自然语言转 SQL")
-    
-    col1, col2 = st.columns([3, 1])
+
+    # 数据库选择
+    db_options = []
+    db_labels = []
+    if st.session_state.initialized and hasattr(st.session_state, 'neo4j_client') and st.session_state.neo4j_client:
+        try:
+            db_list = st.session_state.neo4j_client.get_database_list()
+            db_options = [db["database_id"] for db in db_list]
+            db_labels = [f"{db['name']} ({db['db_type']})" for db in db_list]
+        except Exception as e:
+            logger.warning(f"获取数据库列表失败：{e}")
+
+    col_db, col1, col2 = st.columns([1, 2, 1])
+
+    with col_db:
+        if db_options:
+            # 默认选择第一个数据库
+            default_idx = 0
+            selected_db_label = st.selectbox(
+                "🗄️ 选择数据库",
+                options=db_labels,
+                index=default_idx if len(db_labels) > 0 else 0,
+                key="selected_database",
+                help="选择要查询的数据库，系统将生成对应语法的 SQL"
+            )
+            # 获取选中的数据库 ID
+            selected_idx = db_labels.index(selected_db_label)
+            selected_db_id = db_options[selected_idx]
+            selected_db_info = next((db for db in db_list if db["database_id"] == selected_db_id), None)
+            selected_db_type = selected_db_info["db_type"] if selected_db_info else "mysql"
+        else:
+            st.selectbox("🗄️ 选择数据库", options=["暂无数据库"], disabled=True)
+            selected_db_id = None
+            selected_db_type = "mysql"
 
     with col1:
         user_query = st.text_area(
@@ -403,7 +542,7 @@ with tab1:
     # 生成按钮
     st.markdown("")  # 间距
     col1, col2, col3 = st.columns([1, 1, 1])
-    
+
     with col1:
         generate_btn = st.button("🚀 生成 SQL", type="primary", use_container_width=True)
     with col2:
@@ -416,11 +555,37 @@ with tab1:
         if not st.session_state.initialized:
             st.error("请先初始化系统")
         else:
+            # 优先使用用户选择的数据库
+            if selected_db_id is not None:
+                detected_dialect = selected_db_type
+                detected_db_id = selected_db_id
+                db_name = selected_db_label.split(' ')[0]
+            else:
+                # 自动检测
+                detected_dialect, detected_db_id = st.session_state.sql_generator.detect_dialect(user_query)
+                db_info = st.session_state.sql_generator.dialect_detector.get_database_info(detected_db_id) if detected_db_id else None
+                db_name = db_info.get('name', '未知') if db_info else '默认数据库'
+
+            st.info(f"🎯 检测到目标数据库：**{db_name}** ({detected_dialect.upper()})")
+
             with st.spinner("正在生成 SQL..."):
                 result = st.session_state.sql_generator.generate_sql(
                     user_query=user_query,
-                    session_id=st.session_state.session_id
+                    session_id=st.session_state.session_id,
+                    target_dialect=detected_dialect,
+                    target_database_id=detected_db_id
                 )
+
+            # 检查是否检索到知识
+            if result.get('matched_knowledge') is not None and len(result.get('matched_knowledge', [])) == 0:
+                st.warning("""
+                ⚠️ **未检索到相关知识库内容**
+
+                可能的原因：
+                1. 知识库为空或未初始化 - 请先在"知识图谱构建"页面导入 DDL 文件
+                2. 知识库索引未刷新 - 请点击侧边栏的 **"🔄 重新初始化系统"** 按钮
+                3. 查询问题与知识库内容不匹配 - 尝试调整查询措辞
+                """)
 
             if result.get('status') == 'success' and result.get('sql'):
                 st.session_state.last_sql = result['sql']
@@ -457,7 +622,23 @@ with tab1:
 
                 st.rerun()
             else:
-                st.error(f"生成失败：{result.get('error', '未知错误')}")
+                error_msg = result.get('error', '未知错误')
+                # 检查是否是连接错误
+                if 'Connection' in error_msg or 'connection' in error_msg.lower():
+                    st.error("""
+                    ⚠️ **LLM 服务连接失败**
+
+                    可能的原因：
+                    1. 网络连接问题 - 请检查网络连接
+                    2. API Key 无效或过期 - 请检查 `.env` 文件中的 `LLM_API_KEY` 配置
+                    3. 服务不可用 - 阿里云 DashScope 服务可能暂时不可用
+
+                    建议操作：
+                    - 检查 `.env` 文件中的 API Key 配置是否正确
+                    - 稍后重试
+                    """)
+                else:
+                    st.error(f"生成失败：{error_msg}")
 
     # 显示当前 SQL
     if st.session_state.last_sql:
@@ -538,8 +719,12 @@ with tab2:
         st.info("💡 暂无历史记录，快去生成第一条 SQL 吧！")
 
 
-# ==================== Tab 3: 系统信息 ====================
+# ==================== Tab 3: 知识图谱构建 ====================
 with tab3:
+    from app.pages.kg_builder import show_kg_builder
+    show_kg_builder()
+
+with tab4:
     st.markdown("### ℹ️ 系统信息")
     
     # 系统状态卡片
@@ -581,7 +766,7 @@ with tab3:
 
         st.markdown("""
         **检索配置**
-        - BM25+TF-IDF+FAISS 混合检索
+        - BM25+FAISS 混合检索
         - Few-Shot: {few_shot} (top {top_k})
         """.format(
             few_shot="已启用" if FEW_SHOT_ENABLED else "禁用",

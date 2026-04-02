@@ -138,7 +138,7 @@ class EmbeddingFactory:
             return self._get_tfidf_fallback(text)
 
     def _get_dashscope_embeddings_batch(self, texts: List[str]) -> np.ndarray:
-        """批量获取通义千问 Embedding"""
+        """批量获取通义千问 Embedding（DashScope 限制 batch size <= 25）"""
         if not DASHSCOPE_AVAILABLE:
             return np.array([self._get_tfidf_fallback(t) for t in texts])
 
@@ -149,20 +149,27 @@ class EmbeddingFactory:
             if self.api_key:
                 dashscope.api_key = self.api_key
 
-            # DashScope 支持批量输入
-            response = TextEmbedding.call(
-                model=self.model,
-                input=texts  # 支持列表输入
-            )
+            # DashScope 限制 batch size 不能超过 25，需要分批处理
+            MAX_BATCH_SIZE = 25
+            all_embeddings = []
 
-            if response.status_code == 200:
-                embeddings = []
-                for item in response.output['embeddings']:
-                    embeddings.append(item['embedding'])
-                return np.array(embeddings, dtype=np.float32)
-            else:
-                logger.error(f"DashScope API 错误：{response.code} - {response.message}")
-                return np.array([self._get_tfidf_fallback(t) for t in texts])
+            for i in range(0, len(texts), MAX_BATCH_SIZE):
+                batch_texts = texts[i:i + MAX_BATCH_SIZE]
+                response = TextEmbedding.call(
+                    model=self.model,
+                    input=batch_texts  # 支持列表输入
+                )
+
+                if response.status_code == 200:
+                    for item in response.output['embeddings']:
+                        all_embeddings.append(item['embedding'])
+                else:
+                    logger.error(f"DashScope API 错误：{response.code} - {response.message}")
+                    # 失败时使用单个请求降级
+                    for text in batch_texts:
+                        all_embeddings.append(self._get_dashscope_embedding(text).tolist())
+
+            return np.array(all_embeddings, dtype=np.float32)
 
         except Exception as e:
             logger.error(f"批量获取 DashScope Embedding 失败：{e}")

@@ -50,15 +50,13 @@ PROMPT_MAX_LENGTH = int(os.getenv("PROMPT_MAX_LENGTH", 4000))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", 5))
 
 # ==================== 检索配置 ====================
-# BM25 + TF-IDF + FAISS 三路混合检索配置
+# BM25 + FAISS 两路混合检索配置
 BM25_K1 = float(os.getenv("BM25_K1", 1.5))
 BM25_B = float(os.getenv("BM25_B", 0.75))
-TFIDF_MAX_FEATURES = int(os.getenv("TFIDF_MAX_FEATURES", 5000))
 
-# 三路混合检索权重配置 (总和应为 1)
-BM25_WEIGHT = float(os.getenv("BM25_WEIGHT", 0.4))
-TFIDF_WEIGHT = float(os.getenv("TFIDF_WEIGHT", 0.3))
-DENSE_WEIGHT = float(os.getenv("DENSE_WEIGHT", 0.3))
+# 两路混合检索权重配置 (总和应为 1)
+BM25_WEIGHT = float(os.getenv("BM25_WEIGHT", 0.6))
+DENSE_WEIGHT = float(os.getenv("DENSE_WEIGHT", 0.4))
 
 # FAISS 向量检索配置
 FAISS_ENABLED = os.getenv("FAISS_ENABLED", "true").lower() == "true"

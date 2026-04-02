@@ -1,0 +1,2 @@
+2026-03-27 22:00:40.373 | INFO     | core.knowledge.neo4j_client:connect:65 - Neo4j 同步 + 异步驱动初始化成功，pool_size=50
+2026-03-27 22:00:40.373 | INFO     | core.knowledge.neo4j_client:connect:70 - 成功连接到 Neo4j: bolt://localhost:7687
