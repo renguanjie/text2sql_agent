@@ -2,8 +2,8 @@
 
 基于本地知识库的 SQL 智能生成系统
 
-> **最新版本**: v1.2
-> **核心升级**: 知识图谱构建 + 多数据库支持 + 数据库选择 + 智能方言检测
+> **最新版本**: v1.3
+> **核心升级**: 关系权重追踪 + JOIN 提取引擎 + 反馈驱动图谱增强 + 权重感知 Prompt
 
 ## 🎯 功能特性
 
@@ -16,6 +16,17 @@
 - 🔗 **Neo4j 知识图谱**: 从图数据库同步元数据
 - 💾 **MySQL 存储**: 历史数据和元数据持久化
 - 🏗️ **知识图谱构建**: 支持 DDL 文件/活体数据库构建图谱
+
+### 新增功能 (v1.3)
+
+| 功能 | 说明 | 状态 |
+|------|------|------|
+| ⚖️ **关系权重追踪** | CONNECTS 关系新增 weight/occurrence_count/source 属性 | ✅ |
+| 🔍 **JOIN 提取引擎** | 基于 sqlglot AST 从历史 SQL 中提取表关联关系 | ✅ |
+| 🔄 **权重重平衡** | 历史记录驱动，平滑增量权重 + 新关系比例收缩 | ✅ |
+| 💪 **提取&增强** | 历史页一键提取 JOIN 关系并增强知识图谱 | ✅ |
+| 🧠 **权重感知 Prompt** | LLM 优先选择高权重关联关系，关系按权重降序展示 | ✅ |
+| 🏗️ **应用上下文** | ApplicationContext 统一管理组件生命周期，消除全局单例 | ✅ |
 
 ### 新增功能 (v1.2)
 
@@ -64,15 +75,18 @@ text2sql_agent/
 │   │   ├── generator.py        # SQL 生成器
 │   │   ├── dialect_detector.py # SQL 方言检测器
 │   │   ├── validator.py        # SQL 校验器
-│   │   └── field_validator.py  # sqlglot AST 解析
+│   │   ├── field_validator.py  # sqlglot AST 解析
+│   │   └── join_extractor.py   # ✨ JOIN 提取引擎 (v1.3 新增)
+│   ├── app_context.py          # ✨ 应用上下文 (v1.3 新增)
 │   └── graph_builder/          # ✨ 知识图谱构建模块 (v1.2 新增)
 │       ├── __init__.py
-│       ├── models.py           # IR 数据模型
+│       ├── models.py           # IR 数据模型 (含权重字段)
 │       ├── extractors/         # 抽取器 (DDL/JSON/活体数据库)
 │       ├── enrichment/         # AI 语义增强
 │       ├── compiler/           # SQL 预编译
-│       ├── loader/             # Neo4j 装载器
-│       └── main.py             # 流水线入口
+│       └── loader/             # Neo4j 装载器
+│           ├── neo4j_writer.py # 批量装载 (含权重初始化)
+│           └── weight_initializer.py  # ✨ 权重初始化/重平衡 (v1.3 新增)
 ├── app/                        # ✨ Streamlit 页面模块 (v1.2 新增)
 │   └── pages/
 │       ├── kg_builder.py       # 知识图谱构建页面
@@ -212,7 +226,16 @@ LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 ## 📖 使用示例
 
-### 1. 知识图谱构建（v1.2 新增）
+### 1. 提取&增强（v1.3 新增）
+
+在"执行历史"页面：
+1. 找到已执行的 SQL 记录
+2. 点击"提取&增强"按钮
+3. 系统自动提取 SQL 中的表关联关系（JOIN）
+4. 确认无误后点击"确认增强到知识图谱"
+5. 系统自动更新 Neo4j 中 CONNECTS 关系的权重
+
+### 2. 知识图谱构建（v1.2 新增）
 
 在"知识图谱构建"页面：
 1. 上传 DDL 文件或 JSON 文件
@@ -237,7 +260,7 @@ CREATE TABLE orders (
 ) COMMENT='订单表';
 ```
 
-### 2. SQL 生成（带数据库选择）
+### 3. SQL 生成（带数据库选择）
 
 在主页选择目标数据库，然后输入自然语言查询：
 - 选择数据库：`ride_hailing_db (sparksql)`
@@ -257,31 +280,54 @@ SQL 结构:
 4. 使用 LIMIT 10 取前 10 名
 ```
 
-### 3. 数据库选择（v1.2 新增）
+### 4. 数据库选择（v1.2 新增）
 
 在"SQL 生成"页面左侧，可以选择目标数据库：
 - 下拉框显示：`数据库名 (数据库类型)`
 - 选择不同数据库后，系统会生成对应方言的 SQL
 - 支持 MySQL、Oracle、Hive、PostgreSQL、SparkSQL
 
-### 4. 图谱导出/导入（v1.2 新增）
+### 5. 图谱导出/导入（v1.2 新增）
 
 在侧边栏"知识库管理"中：
 - **📤 导出**：将知识图谱导出为 JSON 文件
 - **📥 导入**：上传 JSON 文件，恢复知识图谱
 
-### 5. 清除知识库（v1.2 新增）
+### 6. 清除知识库（v1.2 新增）
 
 在侧边栏"知识库管理"中：
 1. 勾选"✓ 确认清除"
 2. 点击"🗑️ 清除知识库"
 3. 系统自动重新初始化
 
-### 6. 查看历史
+### 7. 查看历史
 
 切换到"执行历史"标签页，查看历史生成记录。
 
 ## 🏗️ 架构设计
+
+### 知识图谱权重架构（v1.3 新增）
+
+```
+CONNECTS 关系属性:
+├── relationship_type: foreign_key
+├── join_type: LEFT JOIN / INNER JOIN / ...
+├── join_sql: 预编译的 JOIN SQL
+├── from_column / to_column: 关联字段
+├── weight: 0.0 ~ 1.0 (同一表对之间权重和 = 1)
+├── occurrence_count: 出现次数
+├── source: manual | history_extracted
+└── updated_at: 最后更新时间
+
+权重初始化:
+  表 A → 表 B 有 N 条关系
+  每条 weight = 1/N
+
+权重更新 (历史记录驱动):
+  已存在: new_weight = old_weight × (1 - η) + η
+  新关系: weight = 1 / (已有数量 + 1)
+         旧关系按比例收缩
+```
 
 ### 完整处理流程（v1.2）
 
@@ -299,10 +345,10 @@ SQL 结构:
 Few-Shot 检索 ←── 历史成功记录 ─┘│
    ↓                            │
 提示词构建 ←──────── 数据库方言 ─┘
-   ├─ Schema 信息（按数据库过滤）
+   ├─ Schema 信息（按数据库过滤，关系按权重降序）
    ├─ 相关知识
    ├─ Few-Shot 示例
-   └─ CoT 思维链指令
+   └─ CoT 思维链指令（优先选择高权重关联）
    ↓
 异步 LLM 调用 (带重试)
    ↓
@@ -366,6 +412,7 @@ Neo4j Driver Pool
 | 复杂查询准确率 | 基础 | CoT+Few-Shot | ~30% |
 | 连接等待 | 每次新建 | 连接池 | ~80% |
 | 语义检索 | 词频匹配 | Embedding | 显著 |
+| 多表 JOIN 准确率 | 随机选择关联 | 权重优先 | 显著提升 |
 
 ## 🤖 AI Agent 专属技能
 
@@ -455,6 +502,40 @@ python scripts/01_export_graph_to_md.py
 5. **连接池**: 高并发场景建议调大 pool_size
 
 ## 📝 更新日志
+
+### v1.3 (2026-04-12)
+
+**关系权重追踪**:
+- ✅ CONNECTS 关系新增 `weight`/`occurrence_count`/`source` 属性
+- ✅ 图谱构建时自动平分同一表对之间的多条关系权重
+- ✅ Neo4j 关系存储权重信息并支持查询排序
+
+**JOIN 提取引擎**:
+- ✅ 基于 sqlglot AST 解析从历史 SQL 中提取 JOIN 关系
+- ✅ 提取 left_table、right_table、join_condition、join_type
+- ✅ 支持复杂 ON 条件拆分（主关联 + 额外条件）
+- ✅ 支持 LEFT/RIGHT/INNER/FULL/CROSS JOIN
+
+**权重重平衡算法**:
+- ✅ 平滑增量：`new_weight = old_weight × (1 - η) + η`
+- ✅ 新关系创建时按比例收缩旧关系权重
+- ✅ 自动维护同一表对权重之和 = 1
+
+**反馈驱动图谱增强**:
+- ✅ 历史页新增"提取&增强"按钮
+- ✅ 提取 JOIN → 展示确认 → 更新 Neo4j 权重
+- ✅ 闭环优化知识图谱的表关联关系
+
+**权重感知 Prompt**:
+- ✅ 关系信息按权重降序排列
+- ✅ LLM 优先选择高权重关联关系生成 SQL
+- ✅ 提升多表 JOIN 场景的准确率
+
+**架构优化**:
+- ✅ ApplicationContext 统一管理组件生命周期
+- ✅ 消除全局单例，改为依赖注入模式
+- ✅ `_get_schema_from_neo4j` 修复关系类型查询
+- ✅ 消除 sync/async 方法代码重复
 
 ### v1.2 (2026-04-01)
 
