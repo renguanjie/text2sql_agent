@@ -485,7 +485,9 @@ class MySQLClient:
         return stats
 
 
-# 全局客户端实例
+# ==================== 向后兼容（已废弃，请使用 ApplicationContext） ====================
+# 保留全局单例以兼容旧代码，新功能应使用 ApplicationContext
+
 _mysql_client: Optional[MySQLClient] = None
 
 
@@ -494,6 +496,8 @@ def get_mysql_client(host: str, port: int, user: str, password: str,
                      max_overflow: int = 20, pool_timeout: int = 30) -> MySQLClient:
     """
     获取或创建 MySQL 客户端单例（带连接池配置）
+
+    .. deprecated:: 请使用 ApplicationContext 管理组件生命周期
 
     Args:
         host: 主机

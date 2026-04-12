@@ -57,6 +57,9 @@ class RelationshipIR(BaseModel):
     join_type: str = Field(default="LEFT JOIN", description="JOIN 类型")
     extra_condition: Optional[str] = Field(None, description="额外条件")
     join_sql: Optional[str] = Field(None, description="预编译的 JOIN SQL")
+    weight: float = Field(default=1.0, description="关系权重 (0-1)")
+    occurrence_count: int = Field(default=1, description="出现次数")
+    source: str = Field(default="manual", description="来源 (manual/history_extracted)")
     properties: Dict[str, Any] = Field(default_factory=dict, description="扩展属性")
 
 

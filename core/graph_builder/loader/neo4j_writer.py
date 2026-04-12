@@ -31,6 +31,11 @@ class Neo4jGraphBuilder:
             "columns": self.batch_upsert_columns(result.tables),
             "relationships": self.batch_upsert_relationships(result.relationships)
         }
+
+        # 规范化关系权重（平分同一表对之间的多条关系）
+        from .weight_initializer import normalize_relationships
+        stats["weight_normalized"] = normalize_relationships(self.client)
+
         logger.info(f"图谱构建完成：{stats}")
         return stats
 
@@ -221,6 +226,9 @@ class Neo4jGraphBuilder:
         - extra_condition: 额外条件
         - from_column: 源字段
         - to_column: 目标字段
+        - weight: 关系权重 (0-1)
+        - occurrence_count: 出现次数
+        - source: 来源 (manual/history_extracted)
         """
         if not relationships:
             return 0
@@ -242,6 +250,9 @@ class Neo4jGraphBuilder:
             r.join_type = rel.join_type,
             r.join_sql = rel.join_sql,
             r.extra_condition = rel.extra_condition,
+            r.weight = COALESCE(rel.weight, 1.0),
+            r.occurrence_count = COALESCE(rel.occurrence_count, 1),
+            r.source = COALESCE(rel.source, 'manual'),
             r.updated_at = datetime()
 
         RETURN count(r) as count

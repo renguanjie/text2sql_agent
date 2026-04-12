@@ -21,14 +21,8 @@ from config import (
     FEW_SHOT_ENABLED, FEW_SHOT_TOP_K,
     MYSQL_POOL_SIZE, MYSQL_MAX_OVERFLOW, MYSQL_POOL_TIMEOUT
 )
-from core.llm_factory import create_llm
-from core.knowledge.neo4j_client import Neo4jClient
-from core.history.mysql_client import MySQLClient
-from core.retrieval.bm25_tfidf import KnowledgeRetriever
-from core.chain.sql_chain import SQLGenerationChain
-from core.sql.generator import SQLGenerator
+from core.app_context import ApplicationContext
 from core.sql.validator import validate_sql
-from core.embedding_factory import EmbeddingFactory
 from loguru import logger
 import uuid
 
@@ -128,8 +122,8 @@ if 'initialized' not in st.session_state:
 if 'session_id' not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
-if 'sql_generator' not in st.session_state:
-    st.session_state.sql_generator = None
+if 'app_context' not in st.session_state:
+    st.session_state.app_context = None
 
 if 'history' not in st.session_state:
     st.session_state.history = []
@@ -143,172 +137,63 @@ if 'last_result' not in st.session_state:
 
 # ==================== 初始化函数 ====================
 def initialize_system():
-    """初始化系统组件"""
+    """初始化系统组件（委托给 ApplicationContext）"""
     logger.info("开始初始化系统...")
 
-    # 1. 创建 LLM
-    try:
-        llm = create_llm(
-            provider=LLM_PROVIDER,
-            model=LLM_MODEL,
-            api_key=LLM_API_KEY,
-            base_url=LLM_BASE_URL
-        )
-        logger.info(f"LLM 初始化成功：{LLM_PROVIDER}/{LLM_MODEL}")
-    except Exception as e:
-        logger.error(f"LLM 初始化失败：{e}")
-        st.error(f"LLM 初始化失败：{e}")
-        return None
+    app_ctx = ApplicationContext(config={
+        'mysql_host': MYSQL_HOST, 'mysql_port': MYSQL_PORT,
+        'mysql_user': MYSQL_USER, 'mysql_password': MYSQL_PASSWORD,
+        'mysql_database': MYSQL_DATABASE,
+        'mysql_pool_size': MYSQL_POOL_SIZE,
+        'mysql_max_overflow': MYSQL_MAX_OVERFLOW,
+        'mysql_pool_timeout': MYSQL_POOL_TIMEOUT,
+        'neo4j_enabled': NEO4J_ENABLED, 'neo4j_uri': NEO4J_URI,
+        'neo4j_user': NEO4J_USER, 'neo4j_password': NEO4J_PASSWORD,
+        'neo4j_database': NEO4J_DATABASE,
+        'llm_provider': LLM_PROVIDER, 'llm_model': LLM_MODEL,
+        'llm_api_key': LLM_API_KEY, 'llm_base_url': LLM_BASE_URL,
+        'retrieval_top_k': RETRIEVAL_TOP_K, 'sql_dialect': SQL_DIALECT,
+        'bm25_k1': BM25_K1, 'bm25_b': BM25_B,
+        'bm25_weight': BM25_WEIGHT, 'dense_weight': DENSE_WEIGHT,
+        'faiss_enabled': FAISS_ENABLED, 'faiss_embedding_dim': FAISS_EMBEDDING_DIM,
+        'faiss_index_type': FAISS_INDEX_TYPE,
+        'embedding_provider': EMBEDDING_PROVIDER, 'embedding_model': EMBEDDING_MODEL,
+        'embedding_api_key': EMBEDDING_API_KEY,
+        'few_shot_enabled': FEW_SHOT_ENABLED, 'few_shot_top_k': FEW_SHOT_TOP_K,
+    })
 
-    # 2. 创建 Neo4j 客户端 (可选)
-    neo4j_client = Neo4jClient(
-        uri=NEO4J_URI,
-        user=NEO4J_USER,
-        password=NEO4J_PASSWORD,
-        database=NEO4J_DATABASE,
-        max_connection_pool_size=50,
-        connection_timeout=30
-    )
-    if NEO4J_ENABLED:
-        if not neo4j_client.connect():
-            logger.warning("Neo4j 连接失败，将使用 MySQL 元数据模式")
-            st.warning("⚠️ Neo4j 未连接，使用 MySQL 元数据模式")
+    if app_ctx.ensure_initialized():
+        st.session_state.app_context = app_ctx
+        st.session_state.initialized = True
+        logger.info("系统初始化完成")
+        return True
     else:
-        logger.info("Neo4j 未启用，使用 MySQL 元数据模式")
-
-    # 3. 创建 MySQL 客户端（使用连接池）
-    mysql_client = MySQLClient(
-        host=MYSQL_HOST,
-        port=MYSQL_PORT,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=MYSQL_DATABASE,
-        pool_size=MYSQL_POOL_SIZE,
-        max_overflow=MYSQL_MAX_OVERFLOW,
-        pool_timeout=MYSQL_POOL_TIMEOUT
-    )
-    if not mysql_client.connect():
-        logger.warning("MySQL 连接失败，历史记录功能可能不可用")
-
-    # 4. 创建 Embedding Factory
-    embedding_factory = EmbeddingFactory(
-        provider=EMBEDDING_PROVIDER,
-        model=EMBEDDING_MODEL,
-        api_key=EMBEDDING_API_KEY
-    )
-    logger.info(f"Embedding 工厂初始化：{EMBEDDING_PROVIDER}/{EMBEDDING_MODEL}")
-
-    # 5. 创建知识检索器 - 混合检索 (BM25 + FAISS)
-    knowledge_retriever = KnowledgeRetriever(
-        config={
-            'bm25_k1': BM25_K1,
-            'bm25_b': BM25_B,
-            'bm25_weight': BM25_WEIGHT,
-            'dense_weight': DENSE_WEIGHT,
-            'embedding_dim': FAISS_EMBEDDING_DIM,
-            'index_type': FAISS_INDEX_TYPE if FAISS_ENABLED else None,
-            'few_shot_enabled': FEW_SHOT_ENABLED,
-            'few_shot_top_k': FEW_SHOT_TOP_K
-        },
-        embedding_factory=embedding_factory
-    )
-
-    # 5. 加载知识库 (Neo4j 或 MySQL)
-    try:
-        if NEO4J_ENABLED and neo4j_client.driver:
-            # 从 Neo4j 加载
-            metadata = neo4j_client.get_schema_metadata()
-            documents = []
-            metadata_list = []
-
-            for table in metadata.get('tables', []):
-                doc = f"{table.get('name', '')} {table.get('description', '')}"
-                if doc.strip():
-                    documents.append(doc)
-                    metadata_list.append({
-                        'node_type': 'table',
-                        'name': table.get('name', ''),
-                        'description': table.get('description', '')
-                    })
-
-            if documents:
-                knowledge_retriever.retriever.index_documents(documents, metadata_list)
-                logger.info(f"知识库索引完成：{len(documents)} 个文档 (Neo4j)")
-        else:
-            # 从 MySQL 加载元数据
-            tables = mysql_client.get_table_schema()
-            documents = []
-            metadata_list = []
-
-            for table in tables:
-                doc = f"{table.get('table_name', '')} {table.get('table_comment', '')}"
-                if doc.strip():
-                    documents.append(doc)
-                    metadata_list.append({
-                        'node_type': 'table',
-                        'name': table.get('table_name', ''),
-                        'description': table.get('table_comment', '')
-                    })
-
-            if documents:
-                knowledge_retriever.retriever.index_documents(documents, metadata_list)
-                logger.info(f"知识库索引完成：{len(documents)} 个文档 (MySQL)")
-    except Exception as e:
-        logger.warning(f"知识库加载失败：{e}")
-
-    # 6. 创建 SQL 生成链
-    sql_chain = SQLGenerationChain(
-        llm=llm,
-        dialect=SQL_DIALECT,
-        retrieval_top_k=RETRIEVAL_TOP_K
-    )
-
-    # 7. 创建 SQL 生成器
-    generator = SQLGenerator(
-        llm=llm,
-        knowledge_retriever=knowledge_retriever,
-        sql_chain=sql_chain,
-        mysql_client=mysql_client,
-        config={
-            'enable_rewrite': False,
-            'few_shot_enabled': FEW_SHOT_ENABLED,
-            'few_shot_top_k': FEW_SHOT_TOP_K
-        },
-        neo4j_client=neo4j_client
-    )
-
-    st.session_state.sql_generator = generator
-    st.session_state.initialized = True
-    st.session_state.neo4j_client = neo4j_client
-    st.session_state.mysql_client = mysql_client
-
-    logger.info("系统初始化完成")
-    return True
+        logger.error("系统初始化失败")
+        return None
 
 
 # ==================== 侧边栏 ====================
 with st.sidebar:
     st.title("⚙️ 控制中心")
-    
+
     # 系统状态卡片
     st.markdown("### 📊 系统状态")
-    if st.session_state.initialized:
+    ctx = st.session_state.app_context
+    if st.session_state.initialized and ctx:
         st.success("✅ 系统已初始化")
 
-        # 显示连接状态
         col1, col2 = st.columns(2)
         with col1:
             if NEO4J_ENABLED:
                 st.markdown("🔗 **Neo4j**")
-                st.caption("已启用" if hasattr(st.session_state, 'neo4j_client') and st.session_state.neo4j_client.driver else "未连接")
+                st.caption("已启用" if ctx.neo4j_client and ctx.neo4j_client.driver else "未连接")
             else:
                 st.markdown("📄 **MySQL 模式**")
                 st.caption("元数据模式")
         with col2:
             st.markdown("💾 **MySQL**")
-            st.caption("已连接" if hasattr(st.session_state, 'mysql_client') else "未连接")
+            st.caption("已连接" if ctx.mysql_client else "未连接")
 
-        # 显示 Embedding 和 Few-Shot 状态
         st.markdown("🔌 **Embedding**")
         st.caption(f"{EMBEDDING_PROVIDER}/{EMBEDDING_MODEL}")
 
@@ -316,7 +201,6 @@ with st.sidebar:
         st.caption(f"{'已启用' if FEW_SHOT_ENABLED else '禁用'} (top {FEW_SHOT_TOP_K})")
     else:
         st.warning("⚠️ 系统未初始化")
-        # 自动初始化
         with st.spinner("正在初始化系统..."):
             init_result = initialize_system()
             if init_result:
@@ -329,8 +213,9 @@ with st.sidebar:
 
     # 重新初始化系统按钮
     if st.button("🔄 重新初始化系统", use_container_width=True, type="secondary"):
-        # 清除所有相关状态
-        for key in ['initialized', 'sql_generator', 'neo4j_client', 'mysql_client']:
+        if ctx:
+            ctx.reset()
+        for key in ['initialized', 'app_context']:
             if key in st.session_state:
                 del st.session_state[key]
         st.success("系统状态已重置，正在重新初始化...")
@@ -341,7 +226,7 @@ with st.sidebar:
     # 会话信息
     st.markdown("### 💬 会话信息")
     st.code(f"{st.session_state.session_id[:12]}...", language="text")
-    
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🗑️ 清空历史", use_container_width=True):
@@ -357,10 +242,10 @@ with st.sidebar:
     # 知识库管理
     st.markdown("### 🗄️ 知识库管理")
 
-    if NEO4J_ENABLED and hasattr(st.session_state, 'neo4j_client') and st.session_state.neo4j_client:
-        # 获取知识库统计
+    if NEO4J_ENABLED and ctx and ctx.neo4j_client and ctx.neo4j_client.driver:
+        neo4j = ctx.neo4j_client
         try:
-            stats = st.session_state.neo4j_client.execute_query("""
+            stats = neo4j.execute_query("""
                 MATCH (n)
                 OPTIONAL MATCH ()-[r]-()
                 RETURN
@@ -372,13 +257,12 @@ with st.sidebar:
         except Exception as e:
             st.caption(f"无法获取知识库统计")
 
-        # 导出/导入按钮
         col1, col2 = st.columns(2)
         with col1:
             if st.button("📤 导出", use_container_width=True, type="secondary"):
-                if st.session_state.initialized and st.session_state.neo4j_client:
+                if st.session_state.initialized:
                     with st.spinner("正在导出知识库..."):
-                        export_data = st.session_state.neo4j_client.export_knowledge_graph()
+                        export_data = neo4j.export_knowledge_graph()
                         if export_data:
                             import json
                             json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
@@ -391,9 +275,8 @@ with st.sidebar:
                             )
         with col2:
             if st.button("📥 导入", use_container_width=True, type="secondary"):
-                pass  # 导入由下面的文件上传处理
+                pass
 
-        # 文件上传导入
         uploaded_file = st.file_uploader(
             "上传知识库 JSON 文件",
             type=["json"],
@@ -408,7 +291,7 @@ with st.sidebar:
                         import json
                         content = uploaded_file.read().decode('utf-8')
                         import_data = json.loads(content)
-                        result = st.session_state.neo4j_client.import_knowledge_graph(import_data)
+                        result = neo4j.import_knowledge_graph(import_data)
                         if "error" in result:
                             st.error(f"导入失败：{result['error']}")
                         else:
@@ -417,10 +300,8 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"导入失败：{e}")
 
-        # 清除知识库按钮
         col_clear1, col_clear2 = st.columns([3, 1])
         with col_clear1:
-            # 初始化 checkbox 状态
             if "confirm_clear_kg" not in st.session_state:
                 st.session_state.confirm_clear_kg = False
             clear_confirm = st.checkbox("✓ 确认清除", key="confirm_clear_kg",
@@ -430,18 +311,18 @@ with st.sidebar:
                                  disabled=not clear_confirm)
 
         if clear_btn:
-            if st.session_state.initialized and st.session_state.neo4j_client:
+            if st.session_state.initialized:
                 with st.spinner("正在清除知识库..."):
-                    result = st.session_state.neo4j_client.clear_knowledge_graph()
+                    result = neo4j.clear_knowledge_graph()
                     if "error" in result:
                         st.error(f"清除失败：{result['error']}")
                     else:
                         st.success(f"✅ 已删除 {result['nodes']} 个节点，{result['relationships']} 个关系")
-                        # 清除所有相关状态
-                        for key in ['initialized', 'sql_generator', 'neo4j_client', 'mysql_client']:
+                        if ctx:
+                            ctx.reset()
+                        for key in ['initialized', 'app_context']:
                             if key in st.session_state:
                                 del st.session_state[key]
-                        # 重置确认框状态
                         if "confirm_clear_kg" in st.session_state:
                             del st.session_state.confirm_clear_kg
                         st.success("知识库已清除，系统将重新初始化...")
@@ -464,7 +345,7 @@ with st.sidebar:
     - ✅ SQLFluff 语法校验
     - 💾 Neo4j/MySQL 双模式
     """)
-    
+
     st.markdown("---")
     st.caption("© 2026 Text2SQL Agent")
 
@@ -485,9 +366,11 @@ with tab1:
     # 数据库选择
     db_options = []
     db_labels = []
-    if st.session_state.initialized and hasattr(st.session_state, 'neo4j_client') and st.session_state.neo4j_client:
+    db_list = []
+    ctx = st.session_state.app_context
+    if st.session_state.initialized and ctx and ctx.neo4j_client and ctx.neo4j_client.driver:
         try:
-            db_list = st.session_state.neo4j_client.get_database_list()
+            db_list = ctx.neo4j_client.get_database_list()
             db_options = [db["database_id"] for db in db_list]
             db_labels = [f"{db['name']} ({db['db_type']})" for db in db_list]
         except Exception as e:
@@ -552,7 +435,7 @@ with tab1:
 
     # 生成 SQL
     if generate_btn and user_query:
-        if not st.session_state.initialized:
+        if not st.session_state.initialized or not ctx or not ctx.sql_generator:
             st.error("请先初始化系统")
         else:
             # 优先使用用户选择的数据库
@@ -562,14 +445,14 @@ with tab1:
                 db_name = selected_db_label.split(' ')[0]
             else:
                 # 自动检测
-                detected_dialect, detected_db_id = st.session_state.sql_generator.detect_dialect(user_query)
-                db_info = st.session_state.sql_generator.dialect_detector.get_database_info(detected_db_id) if detected_db_id else None
+                detected_dialect, detected_db_id = ctx.sql_generator.detect_dialect(user_query)
+                db_info = ctx.sql_generator.dialect_detector.get_database_info(detected_db_id) if detected_db_id else None
                 db_name = db_info.get('name', '未知') if db_info else '默认数据库'
 
             st.info(f"🎯 检测到目标数据库：**{db_name}** ({detected_dialect.upper()})")
 
             with st.spinner("正在生成 SQL..."):
-                result = st.session_state.sql_generator.generate_sql(
+                result = ctx.sql_generator.generate_sql(
                     user_query=user_query,
                     session_id=st.session_state.session_id,
                     target_dialect=detected_dialect,
@@ -651,10 +534,9 @@ with tab1:
                 st.info("💡 点击代码块右上角的复制按钮即可复制 SQL")
 
     # 执行 SQL
-    if execute_btn and st.session_state.last_sql:
+    if execute_btn and st.session_state.last_sql and ctx and ctx.sql_generator:
         with st.spinner("⏳ 正在执行 SQL..."):
-            # 这里需要获取 history_id，简化处理
-            exec_result = st.session_state.sql_generator.execute_sql(
+            exec_result = ctx.sql_generator.execute_sql(
                 sql=st.session_state.last_sql
             )
 
@@ -703,7 +585,7 @@ with tab2:
                 st.code(item['sql'], language='sql', line_numbers=False)
                 
                 # 操作按钮
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     if st.button("📥 使用此 SQL", key=f"use_{i}", use_container_width=True):
                         st.session_state.last_sql = item['sql']
@@ -715,6 +597,46 @@ with tab2:
                     if st.button("🗑️ 删除", key=f"delete_{i}", use_container_width=True):
                         st.session_state.history.pop(len(st.session_state.history) - 1 - i)
                         st.rerun()
+                with col4:
+                    if st.button("提取&增强", key=f"extract_{i}", use_container_width=True):
+                        # 提取 JOIN 关系
+                        from core.sql.join_extractor import extract_joins_from_sql
+                        joins = extract_joins_from_sql(item['sql'])
+                        # 转为字典列表存储（避免 Streamlit session_state 序列化 dataclass 的问题）
+                        if joins:
+                            st.session_state[f"extracted_joins_{i}"] = [
+                                {
+                                    "left_table": jn.left_table,
+                                    "right_table": jn.right_table,
+                                    "join_type": jn.join_type,
+                                    "join_condition": jn.join_condition,
+                                    "from_column": jn.from_column,
+                                    "to_column": jn.to_column,
+                                    "extra_condition": jn.extra_condition
+                                }
+                                for jn in joins
+                            ]
+                        else:
+                            st.session_state[f"extracted_joins_{i}"] = []
+
+                # 显示提取的 JOIN 关系
+                extracted = st.session_state.get(f"extracted_joins_{i}", [])
+                if extracted:
+                    st.markdown(f"**提取到 {len(extracted)} 个 JOIN 关系：**")
+                    for j, join in enumerate(extracted):
+                        st.markdown(
+                            f"  **{j+1}.** `{join['left_table']}` → `{join['right_table']}` "
+                            f"({join['join_type']}) — ON `{join['join_condition']}`"
+                        )
+
+                    if st.button("确认增强到知识图谱", key=f"confirm_{i}", type="primary", use_container_width=True):
+                        # 更新 Neo4j 权重
+                        if ctx and ctx.neo4j_client and ctx.neo4j_client.driver:
+                            from core.graph_builder.loader.weight_initializer import rebalance_with_history
+                            stats = rebalance_with_history(extracted, ctx.neo4j_client)
+                            st.success(f"增强完成：更新 {stats['updated']} 条，新建 {stats['created']} 条关系")
+                        else:
+                            st.warning("Neo4j 未连接，无法增强")
     else:
         st.info("💡 暂无历史记录，快去生成第一条 SQL 吧！")
 
@@ -777,8 +699,8 @@ with tab4:
     
     # 统计信息
     st.markdown("#### 📊 统计信息")
-    if st.session_state.sql_generator:
-        stats = st.session_state.sql_generator.get_statistics()
+    if ctx and ctx.sql_generator:
+        stats = ctx.sql_generator.get_statistics()
         
         stat_col1, stat_col2, stat_col3 = st.columns(3)
         with stat_col1:

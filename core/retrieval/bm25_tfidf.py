@@ -23,7 +23,9 @@ from ..embedding_factory import EmbeddingFactory, get_embedding_factory
 
 
 class TextPreprocessor:
-    """文本预处理器"""
+    """文本预处理器 - 支持中英文混合分词"""
+
+    _CHINESE_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
 
     def __init__(self):
         """初始化预处理器"""
@@ -32,7 +34,7 @@ class TextPreprocessor:
 
     def tokenize(self, text: str) -> List[str]:
         """
-        对文本进行分词
+        对文本进行分词 - 支持中英文混合
 
         Args:
             text: 输入文本
@@ -40,21 +42,22 @@ class TextPreprocessor:
         Returns:
             List[str]: 分词结果
         """
-        # 转小写
         text = text.lower()
-
-        # 移除标点符号
         text = re.sub(self.punctuation, ' ', text)
-
-        # 按空格和特殊字符分割
-        # 对于中文，这里使用简单的字符级分词
-        # 可以集成 jieba 等分词工具来提升效果
         words = text.split()
+        result = []
 
-        # 过滤空字符串和单个字符（保留数字）
-        words = [w for w in words if w and (len(w) > 1 or w.isdigit())]
+        for w in words:
+            if not w:
+                continue
+            if len(w) > 1 or w.isdigit():
+                # 如果包含中文字符，进行字符级分词
+                if self._CHINESE_RE.search(w):
+                    result.extend(list(w))
+                else:
+                    result.append(w)
 
-        return words
+        return result
 
     def preprocess(self, text: str) -> str:
         """
@@ -267,13 +270,14 @@ class HybridRetriever:
         # 1. BM25 分数
         bm25_scores = self.bm25_model.get_scores(tokenized_query)
 
-        # 2. FAISS 向量相似度分数
+        # 2. FAISS 向量相似度分数（限制搜索上限以提升性能）
         if FAISS_AVAILABLE and self.dense_embedder.index is not None:
-            dense_indices, dense_scores = self.dense_embedder.search(query, top_k=len(self.documents))
-            # 将向量分数映射到文档索引
+            faiss_k = min(len(self.documents), 100)  # FAISS 搜索上限 100
+            dense_indices, dense_scores = self.dense_embedder.search(query, top_k=faiss_k)
+            # 将向量分数映射到文档索引（稀疏映射）
             dense_vec = np.zeros(len(self.documents), dtype=np.float32)
             for idx, score in zip(dense_indices, dense_scores):
-                if idx < len(self.documents):
+                if idx < len(self.documents) and score > 0:
                     dense_vec[idx] = score
             dense_scores = dense_vec
         else:

@@ -261,7 +261,9 @@ class EmbeddingFactory:
         return len(self._cache)
 
 
-# 全局单例
+# ==================== 向后兼容（已废弃，请使用 ApplicationContext） ====================
+# 保留全局单例以兼容旧代码，新功能应使用 ApplicationContext
+
 _embedding_factory: Optional[EmbeddingFactory] = None
 
 

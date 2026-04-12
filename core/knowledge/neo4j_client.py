@@ -681,7 +681,9 @@ class Neo4jClient:
         return count
 
 
-# 全局客户端实例
+# ==================== 向后兼容（已废弃，请使用 ApplicationContext） ====================
+# 保留全局单例以兼容旧代码，新功能应使用 ApplicationContext
+
 _neo4j_client: Optional[Neo4jClient] = None
 
 
@@ -691,6 +693,8 @@ def get_neo4j_client(uri: str, user: str, password: str,
                      connection_timeout: int = 30) -> Neo4jClient:
     """
     获取或创建 Neo4j 客户端单例（带连接池配置）
+
+    .. deprecated:: 请使用 ApplicationContext 管理组件生命周期
 
     Args:
         uri: Neo4j URI
