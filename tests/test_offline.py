@@ -2,8 +2,10 @@
 Text2SQL 智能体 - 离线测试脚本
 测试不依赖外部包的模块功能
 """
-import sys
-sys.path.insert(0, '/Users/rgj/.openclaw/workspace/text2sql_agent')
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 print("=" * 50)
 print("Text2SQL 智能体 - 模块测试")
@@ -104,7 +106,7 @@ print("  ✓ DROP 查询拦截")
 print("\n[5] 测试提示词模板结构...")
 
 # 验证模板文件存在且包含必要内容
-with open('/Users/rgj/.openclaw/workspace/text2sql_agent/core/chain/prompts.py', 'r', encoding='utf-8') as f:
+with (PROJECT_ROOT / 'core/chain/prompts.py').open('r', encoding='utf-8') as f:
     prompts_content = f.read()
 
 assert 'SQL_GENERATION_SYSTEM_PROMPT' in prompts_content, "缺少系统提示词"
@@ -120,7 +122,7 @@ print("  ✓ 必要的占位符完整")
 print("\n[6] 测试项目结构...")
 import os
 
-root = '/Users/rgj/.openclaw/workspace/text2sql_agent'
+root = PROJECT_ROOT
 
 required_files = [
     'config.py',
@@ -195,7 +197,7 @@ if all_passed:
     print("\n项目已完成初始化，可以开始使用。")
     print("\n下一步:")
     print("1. 安装依赖：pip install -r requirements.txt")
-    print("2. 配置环境变量：cp .env.example .env")
+    print("2. 配置环境变量：cp env.example .env")
     print("3. 初始化数据库：mysql -u root -p < schema.sql")
     print("4. 启动应用：streamlit run app.py")
 else:

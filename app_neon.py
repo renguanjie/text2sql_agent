@@ -4,10 +4,11 @@ Text2SQL 智能体 - Neon PostgreSQL 版本
 """
 import streamlit as st
 import sys
+import os
 from pathlib import Path
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
 from config import (
@@ -87,7 +88,7 @@ with st.sidebar:
     st.subheader("🗄️ 数据库配置")
     neon_url = st.text_input(
         "Neon PostgreSQL URL",
-        value="postgresql://neondb_owner:npg_oGspmF6zTY9w@ep-polished-snow-ak3wzf24.c-3.us-west-2.aws.neon.tech/neondb?sslmode=require",
+        value=os.getenv("NEON_DB_URL", ""),
         type="password",
         help="Neon PostgreSQL 连接字符串"
     )

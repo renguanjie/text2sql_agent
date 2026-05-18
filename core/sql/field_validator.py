@@ -3,6 +3,8 @@ SQL 字段验证器
 验证生成的 SQL 中使用的表名和字段名是否存在于数据库中
 使用 sqlglot 进行 AST 解析，精准提取表名和字段名
 """
+import os
+
 from sqlalchemy import create_engine, inspect, text
 from typing import Dict, List, Set, Tuple, Optional, Any
 from loguru import logger
@@ -460,13 +462,15 @@ class SQLFieldValidator:
 
 def test_validator():
     """测试字段验证器 - AST 解析 vs 正则"""
-    NEON_URL = "postgresql://neondb_owner:npg_oGspmF6zTY9w@ep-polished-snow-ak3wzf24.c-3.us-west-2.aws.neon.tech/neondb?sslmode=require"
+    neon_url = os.getenv("NEON_DB_URL")
+    if not neon_url:
+        raise RuntimeError("请先设置 NEON_DB_URL 后再运行字段验证器测试")
 
     print("=" * 60)
     print("SQL 字段验证器测试 (AST 解析)")
     print("=" * 60)
 
-    validator = SQLFieldValidator(NEON_URL)
+    validator = SQLFieldValidator(neon_url)
 
     # 测试用例 - 包含复杂 SQL 场景
     test_cases = [

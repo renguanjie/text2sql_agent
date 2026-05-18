@@ -92,7 +92,13 @@ text2sql_agent/
 │       ├── kg_builder.py       # 知识图谱构建页面
 │       └── graph_builder.py    # 图谱状态页面
 ├── tests/                      # 测试
-│   └── test_graph_builder.py
+│   ├── conftest.py             # pytest 统一项目路径配置
+│   ├── test_core.py            # 核心模块单元测试
+│   ├── test_offline.py         # 离线脚本式测试
+│   ├── test_comprehensive.py   # 综合测试与报告生成
+│   ├── test_graph_builder.py   # 知识图谱构建测试
+│   ├── test_llm_integration.py # LLM + Neo4j + Neon 集成测试
+│   └── test_neon_text2sql.py   # Neon PostgreSQL Text2SQL 测试
 └── logs/                       # 日志目录
 ```
 
@@ -124,7 +130,7 @@ pip install -r requirements.txt
 ### 3. 配置环境变量
 
 ```bash
-cp .env.example .env
+cp env.example .env
 # 编辑 .env 文件，配置数据库和 LLM
 ```
 
@@ -143,6 +149,44 @@ streamlit run app.py
 
 访问 http://localhost:8501
 
+服务器部署时可以使用一键启动脚本：
+
+```bash
+chmod +x scripts/start_server.sh
+./scripts/start_server.sh
+```
+
+脚本会自动完成以下操作：
+
+- 如果缺少 `.env`，从 `env.example` 创建一份。
+- 创建 `logs/`、`python_deps/` 和 `.pip_cache/`。
+- 将 `requirements.txt` 依赖安装到项目内的 `python_deps/` 目录。
+- 根据 `requirements.txt` 哈希判断依赖是否变化，未变化时跳过安装。
+- 通过 `python -m streamlit run app.py` 启动服务，默认监听 `0.0.0.0:8501`。
+
+常用部署参数可以写入 `.env`，也可以临时通过环境变量覆盖：
+
+```bash
+STREAMLIT_PORT=8502 ./scripts/start_server.sh
+PYTHON_BIN=/usr/bin/python3.11 PYTHON_DEPS_DIR=/opt/text2sql/python_deps ./scripts/start_server.sh
+INSTALL_DEPS=0 ./scripts/start_server.sh
+```
+
+### 6. 运行测试
+
+```bash
+# 默认运行离线/单元测试；真实数据库和外部 LLM 测试会在缺配置时跳过
+pytest tests
+
+# 运行需要 MySQL/Neo4j 的集成测试
+TEXT2SQL_RUN_DB_TESTS=1 pytest tests/test_comprehensive.py tests/test_graph_builder.py
+
+# 运行 Neon/LLM 集成测试前需要配置 NEON_DB_URL 和 LLM_API_KEY
+NEON_DB_URL=postgresql://... LLM_API_KEY=... pytest tests/test_llm_integration.py tests/test_neon_text2sql.py
+```
+
+测试脚本统一放在 `tests/` 目录下。原先根目录的 `test_llm_integration.py`、`test_neon_text2sql.py` 已归入该目录，并改为通过环境变量读取外部服务配置，避免在测试代码中硬编码密钥和旧工作区路径。
+
 ## 📋 配置说明
 
 ### 环境变量完整列表
@@ -158,6 +202,7 @@ streamlit run app.py
 | **MYSQL_POOL_SIZE** | ✨ MySQL 连接池大小 | 10 |
 | **MYSQL_MAX_OVERFLOW** | ✨ 最大溢出连接数 | 20 |
 | **MYSQL_POOL_TIMEOUT** | ✨ 获取连接超时（秒） | 30 |
+| TEXT2SQL_RUN_DB_TESTS | 是否运行真实数据库集成测试 | 0 |
 
 #### Neo4j 配置
 | 变量名 | 说明 | 默认值 |
@@ -168,6 +213,22 @@ streamlit run app.py
 | NEO4J_PASSWORD | Neo4j 密码 | neo4j@123 |
 | **NEO4J_MAX_POOL_SIZE** | ✨ 最大连接池大小 | 50 |
 | **NEO4J_CONNECTION_TIMEOUT** | ✨ 连接超时（秒） | 30 |
+
+#### Neon 集成测试配置
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| NEON_DB_URL | Neon PostgreSQL 连接 URL，仅集成测试使用 | - |
+
+#### 启动脚本配置
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| STREAMLIT_ADDRESS | Streamlit 监听地址 | 0.0.0.0 |
+| STREAMLIT_PORT | Streamlit 监听端口 | 8501 |
+| APP_ENTRY | Streamlit 入口文件 | app.py |
+| PYTHON_BIN | 指定 Python 可执行文件 | 自动查找 python3/python |
+| PYTHON_DEPS_DIR | Python 依赖安装目录 | python_deps |
+| PIP_CACHE_DIR | pip 缓存目录 | .pip_cache |
+| INSTALL_DEPS | 启动时是否检查并安装依赖 | 1 |
 
 #### LLM 配置
 | 变量名 | 说明 | 默认值 |

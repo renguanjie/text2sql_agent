@@ -4,10 +4,11 @@ Text2SQL 智能体 - Streamlit 主入口
 """
 import streamlit as st
 import sys
+import json
 from pathlib import Path
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
 from config import (
@@ -25,6 +26,126 @@ from core.app_context import ApplicationContext
 from core.sql.validator import validate_sql
 from loguru import logger
 import uuid
+
+
+def get_knowledge_graph_template() -> dict:
+    """返回知识图谱 JSON 导入模板。"""
+    return {
+        "version": "2.0",
+        "format": "text2sql_knowledge_graph",
+        "nodes": [
+            {
+                "label": "Database",
+                "properties": {
+                    "database_id": 1,
+                    "name": "example_db",
+                    "db_type": "mysql",
+                    "db_language": "SQL",
+                    "description": "示例数据库"
+                }
+            },
+            {
+                "label": "Table",
+                "properties": {
+                    "name": "customer",
+                    "database": "example_db",
+                    "database_id": 1,
+                    "description": "客户表",
+                    "is_view": False
+                }
+            },
+            {
+                "label": "Column",
+                "properties": {
+                    "name": "customer_id",
+                    "table_name": "customer",
+                    "database_id": 1,
+                    "data_type": "BIGINT",
+                    "description": "客户 ID",
+                    "is_primary_key": True,
+                    "is_nullable": False
+                }
+            }
+        ],
+        "edges": [
+            {
+                "type": "HAS_TABLE",
+                "start": {
+                    "label": "Database",
+                    "properties": {"database_id": 1, "name": "example_db"}
+                },
+                "end": {
+                    "label": "Table",
+                    "properties": {"database_id": 1, "name": "customer"}
+                },
+                "properties": {}
+            },
+            {
+                "type": "HAS_COLUMN",
+                "start": {
+                    "label": "Table",
+                    "properties": {"database_id": 1, "name": "customer"}
+                },
+                "end": {
+                    "label": "Column",
+                    "properties": {"database_id": 1, "table_name": "customer", "name": "customer_id"}
+                },
+                "properties": {}
+            }
+        ],
+        "databases": [
+            {
+                "database_id": 1,
+                "name": "example_db",
+                "db_type": "mysql",
+                "db_language": "SQL",
+                "description": "示例数据库"
+            }
+        ],
+        "tables": [
+            {
+                "name": "customer",
+                "database": "example_db",
+                "database_id": 1,
+                "description": "客户表",
+                "is_view": False
+            }
+        ],
+        "columns": [
+            {
+                "name": "customer_id",
+                "table_name": "customer",
+                "database_id": 1,
+                "data_type": "BIGINT",
+                "description": "客户 ID",
+                "is_primary_key": True,
+                "is_nullable": False
+            }
+        ],
+        "relationships": [
+            {
+                "relationship_type": "CONNECTS",
+                "from_table": "customer",
+                "from_database_id": 1,
+                "from_column": "customer_id",
+                "to_table": "order",
+                "to_database_id": 1,
+                "to_column": "customer_id",
+                "join_type": "LEFT JOIN",
+                "weight": 1.0,
+                "occurrence_count": 1,
+                "source": "manual"
+            }
+        ],
+        "concepts": [
+            {
+                "name": "客户域",
+                "description": "客户相关数据",
+                "tags": ["客户"],
+                "related_tables": ["customer"]
+            }
+        ]
+    }
 
 # 配置日志
 logger.remove()
@@ -264,7 +385,6 @@ with st.sidebar:
                     with st.spinner("正在导出知识库..."):
                         export_data = neo4j.export_knowledge_graph()
                         if export_data:
-                            import json
                             json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
                             st.download_button(
                                 label="📥 点击下载 JSON 文件",
@@ -274,8 +394,14 @@ with st.sidebar:
                                 use_container_width=True
                             )
         with col2:
-            if st.button("📥 导入", use_container_width=True, type="secondary"):
-                pass
+            st.download_button(
+                label="⬇️ 下载模板",
+                data=json.dumps(get_knowledge_graph_template(), ensure_ascii=False, indent=2),
+                file_name="knowledge_graph_template.json",
+                mime="application/json",
+                use_container_width=True,
+                help="下载可导入的知识图谱 JSON 模板"
+            )
 
         uploaded_file = st.file_uploader(
             "上传知识库 JSON 文件",
@@ -285,20 +411,91 @@ with st.sidebar:
         )
 
         if uploaded_file is not None:
-            if st.checkbox("✓ 我已了解风险，确认导入将覆盖现有知识图谱", key="confirm_import_kg"):
-                with st.spinner("正在导入知识库..."):
-                    try:
-                        import json
-                        content = uploaded_file.read().decode('utf-8')
-                        import_data = json.loads(content)
-                        result = neo4j.import_knowledge_graph(import_data)
-                        if "error" in result:
-                            st.error(f"导入失败：{result['error']}")
-                        else:
-                            st.success(f"✅ 导入完成：{result['nodes']} 个节点，{result['relationships']} 个关系")
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"导入失败：{e}")
+            try:
+                content = uploaded_file.getvalue().decode('utf-8')
+                import_data = json.loads(content)
+            except UnicodeDecodeError:
+                import_data = None
+                st.error("JSON 文件编码异常，请使用 UTF-8 编码后重新上传。")
+            except json.JSONDecodeError as e:
+                import_data = None
+                st.error(f"JSON 格式异常：第 {e.lineno} 行第 {e.colno} 列，{e.msg}")
+
+            if import_data is None:
+                st.warning("格式异常，是否下载模板后按模板调整？")
+                st.download_button(
+                    label="⬇️ 下载知识图谱 JSON 模板",
+                    data=json.dumps(get_knowledge_graph_template(), ensure_ascii=False, indent=2),
+                    file_name="knowledge_graph_template.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+            else:
+                validation = neo4j.validate_knowledge_graph_json(import_data)
+                if not validation["valid"]:
+                    st.error("知识图谱 JSON 结构异常：")
+                    for error in validation["errors"]:
+                        st.write(f"- {error}")
+                    st.warning("是否下载模板后按模板调整？")
+                    st.download_button(
+                        label="⬇️ 下载知识图谱 JSON 模板",
+                        data=json.dumps(get_knowledge_graph_template(), ensure_ascii=False, indent=2),
+                        file_name="knowledge_graph_template.json",
+                        mime="application/json",
+                        use_container_width=True
+                    )
+                else:
+                    database_refs = validation.get("database_refs", [])
+                    existing_databases = neo4j.get_existing_import_databases(import_data)
+                    if database_refs:
+                        st.caption("导入文件包含数据库：" + "、".join(
+                            str(db.get("name") or db.get("database_id")) for db in database_refs
+                        ))
+
+                    if existing_databases:
+                        st.warning(
+                            "检测到导入文件中的数据库图谱已存在："
+                            + "、".join(str(db.get("name") or db.get("database_id")) for db in existing_databases)
+                            + "。请确认是否覆盖这些数据库的现有图谱。"
+                        )
+                        confirm_import = st.checkbox(
+                            "✓ 确认覆盖已存在数据库图谱",
+                            key="confirm_overwrite_import_kg"
+                        )
+                        import_clicked = st.button(
+                            "覆盖并导入",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not confirm_import,
+                            key="overwrite_import_kg_btn"
+                        )
+                        overwrite = True
+                    else:
+                        st.info("未检测到同名或同 ID 数据库图谱，将直接导入。")
+                        import_clicked = st.button(
+                            "直接导入",
+                            type="primary",
+                            use_container_width=True,
+                            key="direct_import_kg_btn"
+                        )
+                        overwrite = False
+
+                    if import_clicked:
+                        with st.spinner("正在导入知识库..."):
+                            result = neo4j.import_knowledge_graph(import_data, overwrite=overwrite)
+                            if "error" in result:
+                                st.error(f"导入失败：{result['error']}")
+                            else:
+                                st.success(
+                                    f"✅ 导入完成：{result['nodes']} 个节点，"
+                                    f"{result['relationships']} 个关系"
+                                )
+                                if ctx:
+                                    ctx.reset()
+                                for key in ['initialized', 'app_context']:
+                                    if key in st.session_state:
+                                        del st.session_state[key]
+                                st.rerun()
 
         col_clear1, col_clear2 = st.columns([3, 1])
         with col_clear1:

@@ -10,6 +10,7 @@ from loguru import logger
 import json
 import asyncio
 from datetime import datetime
+from neo4j.time import DateTime, Date, Time, Duration
 
 
 class Neo4jClient:
@@ -362,52 +363,61 @@ class Neo4jClient:
             return {}
 
         try:
-            # 导出数据库
-            databases = self.execute_query("""
-                MATCH (d:Database)
-                RETURN d.database_id as database_id, d.name as name, d.db_type as db_type,
-                       d.db_language as db_language, d.description as description,
-                       d.host as host, d.port as port, d.version as version
-            """)
-
-            # 导出表
-            tables = self.execute_query("""
-                MATCH (t:Table)
-                OPTIONAL MATCH (d:Database)-[:HAS_TABLE]->(t)
-                RETURN t.name as name, t.description as description, t.schema as schema,
-                       t.database_id as database_id, d.name as database_name
-            """)
-
-            # 导出字段
-            columns = self.execute_query("""
-                MATCH (c:Column)
-                RETURN c.name as name, c.type as type, c.description as description,
-                       c.is_primary_key as is_primary_key, c.is_nullable as is_nullable,
-                       c.order as order
-            """)
-
-            # 导出关系
-            relationships = self.execute_query("""
-                MATCH (start:Table)-[r:HAS_COLUMN|BELONGS_TO|REFERENCES]->(end)
-                RETURN start.name as from_table, type(r) as relationship_type, end.name as to_table,
-                       r.description as description
-            """)
-
-            # 导出业务概念
-            concepts = self.execute_query("""
-                MATCH (c:BusinessConcept)
-                OPTIONAL MATCH (t:Table)-[:RELATED_TO]->(c)
-                RETURN c.name as name, c.description as description, c.category as category,
-                       collect(t.name) as related_tables
-            """)
+            nodes = self._export_graph_nodes()
+            relationships = self._export_graph_relationships()
+            databases = [
+                node["properties"]
+                for node in nodes
+                if node["label"] == "Database"
+            ]
+            tables = [
+                node["properties"]
+                for node in nodes
+                if node["label"] == "Table"
+            ]
+            columns = [
+                node["properties"]
+                for node in nodes
+                if node["label"] == "Column"
+            ]
+            concepts = [
+                {
+                    **node["properties"],
+                    "related_tables": [
+                        rel["start"]["properties"].get("name")
+                        for rel in relationships
+                        if rel["type"] in {"RELATED_TO", "MAPPED_TO"}
+                        and rel["end"]["key"] == node["key"]
+                        and rel["start"]["label"] == "Table"
+                    ]
+                }
+                for node in nodes
+                if node["label"] == "BusinessConcept"
+            ]
 
             export_data = {
-                "version": "1.0",
+                "version": "2.0",
                 "exported_at": datetime.now().isoformat(),
+                "format": "text2sql_knowledge_graph",
+                "nodes": nodes,
+                "edges": relationships,
                 "databases": databases,
                 "tables": tables,
                 "columns": columns,
-                "relationships": relationships,
+                "relationships": [
+                    {
+                        "relationship_type": rel["type"],
+                        "from_table": rel["start"]["properties"].get("name"),
+                        "from_database_id": rel["start"]["properties"].get("database_id"),
+                        "from_column": rel["properties"].get("from_column"),
+                        "to_table": rel["end"]["properties"].get("name"),
+                        "to_database_id": rel["end"]["properties"].get("database_id"),
+                        "to_column": rel["properties"].get("to_column"),
+                        **rel["properties"],
+                    }
+                    for rel in relationships
+                    if rel["start"]["label"] == "Table" and rel["end"]["label"] == "Table"
+                ],
                 "concepts": concepts
             }
 
@@ -418,7 +428,84 @@ class Neo4jClient:
             logger.error(f"导出知识图谱失败：{e}")
             return {}
 
-    def import_knowledge_graph(self, import_data: Dict[str, Any]) -> Dict[str, int]:
+    def validate_knowledge_graph_json(self, import_data: Dict[str, Any]) -> Dict[str, Any]:
+        """校验知识图谱 JSON 格式，返回标准化校验结果。"""
+        errors = []
+        if not isinstance(import_data, dict):
+            return {"valid": False, "errors": ["JSON 顶层必须是对象"], "database_refs": []}
+
+        has_v2_graph = isinstance(import_data.get("nodes"), list) and isinstance(import_data.get("edges"), list)
+        has_legacy_graph = any(isinstance(import_data.get(key), list) for key in ("databases", "tables", "columns", "relationships", "concepts"))
+
+        if not has_v2_graph and not has_legacy_graph:
+            errors.append("缺少 nodes/edges 或 databases/tables/columns/relationships/concepts 数组")
+
+        if has_v2_graph:
+            for idx, node in enumerate(import_data.get("nodes", [])):
+                if not isinstance(node, dict):
+                    errors.append(f"nodes[{idx}] 必须是对象")
+                    continue
+                if not node.get("label") or not isinstance(node.get("properties"), dict):
+                    errors.append(f"nodes[{idx}] 缺少 label 或 properties")
+            for idx, edge in enumerate(import_data.get("edges", [])):
+                if not isinstance(edge, dict):
+                    errors.append(f"edges[{idx}] 必须是对象")
+                    continue
+                if not edge.get("type") or not isinstance(edge.get("start"), dict) or not isinstance(edge.get("end"), dict):
+                    errors.append(f"edges[{idx}] 缺少 type/start/end")
+
+        for key in ("databases", "tables", "columns", "relationships", "concepts"):
+            value = import_data.get(key)
+            if value is not None and not isinstance(value, list):
+                errors.append(f"{key} 必须是数组")
+
+        return {
+            "valid": not errors,
+            "errors": errors,
+            "database_refs": self.get_import_database_refs(import_data)
+        }
+
+    def get_import_database_refs(self, import_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """从导入 JSON 中提取数据库标识，兼容多数据库配置。"""
+        refs = {}
+
+        def add_ref(database_id=None, name=None):
+            if database_id is None and not name:
+                return
+            key = f"id:{database_id}" if database_id is not None else f"name:{name}"
+            refs[key] = {"database_id": database_id, "name": name}
+
+        for db in import_data.get("databases", []) or []:
+            if isinstance(db, dict):
+                add_ref(db.get("database_id") or db.get("id"), db.get("name"))
+
+        for node in import_data.get("nodes", []) or []:
+            if isinstance(node, dict) and node.get("label") == "Database":
+                props = node.get("properties") or {}
+                add_ref(props.get("database_id") or props.get("id"), props.get("name"))
+
+        for table in import_data.get("tables", []) or []:
+            if isinstance(table, dict):
+                add_ref(table.get("database_id"), table.get("database") or table.get("database_name"))
+
+        return list(refs.values())
+
+    def get_existing_import_databases(self, import_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """查询导入 JSON 涉及的数据库在当前图谱中是否已存在。"""
+        existing = []
+        for ref in self.get_import_database_refs(import_data):
+            result = self.execute_query("""
+                MATCH (d:Database)
+                WHERE ($database_id IS NOT NULL AND d.database_id = $database_id)
+                   OR ($name IS NOT NULL AND d.name = $name)
+                RETURN d.database_id as database_id, d.name as name
+                LIMIT 1
+            """, ref)
+            if result:
+                existing.append(result[0])
+        return existing
+
+    def import_knowledge_graph(self, import_data: Dict[str, Any], overwrite: bool = False) -> Dict[str, int]:
         """
         从 JSON 导入知识图谱（支持两种格式：标准格式和 graph_builder 格式）
 
@@ -433,6 +520,16 @@ class Neo4jClient:
             return {"nodes": 0, "relationships": 0}
 
         try:
+            validation = self.validate_knowledge_graph_json(import_data)
+            if not validation["valid"]:
+                return {"nodes": 0, "relationships": 0, "error": "；".join(validation["errors"])}
+
+            if overwrite:
+                self.clear_databases_from_import(import_data)
+
+            if import_data.get("nodes") and import_data.get("edges"):
+                return self._import_v2_knowledge_graph(import_data)
+
             stats = {"nodes": 0, "relationships": 0, "databases": 0, "tables": 0, "columns": 0, "concepts": 0}
 
             # 1. 导入数据库
@@ -588,6 +685,279 @@ class Neo4jClient:
         except Exception as e:
             logger.error(f"导入知识图谱失败：{e}")
             return {"nodes": 0, "relationships": 0, "error": str(e)}
+
+    def clear_databases_from_import(self, import_data: Dict[str, Any]) -> Dict[str, int]:
+        """删除导入 JSON 涉及的数据库子图，用于覆盖式导入。"""
+        total = {"nodes": 0, "relationships": 0}
+        refs = self.get_import_database_refs(import_data)
+        for ref in refs:
+            result = self.execute_query("""
+                MATCH (d:Database)
+                WHERE ($database_id IS NOT NULL AND d.database_id = $database_id)
+                   OR ($name IS NOT NULL AND d.name = $name)
+                OPTIONAL MATCH (d)-[:HAS_TABLE]->(t:Table)
+                OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
+                WITH collect(DISTINCT d) + collect(DISTINCT t) + collect(DISTINCT c) AS nodes
+                UNWIND nodes AS n
+                WITH DISTINCT n WHERE n IS NOT NULL
+                DETACH DELETE n
+                RETURN count(n) as deleted_nodes
+            """, ref)
+            total["nodes"] += result[0].get("deleted_nodes", 0) if result else 0
+
+        # 清理被覆盖数据库遗留下来的孤立业务概念
+        result = self.execute_query("""
+            MATCH (c:BusinessConcept)
+            WHERE NOT (c)--()
+            DELETE c
+            RETURN count(c) as deleted_nodes
+        """)
+        total["nodes"] += result[0].get("deleted_nodes", 0) if result else 0
+        return total
+
+    def _export_graph_nodes(self) -> List[Dict[str, Any]]:
+        records = self.execute_query("""
+            MATCH (n)
+            WHERE n:Database OR n:Table OR n:Column OR n:BusinessConcept
+            RETURN labels(n) as labels, properties(n) as properties
+            ORDER BY labels(n)[0], coalesce(n.database_id, 0), coalesce(n.table_name, ''), coalesce(n.name, '')
+        """)
+        nodes = []
+        for record in records:
+            labels = record.get("labels") or []
+            label = self._primary_export_label(labels)
+            properties = self._json_safe(record.get("properties") or {})
+            nodes.append({
+                "label": label,
+                "labels": labels,
+                "key": self._node_key(label, properties),
+                "properties": properties,
+            })
+        return nodes
+
+    def _export_graph_relationships(self) -> List[Dict[str, Any]]:
+        records = self.execute_query("""
+            MATCH (start)-[r]->(end)
+            WHERE (start:Database OR start:Table OR start:Column OR start:BusinessConcept)
+              AND (end:Database OR end:Table OR end:Column OR end:BusinessConcept)
+            RETURN labels(start) as start_labels, properties(start) as start_properties,
+                   type(r) as type, properties(r) as properties,
+                   labels(end) as end_labels, properties(end) as end_properties
+            ORDER BY type(r)
+        """)
+        edges = []
+        for record in records:
+            start_label = self._primary_export_label(record.get("start_labels") or [])
+            end_label = self._primary_export_label(record.get("end_labels") or [])
+            start_props = self._json_safe(record.get("start_properties") or {})
+            end_props = self._json_safe(record.get("end_properties") or {})
+            edges.append({
+                "type": record.get("type"),
+                "start": {
+                    "label": start_label,
+                    "key": self._node_key(start_label, start_props),
+                    "properties": self._node_ref_properties(start_label, start_props),
+                },
+                "end": {
+                    "label": end_label,
+                    "key": self._node_key(end_label, end_props),
+                    "properties": self._node_ref_properties(end_label, end_props),
+                },
+                "properties": self._json_safe(record.get("properties") or {}),
+            })
+        return edges
+
+    def _import_v2_knowledge_graph(self, import_data: Dict[str, Any]) -> Dict[str, int]:
+        stats = {"nodes": 0, "relationships": 0, "databases": 0, "tables": 0, "columns": 0, "concepts": 0}
+        label_counts = {
+            "Database": "databases",
+            "Table": "tables",
+            "Column": "columns",
+            "BusinessConcept": "concepts",
+        }
+
+        for node in import_data.get("nodes", []):
+            label = node.get("label")
+            properties = self._neo4j_property_map(node.get("properties") or {})
+            if label not in label_counts:
+                continue
+            self._merge_node(label, properties)
+            stats[label_counts[label]] += 1
+
+        for edge in import_data.get("edges", []):
+            rel_type = self._safe_relationship_type(edge.get("type"))
+            if not rel_type:
+                continue
+            start = edge.get("start") or {}
+            end = edge.get("end") or {}
+            self._merge_relationship(
+                rel_type=rel_type,
+                start_label=start.get("label"),
+                start_props=start.get("properties") or {},
+                end_label=end.get("label"),
+                end_props=end.get("properties") or {},
+                properties=edge.get("properties") or {},
+            )
+            stats["relationships"] += 1
+
+        stats["nodes"] = stats["databases"] + stats["tables"] + stats["columns"] + stats["concepts"]
+        logger.info(f"知识图谱 v2 导入完成：{stats}")
+        return stats
+
+    def _merge_node(self, label: str, properties: Dict[str, Any]):
+        key_props = self._node_ref_properties(label, properties)
+        safe_props = self._neo4j_property_map(properties)
+        if label == "Database":
+            query = """
+                MERGE (n:Database {database_id: $key.database_id})
+                SET n += $props, n.updated_at = datetime()
+            """ if key_props.get("database_id") is not None else """
+                MERGE (n:Database {name: $key.name})
+                SET n += $props, n.updated_at = datetime()
+            """
+        elif label == "Table":
+            query = """
+                MERGE (n:Table {name: $key.name, database_id: $key.database_id})
+                SET n += $props, n.updated_at = datetime()
+            """
+        elif label == "Column":
+            query = """
+                MERGE (n:Column {name: $key.name, table_name: $key.table_name, database_id: $key.database_id})
+                SET n += $props, n.updated_at = datetime()
+            """
+        elif label == "BusinessConcept":
+            query = """
+                MERGE (n:BusinessConcept {name: $key.name})
+                SET n += $props, n.updated_at = datetime()
+            """
+        else:
+            return
+        self.execute_query(query, {"key": key_props, "props": safe_props})
+
+    def _merge_relationship(self, rel_type: str, start_label: str, start_props: Dict[str, Any],
+                            end_label: str, end_props: Dict[str, Any], properties: Dict[str, Any]):
+        if start_label not in {"Database", "Table", "Column", "BusinessConcept"}:
+            return
+        if end_label not in {"Database", "Table", "Column", "BusinessConcept"}:
+            return
+
+        start_match = self._node_match_clause("start", start_label, "start_key")
+        end_match = self._node_match_clause("end", end_label, "end_key")
+        rel_key = self._relationship_key(rel_type, properties)
+        merge_clause = (
+            f"MERGE (start)-[r:{rel_type} {{relationship_key: $rel_key.relationship_key}}]->(end)"
+            if rel_key.get("relationship_key") else
+            f"MERGE (start)-[r:{rel_type}]->(end)"
+        )
+        query = f"""
+            {start_match}
+            {end_match}
+            {merge_clause}
+            SET r += $props, r.updated_at = datetime()
+        """
+        self.execute_query(query, {
+            "start_key": self._node_ref_properties(start_label, start_props),
+            "end_key": self._node_ref_properties(end_label, end_props),
+            "rel_key": rel_key,
+            "props": self._neo4j_property_map(properties),
+        })
+
+    def _node_match_clause(self, variable: str, label: str, key_name: str) -> str:
+        if label == "Database":
+            return f"""
+                MATCH ({variable}:Database)
+                WHERE (${key_name}.database_id IS NOT NULL AND {variable}.database_id = ${key_name}.database_id)
+                   OR (${key_name}.database_id IS NULL AND {variable}.name = ${key_name}.name)
+            """
+        if label == "Table":
+            return f"MATCH ({variable}:Table {{name: ${key_name}.name, database_id: ${key_name}.database_id}})"
+        if label == "Column":
+            return f"MATCH ({variable}:Column {{name: ${key_name}.name, table_name: ${key_name}.table_name, database_id: ${key_name}.database_id}})"
+        return f"MATCH ({variable}:BusinessConcept {{name: ${key_name}.name}})"
+
+    def _node_ref_properties(self, label: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        if label == "Database":
+            return {
+                "database_id": properties.get("database_id") or properties.get("id"),
+                "name": properties.get("name"),
+            }
+        if label == "Table":
+            return {
+                "database_id": properties.get("database_id"),
+                "name": properties.get("name"),
+            }
+        if label == "Column":
+            return {
+                "database_id": properties.get("database_id"),
+                "table_name": properties.get("table_name"),
+                "name": properties.get("name"),
+            }
+        return {"name": properties.get("name")}
+
+    def _node_key(self, label: str, properties: Dict[str, Any]) -> str:
+        ref = self._node_ref_properties(label, properties)
+        if label == "Database":
+            return f"Database:{ref.get('database_id') or ref.get('name')}"
+        if label == "Table":
+            return f"Table:{ref.get('database_id')}:{ref.get('name')}"
+        if label == "Column":
+            return f"Column:{ref.get('database_id')}:{ref.get('table_name')}:{ref.get('name')}"
+        return f"BusinessConcept:{ref.get('name')}"
+
+    def _primary_export_label(self, labels: List[str]) -> str:
+        for label in ("Database", "Table", "Column", "BusinessConcept"):
+            if label in labels:
+                return label
+        return labels[0] if labels else ""
+
+    def _safe_relationship_type(self, rel_type: str) -> Optional[str]:
+        if not rel_type:
+            return None
+        rel_type = str(rel_type).upper()
+        if not rel_type.replace("_", "").isalnum():
+            return None
+        return rel_type
+
+    def _relationship_key(self, rel_type: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+        if rel_type in {"CONNECTS", "REFERENCES"}:
+            key = "|".join([
+                rel_type,
+                str(properties.get("relationship_type") or ""),
+                str(properties.get("from_column") or ""),
+                str(properties.get("to_column") or ""),
+                str(properties.get("source") or ""),
+            ])
+            return {"relationship_key": key}
+        return {"relationship_key": None}
+
+    def _json_safe(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, (DateTime, Date, Time, Duration)):
+            return str(value)
+        if hasattr(value, "iso_format"):
+            return value.iso_format()
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return value
+
+    def _neo4j_property_map(self, value: Dict[str, Any]) -> Dict[str, Any]:
+        safe = {}
+        for key, item in (value or {}).items():
+            if item is None:
+                safe[key] = None
+            elif isinstance(item, (str, int, float, bool)):
+                safe[key] = item
+            elif isinstance(item, list):
+                safe[key] = [
+                    i if isinstance(i, (str, int, float, bool)) else json.dumps(i, ensure_ascii=False, default=str)
+                    for i in item
+                ]
+            else:
+                safe[key] = json.dumps(item, ensure_ascii=False, default=str)
+        return safe
 
     def clear_knowledge_graph(self) -> Dict[str, int]:
         """

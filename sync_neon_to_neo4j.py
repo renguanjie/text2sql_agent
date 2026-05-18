@@ -3,15 +3,16 @@ Neon PostgreSQL 表结构同步到 Neo4j 知识库
 包含中文字段翻译和表关联关系构建
 """
 import json
+import os
 from neo4j import GraphDatabase
 from sqlalchemy import create_engine, inspect, text
 
 # ==================== 配置 ====================
 
-NEON_DB_URL = "postgresql://neondb_owner:npg_oGspmF6zTY9w@ep-polished-snow-ak3wzf24.c-3.us-west-2.aws.neon.tech/neondb?sslmode=require"
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "neo4j@123"
+NEON_DB_URL = os.getenv("NEON_DB_URL", "")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 
 # ==================== 字段中文翻译映射 ====================
 

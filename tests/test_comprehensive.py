@@ -3,15 +3,14 @@ Text2SQL 智能体 - 综合功能测试套件
 覆盖全部核心功能的 30+ 测试用例
 """
 import pytest
-import sys
-from pathlib import Path
+import os
 import json
 import time
 from datetime import datetime
+from pathlib import Path
 
-# 添加项目根目录到路径
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # ==================== 测试数据 ====================
 
@@ -114,8 +113,7 @@ class TestRetrieval:
         from core.retrieval.bm25_tfidf import TextPreprocessor
         preprocessor = TextPreprocessor()
         tokens = preprocessor.tokenize('查询，用户！数据？')
-        assert ',' not in str(tokens)
-        assert '!' not in str(tokens)
+        assert all(token not in {'，', '！', '？', ',', '!', '?'} for token in tokens)
         
     def test_06_hybrid_retriever_init(self):
         """测试 6: 混合检索器初始化"""
@@ -194,24 +192,15 @@ class TestSQLValidator:
         
     def test_15_safety_check_safe_sql(self):
         """测试 15: 安全 SQL 检查 (安全) - 跳过"""
-        # is_safe_sql 函数未实现，跳过
-        results['skipped'] += 1
-        print("  ⏭️ test_15_safety_check_safe_sql: 跳过 (is_safe_sql 未实现)")
-        return
+        pytest.skip("is_safe_sql 未实现")
         
     def test_16_safety_check_dangerous_sql(self):
         """测试 16: 安全 SQL 检查 (危险) - 跳过"""
-        # is_safe_sql 函数未实现，跳过
-        results['skipped'] += 1
-        print("  ⏭️ test_16_safety_check_dangerous_sql: 跳过 (is_safe_sql 未实现)")
-        return
+        pytest.skip("is_safe_sql 未实现")
         
     def test_17_safety_check_injection(self):
         """测试 17: SQL 注入检查 - 跳过"""
-        # is_safe_sql 函数未实现，跳过
-        results['skipped'] += 1
-        print("  ⏭️ test_17_safety_check_injection: 跳过 (is_safe_sql 未实现)")
-        return
+        pytest.skip("is_safe_sql 未实现")
 
 
 # ==================== SQL 生成器模块测试 ====================
@@ -221,28 +210,25 @@ class TestSQLGenerator:
     
     def test_18_extract_sql_from_response(self):
         """测试 18: 从响应提取 SQL - 跳过"""
-        # LangChain 兼容性问题，跳过
-        results['skipped'] += 1
-        print("  ⏭️ test_18_extract_sql_from_response: 跳过 (LangChain 兼容性)")
-        return
+        pytest.skip("LangChain 兼容性问题")
         
     def test_19_extract_sql_clean(self):
         """测试 19: 纯净 SQL 提取 - 跳过"""
-        results['skipped'] += 1
-        print("  ⏭️ test_19_extract_sql_clean: 跳过 (LangChain 兼容性)")
-        return
+        pytest.skip("LangChain 兼容性问题")
         
     def test_20_extract_sql_multiline(self):
         """测试 20: 多行 SQL 提取 - 跳过"""
-        results['skipped'] += 1
-        print("  ⏭️ test_20_extract_sql_multiline: 跳过 (LangChain 兼容性)")
-        return
+        pytest.skip("LangChain 兼容性问题")
 
 
 # ==================== MySQL 客户端测试 ====================
 
 class TestMySQLClient:
     """MySQL 客户端测试"""
+
+    def setup_method(self):
+        if os.getenv("TEXT2SQL_RUN_DB_TESTS") != "1":
+            pytest.skip("设置 TEXT2SQL_RUN_DB_TESTS=1 后运行真实 MySQL 集成测试")
     
     def test_21_mysql_connect(self):
         """测试 21: MySQL 连接"""
@@ -318,6 +304,8 @@ class TestNeo4jClient:
         
     def test_28_neo4j_client_connect(self):
         """测试 28: Neo4j 连接 (允许失败)"""
+        if os.getenv("TEXT2SQL_RUN_DB_TESTS") != "1":
+            pytest.skip("设置 TEXT2SQL_RUN_DB_TESTS=1 后运行真实 Neo4j 集成测试")
         from core.knowledge.neo4j_client import Neo4jClient
         client = Neo4jClient('bolt://localhost:7687', 'neo4j', 'neo4j@123')
         # Neo4j 可能未安装，连接失败也算通过测试
@@ -555,6 +543,10 @@ def run_tests_and_generate_report():
                         results['passed'] += 1
                         results['details'].append({'name': test_name, 'status': '✅ PASS', 'error': None})
                         print(f"  ✅ {method_name}")
+                except pytest.skip.Exception as e:
+                    results['skipped'] += 1
+                    results['details'].append({'name': test_name, 'status': '⏭️ SKIP', 'error': str(e)})
+                    print(f"  ⏭️ {method_name}: {e}")
                 except Exception as e:
                     results['failed'] += 1
                     results['details'].append({'name': test_name, 'status': '❌ FAIL', 'error': str(e)})
@@ -648,7 +640,7 @@ def run_tests_and_generate_report():
 ---
 
 *报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
-*测试文件位置：/Users/rgj/.openclaw/workspace/text2sql_agent/tests/test_comprehensive.py*
+*测试文件位置：{PROJECT_ROOT / 'tests/test_comprehensive.py'}*
 """
     
     # 写入报告
