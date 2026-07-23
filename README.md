@@ -2,8 +2,8 @@
 
 基于本地知识库的 SQL 智能生成系统
 
-> **最新版本**: v1.3
-> **核心升级**: 关系权重追踪 + JOIN 提取引擎 + 反馈驱动图谱增强 + 权重感知 Prompt
+> **最新版本**: v1.4
+> **核心升级**: 多模型 UI 热切换 + 安全加固 + SQL 注入防护 + 全链路代码质量优化
 
 ## 🎯 功能特性
 
@@ -16,6 +16,27 @@
 - 🔗 **Neo4j 知识图谱**: 从图数据库同步元数据
 - 💾 **MySQL 存储**: 历史数据和元数据持久化
 - 🏗️ **知识图谱构建**: 支持 DDL 文件/活体数据库构建图谱
+
+### 新增功能 (v1.4)
+
+| 功能 | 说明 | 状态 |
+|------|------|------|
+| ⚙️ **多模型 UI 热切换** | 系统信息页新增模型配置面板，支持 UI 手动切换 LLM 和 Embedding 模型 | ✅ |
+|  **7 大 LLM 提供商** | OpenAI / Ollama / Anthropic / DashScope / DeepSeek / 智谱 AI / Azure OpenAI | ✅ |
+| 🧩 **3 大 Embedding 提供商** | DashScope / OpenAI / Ollama，支持本地 bge-m3、nomic-embed-text | ✅ |
+| 🔄 **热重载** | 切换模型后自动重载相关组件，无需重启应用 | ✅ |
+| 🔒 **SQL 注入防护** | `_is_safe_query` 改用 sqlglot AST 解析，杜绝字符串匹配绕过 | ✅ |
+| 🛡️ **Cypher 注入防护** | Neo4j 标识符白名单校验，防止 label/rel_type 注入 | ✅ |
+|  **SQL 参数绑定修复** | `update_sql_execution` 改用 SQLAlchemy 命名参数，修复运行时错误 | ✅ |
+|  **连接泄漏修复** | `reset()` 先关闭连接再重置，消除重复初始化时的连接泄漏 | ✅ |
+|  **日志脱敏** | 日志中 SQL/Cypher 查询截断至 60-80 字符，防止敏感信息泄露 | ✅ |
+| 🗂️ **信息脱敏** | 系统信息页隐藏数据库主机/端口，仅显示连接状态 | ✅ |
+| ⚡ **Embedding LRU 缓存** | `OrderedDict` 实现 LRU 淘汰，上限 10000 条，防止内存无限增长 | ✅ |
+| 🔧 **文件上传安全** | 改用 `tempfile.NamedTemporaryFile` 唯一文件名，避免并发覆盖 | ✅ |
+| 🔗 **URI 编码** | 活体数据库连接凭据使用 `quote_plus` URL 编码，支持特殊字符密码 | ✅ |
+|  **Linter 缓存** | `validate_sql()` 按方言缓存 SQLValidator，避免重复创建 | ✅ |
+| 📊 **统计查询优化** | `get_statistics()` 5 次查询合并为 1 次 | ✅ |
+| 🏭 **组件管理统一** | `kg_builder` 改用 `ApplicationContext`，消除双 driver 实例 | ✅ |
 
 ### 新增功能 (v1.3)
 
@@ -233,17 +254,33 @@ NEON_DB_URL=postgresql://... LLM_API_KEY=... pytest tests/test_llm_integration.p
 #### LLM 配置
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| LLM_PROVIDER | LLM 提供商 | openai |
-| LLM_MODEL | LLM 模型 | gpt-4 |
+| LLM_PROVIDER | LLM 提供商（openai / ollama / anthropic / dashscope / deepseek / zhipu / azure） | ollama |
+| LLM_MODEL | LLM 模型 | gemma3:e4b |
 | LLM_API_KEY | LLM API Key | - |
-| LLM_BASE_URL | LLM API 基础 URL | - |
+| LLM_BASE_URL | LLM API 基础 URL | http://localhost:11434 |
 
-#### Embedding 配置（新增）
+> **支持的 LLM 提供商**：
+> - **OpenAI** — gpt-4o 等，使用 OpenAI 官方 API
+> - **Ollama** — gemma3:e4b、qwen2.5、llama3 等，本地部署，无需 API Key
+> - **Anthropic** — claude-sonnet-4-20250514 等，使用 Anthropic 官方 API
+> - **DashScope** — qwen-max 等，阿里云通义千问（OpenAI 兼容接口）
+> - **DeepSeek** — deepseek-chat 等，深度求索（OpenAI 兼容接口）
+> - **智谱 AI** — glm-4-flash 等，智谱清言（OpenAI 兼容接口）
+> - **Azure OpenAI** — gpt-4o 等，需 Azure 端点 URL
+
+> **也可在系统信息页通过 UI 直接切换模型，无需修改 `.env` 文件。**
+
+#### Embedding 配置
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| EMBEDDING_PROVIDER | Embedding 提供商 | dashscope |
-| EMBEDDING_MODEL | Embedding 模型 | text-embedding-v1 |
+| EMBEDDING_PROVIDER | Embedding 提供商（dashscope / openai / ollama） | ollama |
+| EMBEDDING_MODEL | Embedding 模型 | bge-m3:latest |
 | EMBEDDING_API_KEY | API Key | - |
+
+> **支持的 Embedding 提供商**：
+> - **DashScope** — text-embedding-v3 (1024 维)，通义千问
+> - **OpenAI** — text-embedding-3-large (3072 维)
+> - **Ollama** — bge-m3:latest (1024 维)、nomic-embed-text (768 维)，本地部署
 
 #### Few-Shot 配置（新增）
 | 变量名 | 说明 | 默认值 |
@@ -263,26 +300,62 @@ NEON_DB_URL=postgresql://... LLM_API_KEY=... pytest tests/test_llm_integration.p
 ### LLM 配置示例
 
 ```bash
+# 本地 Ollama（默认）
+LLM_PROVIDER=ollama
+LLM_MODEL=gemma3:e4b
+LLM_BASE_URL=http://localhost:11434
+
 # OpenAI
 LLM_PROVIDER=openai
-LLM_MODEL=gpt-4
+LLM_MODEL=gpt-4o
 LLM_API_KEY=sk-xxx
+
+# Anthropic Claude
+LLM_PROVIDER=anthropic
+LLM_MODEL=claude-sonnet-4-20250514
+LLM_API_KEY=sk-ant-xxx
 
 # Azure OpenAI
 LLM_PROVIDER=azure
-LLM_MODEL=gpt-4
+LLM_MODEL=gpt-4o
 LLM_API_KEY=xxx
 LLM_BASE_URL=https://xxx.openai.azure.com
 
-# 本地 Ollama
-LLM_PROVIDER=ollama
-LLM_MODEL=llama2
-LLM_BASE_URL=http://localhost:11434
-
-# 通义千问
-LLM_PROVIDER=openai
+# DashScope 通义千问
+LLM_PROVIDER=dashscope
 LLM_MODEL=qwen-max
+LLM_API_KEY=sk-xxx
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# DeepSeek 深度求索
+LLM_PROVIDER=deepseek
+LLM_MODEL=deepseek-chat
+LLM_API_KEY=sk-xxx
+LLM_BASE_URL=https://api.deepseek.com/v1
+
+# 智谱 AI
+LLM_PROVIDER=zhipu
+LLM_MODEL=glm-4-flash
+LLM_API_KEY=xxx
+LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+```
+
+### Embedding 配置示例
+
+```bash
+# 本地 Ollama（默认）
+EMBEDDING_PROVIDER=ollama
+EMBEDDING_MODEL=bge-m3:latest
+
+# DashScope 通义千问
+EMBEDDING_PROVIDER=dashscope
+EMBEDDING_MODEL=text-embedding-v3
+EMBEDDING_API_KEY=sk-xxx
+
+# OpenAI
+EMBEDDING_PROVIDER=openai
+EMBEDDING_MODEL=text-embedding-3-large
+EMBEDDING_API_KEY=sk-xxx
 ```
 
 ## 📖 使用示例
@@ -563,6 +636,42 @@ python scripts/01_export_graph_to_md.py
 5. **连接池**: 高并发场景建议调大 pool_size
 
 ## 📝 更新日志
+
+### v1.4 (2026-07-24)
+
+**多模型 UI 热切换**:
+- ✅ 系统信息页新增「模型配置」面板，支持通过 UI 手动切换 LLM 和 Embedding 模型
+- ✅ 支持 7 大 LLM 提供商：OpenAI、Ollama、Anthropic、DashScope、DeepSeek、智谱 AI、Azure OpenAI
+- ✅ 支持 3 大 Embedding 提供商：DashScope、OpenAI、Ollama
+- ✅ 切换后自动热重载相关组件（LLM 切换保留数据库连接，Embedding 切换重建知识库索引）
+- ✅ 提供商切换时 API Key / Base URL 字段按需要自动显隐，带默认值提示
+- ✅ 支持一键恢复为 `.env` 中的默认配置
+- ✅ `llm_factory.py` 新增 DashScope / DeepSeek / 智谱 provider（复用 OpenAI 兼容 API）
+- ✅ `embedding_factory.py` 新增 Ollama embedding provider（HTTP REST API 调用，无需额外 SDK）
+
+**安全加固**:
+- ✅ `_is_safe_query` 改用 sqlglot AST 解析判断顶层语句类型，仅允许 SELECT/WITH/UNION，杜绝字符串匹配绕过（注释、CTE、分号等）
+- ✅ 回退模式增强：去除 SQL 注释 + 按分号拆分多语句逐条检查
+- ✅ Neo4j `_safe_identifier` 白名单校验，label / rel_type 仅允许字母/数字/下划线
+- ✅ `get_all_nodes`、`get_node_by_name`、`_merge_relationship` 全部接入标识符校验
+- ✅ 系统信息页脱敏展示：隐藏 MySQL 主机/端口、Neo4j URI，仅显示连接状态
+- ✅ 日志中 SQL/Cypher 查询截断至 60-80 字符，防止敏感数据泄露
+
+**Bug 修复**:
+- ✅ `update_sql_execution` 改用 SQLAlchemy 命名参数（`:name`），修复 `%s` 占位符导致运行时错误
+- ✅ `reset()` 先调用 `shutdown()` 关闭连接再重置，消除重复初始化时的连接泄漏
+- ✅ `kg_builder.py` 改用 `app_context.neo4j_client`，消除废弃全局单例导致的 Neo4j 双 driver 实例
+- ✅ 文件上传改用 `tempfile.NamedTemporaryFile` 生成唯一文件名，避免并发覆盖
+- ✅ 活体数据库连接 URI 使用 `urllib.parse.quote_plus` 编码凭据，支持含特殊字符的密码
+
+**性能优化**:
+- ✅ Embedding 缓存改用 `OrderedDict` LRU 淘汰，上限 10000 条，防止内存无限增长
+- ✅ `validate_sql()` 按方言缓存 `SQLValidator` 实例，避免每次调用重建 Linter
+- ✅ `get_statistics()` 5 次独立查询合并为 1 次带子查询的 SQL
+
+**默认配置变更**:
+- ✅ 默认 LLM 切换为本地 Ollama `gemma3:e4b`
+- ✅ 默认 Embedding 切换为本地 Ollama `bge-m3:latest`（1024 维 dense）
 
 ### v1.3 (2026-04-12)
 

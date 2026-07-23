@@ -326,6 +326,17 @@ class SQLExecutionValidator:
         return tables
 
 
+# 模块级 Linter 缓存，避免重复创建（按方言缓存）
+_validator_cache: Dict[str, 'SQLValidator'] = {}
+
+
+def _get_cached_validator(dialect: str) -> 'SQLValidator':
+    """获取或创建指定方言的缓存 SQLValidator 实例"""
+    if dialect not in _validator_cache:
+        _validator_cache[dialect] = SQLValidator(dialect=dialect)
+    return _validator_cache[dialect]
+
+
 def validate_sql(sql: str, dialect: str = "mysql",
                 execution_check: bool = True) -> Dict[str, Any]:
     """
@@ -339,8 +350,8 @@ def validate_sql(sql: str, dialect: str = "mysql",
     Returns:
         Dict: 校验结果
     """
-    # SQLFluff 校验
-    validator = SQLValidator(dialect=dialect)
+    # SQLFluff 校验（使用缓存的 validator）
+    validator = _get_cached_validator(dialect)
     syntax_result = validator.validate(sql)
 
     # 执行前校验

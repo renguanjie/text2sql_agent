@@ -313,7 +313,7 @@ class SQLGenerator:
         if not self.mysql_client:
             return {'status': 'error', 'error': 'MySQL 客户端未连接', 'data': None}
 
-        logger.info(f"执行 SQL: {sql[:100]}...")
+        logger.info(f"执行 SQL: {sql[:60].replace(chr(10), ' ')}...")
 
         try:
             if not self._is_safe_query(sql):
@@ -341,12 +341,52 @@ class SQLGenerator:
             return {'status': 'fail', 'error': str(e), 'data': None}
 
     def _is_safe_query(self, sql: str) -> bool:
-        """检查 SQL 是否安全（只允许 SELECT）"""
-        sql_upper = sql.strip().upper()
-        unsafe_keywords = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE']
-        for keyword in unsafe_keywords:
-            if sql_upper.startswith(keyword) or f" {keyword} " in sql_upper:
+        """检查 SQL 是否安全（只允许 SELECT / WITH ... SELECT）
+
+        优先使用 sqlglot AST 解析顶层语句类型，避免字符串匹配的绕过风险。
+        解析失败时回退到关键字检查。
+        """
+        # 尝试用 sqlglot AST 解析
+        try:
+            import sqlglot
+            parsed = sqlglot.parse(sql)
+            if not parsed:
                 return False
+            for statement in parsed:
+                if statement is None:
+                    continue
+                stmt_type = type(statement).__name__
+                # 仅允许 SELECT、UNION（查询组合）、With（CTE 包裹的查询）
+                if stmt_type not in ('Select', 'Union', 'With'):
+                    return False
+                # 对于 With 语句，检查其主体是否也是 SELECT
+                if stmt_type == 'With':
+                    body = statement.args.get('this')
+                    if body and type(body).__name__ not in ('Select', 'Union'):
+                        return False
+            return True
+        except ImportError:
+            logger.warning("sqlglot 未安装，SQL 安全校验回退到关键字模式")
+        except Exception as e:
+            logger.warning(f"sqlglot 解析失败，回退到关键字模式: {e}")
+
+        # 回退：增强版关键字检查（去注释 + 多语句拆分）
+        import re
+        sql_upper = sql.strip().upper()
+        sql_no_comments = re.sub(r'--.*$', '', sql_upper, flags=re.MULTILINE)
+        sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
+        for stmt in sql_no_comments.split(';'):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            unsafe_keywords = [
+                'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE',
+                'ALTER', 'TRUNCATE', 'EXEC', 'EXECUTE', 'GRANT', 'REVOKE',
+                'MERGE', 'REPLACE',
+            ]
+            for keyword in unsafe_keywords:
+                if stmt.startswith(keyword) or f' {keyword} ' in f' {stmt} ':
+                    return False
         return True
 
     def fix_and_retry(self, history_id: int, error: str) -> Dict[str, Any]:

@@ -5,6 +5,7 @@ Text2SQL 智能体 - Streamlit 主入口
 import streamlit as st
 import sys
 import json
+import os
 from pathlib import Path
 
 # 添加项目根目录到路径
@@ -15,6 +16,7 @@ from config import (
     MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
     NEO4J_ENABLED, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE,
     LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL,
+    LLM_PROVIDERS, EMBEDDING_PROVIDERS,
     RETRIEVAL_TOP_K, SQL_DIALECT,
     BM25_K1, BM25_B, BM25_WEIGHT, DENSE_WEIGHT,
     FAISS_ENABLED, FAISS_EMBEDDING_DIM, FAISS_INDEX_TYPE,
@@ -291,6 +293,249 @@ def initialize_system():
     else:
         logger.error("系统初始化失败")
         return None
+
+
+# ==================== 模型配置辅助函数 ====================
+
+def _apply_llm_config(provider: str, model: str, api_key: str, base_url: str) -> bool:
+    """应用 LLM 配置变更，热重载 LLM 相关组件"""
+    try:
+        # 更新环境变量
+        os.environ["LLM_PROVIDER"] = provider
+        os.environ["LLM_MODEL"] = model
+        os.environ["LLM_API_KEY"] = api_key
+        os.environ["LLM_BASE_URL"] = base_url
+
+        ctx = st.session_state.get("app_context")
+        if not ctx:
+            st.error("系统未初始化")
+            return False
+
+        # 更新 context 配置
+        ctx.config.update({
+            "llm_provider": provider, "llm_model": model,
+            "llm_api_key": api_key, "llm_base_url": base_url,
+        })
+
+        # 仅重载 LLM 相关组件（保留数据库连接）
+        ctx._init_llm()
+        ctx._init_sql_chain()
+        ctx._init_sql_generator()
+        ctx._initialized = True
+
+        logger.info(f"LLM 配置已更新：{provider}/{model}")
+        return True
+    except Exception as e:
+        logger.error(f"LLM 配置更新失败：{e}")
+        return False
+
+
+def _apply_embedding_config(provider: str, model: str, api_key: str) -> bool:
+    """应用 Embedding 配置变更，热重载 Embedding 和检索器"""
+    try:
+        os.environ["EMBEDDING_PROVIDER"] = provider
+        os.environ["EMBEDDING_MODEL"] = model
+        os.environ["EMBEDDING_API_KEY"] = api_key
+
+        ctx = st.session_state.get("app_context")
+        if not ctx:
+            st.error("系统未初始化")
+            return False
+
+        # 获取新 embedding 维度
+        from config import EMBEDDING_PROVIDERS as _EP
+        dim = _EP.get(provider, {}).get("dimensions", 1536)
+
+        ctx.config.update({
+            "embedding_provider": provider, "embedding_model": model,
+            "embedding_api_key": api_key, "faiss_embedding_dim": dim,
+        })
+
+        # 重建 Embedding → Retriever → Generator 链路
+        ctx._init_embedding()
+        ctx._init_retriever()
+        ctx._init_sql_generator()
+        ctx._load_knowledge_base()
+
+        # 重建 Few-Shot 索引
+        if ctx.mysql_client:
+            try:
+                history_records = ctx.mysql_client.get_history_list(limit=100)
+                ctx.knowledge_retriever.build_few_shot_index(history_records)
+            except Exception:
+                pass
+
+        ctx._initialized = True
+        logger.info(f"Embedding 配置已更新：{provider}/{model}")
+        return True
+    except Exception as e:
+        logger.error(f"Embedding 配置更新失败：{e}")
+        return False
+
+
+def _render_model_config_panel():
+    """渲染模型配置 UI 面板（LLM + Embedding）"""
+    st.markdown("### ️ 模型配置")
+    st.caption("切换大语言模型或向量模型后点击保存，系统将自动重载相关组件。")
+
+    ctx = st.session_state.get("app_context")
+
+    # 读取当前配置（优先从 session_state 覆盖值，否则从环境变量）
+    current_llm_provider = st.session_state.get("_llm_provider", LLM_PROVIDER)
+    current_llm_model = st.session_state.get("_llm_model", LLM_MODEL)
+    current_llm_api_key = st.session_state.get("_llm_api_key", LLM_API_KEY)
+    current_llm_base_url = st.session_state.get("_llm_base_url", LLM_BASE_URL)
+
+    current_emb_provider = st.session_state.get("_emb_provider", EMBEDDING_PROVIDER)
+    current_emb_model = st.session_state.get("_emb_model", EMBEDDING_MODEL)
+    current_emb_api_key = st.session_state.get("_emb_api_key", EMBEDDING_API_KEY)
+
+    # ── LLM 配置 ──
+    with st.expander("── 大语言模型 (LLM) ──", expanded=False):
+        provider_labels = {k: v["label"] for k, v in LLM_PROVIDERS.items()}
+        provider_keys = list(LLM_PROVIDERS.keys())
+        provider_display = [provider_labels[k] for k in provider_keys]
+
+        current_idx = provider_keys.index(current_llm_provider) if current_llm_provider in provider_keys else 0
+
+        selected_label = st.selectbox(
+            "提供商",
+            options=provider_display,
+            index=current_idx,
+            key="cfg_llm_provider",
+        )
+        selected_provider = provider_keys[provider_display.index(selected_label)]
+        provider_info = LLM_PROVIDERS[selected_provider]
+
+        # 默认模型：如果用户手动填过就用用户的，否则用提供商推荐
+        if st.session_state.get("_llm_model"):
+            default_model = st.session_state["_llm_model"]
+        else:
+            default_model = provider_info["default_model"]
+
+        st.text_input(
+            "模型名称",
+            value=default_model,
+            key="cfg_llm_model",
+            help="输入模型名称，如 gpt-4o、qwen-max、qwen2.5 等",
+        )
+
+        if provider_info["needs_api_key"]:
+            st.text_input(
+                "API Key",
+                value=current_llm_api_key,
+                type="password",
+                key="cfg_llm_api_key",
+                help="留空则使用 .env 中的配置",
+            )
+        else:
+            st.caption("此提供商无需 API Key")
+            st.session_state["cfg_llm_api_key"] = ""
+
+        if provider_info["needs_base_url"]:
+            st.text_input(
+                "Base URL",
+                value=current_llm_base_url or provider_info["default_base_url"],
+                key="cfg_llm_base_url",
+                help=f"默认：{provider_info['default_base_url'] or '（无）'}",
+            )
+        else:
+            st.caption("使用官方默认 API 地址")
+            st.session_state["cfg_llm_base_url"] = ""
+
+        col_save_llm, col_reset_llm = st.columns([1, 1])
+        with col_save_llm:
+            if st.button(" 保存并重新加载 LLM", use_container_width=True, type="primary", key="btn_save_llm"):
+                new_provider = selected_provider
+                new_model = st.session_state.get("cfg_llm_model", provider_info["default_model"])
+                new_api_key = st.session_state.get("cfg_llm_api_key", current_llm_api_key)
+                new_base_url = st.session_state.get("cfg_llm_base_url", "")
+
+                with st.spinner("正在重新加载 LLM..."):
+                    ok = _apply_llm_config(new_provider, new_model, new_api_key, new_base_url)
+
+                if ok:
+                    # 持久化到 session_state，下次刷新时保持
+                    st.session_state["_llm_provider"] = new_provider
+                    st.session_state["_llm_model"] = new_model
+                    st.session_state["_llm_api_key"] = new_api_key
+                    st.session_state["_llm_base_url"] = new_base_url
+                    st.success(f"✅ LLM 已切换为：{LLM_PROVIDERS[new_provider]['label']} / {new_model}")
+                else:
+                    st.error("LLM 加载失败，请检查配置")
+
+        with col_reset_llm:
+            if st.button("️ 恢复默认 LLM 配置", use_container_width=True, key="btn_reset_llm"):
+                for k in ("_llm_provider", "_llm_model", "_llm_api_key", "_llm_base_url"):
+                    st.session_state.pop(k, None)
+                st.success("已恢复为 .env 中的默认配置，请刷新页面")
+
+    st.markdown("")
+
+    # ── Embedding 配置 ──
+    with st.expander("── 向量模型 (Embedding) ─", expanded=False):
+        emb_provider_labels = {k: v["label"] for k, v in EMBEDDING_PROVIDERS.items()}
+        emb_provider_keys = list(EMBEDDING_PROVIDERS.keys())
+        emb_provider_display = [emb_provider_labels[k] for k in emb_provider_keys]
+
+        current_emb_idx = emb_provider_keys.index(current_emb_provider) if current_emb_provider in emb_provider_keys else 0
+
+        selected_emb_label = st.selectbox(
+            "提供商",
+            options=emb_provider_display,
+            index=current_emb_idx,
+            key="cfg_emb_provider",
+        )
+        selected_emb_provider = emb_provider_keys[emb_provider_display.index(selected_emb_label)]
+        emb_provider_info = EMBEDDING_PROVIDERS[selected_emb_provider]
+
+        if st.session_state.get("_emb_model"):
+            emb_default_model = st.session_state["_emb_model"]
+        else:
+            emb_default_model = emb_provider_info["default_model"]
+
+        st.text_input(
+            "模型名称",
+            value=emb_default_model,
+            key="cfg_emb_model",
+            help=f"输入 Embedding 模型名称，如 text-embedding-v3、nomic-embed-text 等",
+        )
+
+        if emb_provider_info["needs_api_key"]:
+            st.text_input(
+                "API Key",
+                value=current_emb_api_key,
+                type="password",
+                key="cfg_emb_api_key",
+                help="留空则使用 .env 中的配置",
+            )
+        else:
+            st.caption("此提供商无需 API Key（本地模型）")
+            st.session_state["cfg_emb_api_key"] = ""
+
+        col_save_emb, col_reset_emb = st.columns([1, 1])
+        with col_save_emb:
+            if st.button("💾 保存并重新加载 Embedding", use_container_width=True, type="primary", key="btn_save_emb"):
+                new_emb_provider = selected_emb_provider
+                new_emb_model = st.session_state.get("cfg_emb_model", emb_provider_info["default_model"])
+                new_emb_api_key = st.session_state.get("cfg_emb_api_key", current_emb_api_key)
+
+                with st.spinner("正在重新加载 Embedding 和知识库索引..."):
+                    ok = _apply_embedding_config(new_emb_provider, new_emb_model, new_emb_api_key)
+
+                if ok:
+                    st.session_state["_emb_provider"] = new_emb_provider
+                    st.session_state["_emb_model"] = new_emb_model
+                    st.session_state["_emb_api_key"] = new_emb_api_key
+                    st.success(f"✅ Embedding 已切换为：{EMBEDDING_PROVIDERS[new_emb_provider]['label']} / {new_emb_model}")
+                else:
+                    st.error("Embedding 加载失败，请检查配置")
+
+        with col_reset_emb:
+            if st.button("↩️ 恢复默认 Embedding 配置", use_container_width=True, key="btn_reset_emb"):
+                for k in ("_emb_provider", "_emb_model", "_emb_api_key"):
+                    st.session_state.pop(k, None)
+                st.success("已恢复为 .env 中的默认配置，请刷新页面")
 
 
 # ==================== 侧边栏 ====================
@@ -845,41 +1090,46 @@ with tab3:
 
 with tab4:
     st.markdown("### ℹ️ 系统信息")
-    
+
+    # 读取当前生效的配置（UI 覆盖值优先于 .env）
+    _current_llm_provider = st.session_state.get("_llm_provider", LLM_PROVIDER)
+    _current_llm_model = st.session_state.get("_llm_model", LLM_MODEL)
+    _current_llm_base_url = st.session_state.get("_llm_base_url", LLM_BASE_URL)
+    _current_emb_provider = st.session_state.get("_emb_provider", EMBEDDING_PROVIDER)
+    _current_emb_model = st.session_state.get("_emb_model", EMBEDDING_MODEL)
+
     # 系统状态卡片
     st.markdown("#### 🔧 配置信息")
     config_col1, config_col2 = st.columns(2)
     with config_col1:
-        st.markdown("""
+        # LLM 配置展示（显示当前生效值 + 标签）
+        llm_label = LLM_PROVIDERS.get(_current_llm_provider, {}).get("label", _current_llm_provider)
+        st.markdown(f"""
         **LLM 配置**
-        - 提供商：{provider}
-        - 模型：{model}
-        - Base URL: {base_url}
-        """.format(
-            provider=LLM_PROVIDER,
-            model=LLM_MODEL,
-            base_url=LLM_BASE_URL or "OpenAI 默认"
-        ))
+        - 提供商：{llm_label}
+        - 模型：{_current_llm_model}
+        - Base URL: {_current_llm_base_url or "默认"}
+        """)
 
-        st.markdown("""
+        emb_label = EMBEDDING_PROVIDERS.get(_current_emb_provider, {}).get("label", _current_emb_provider)
+        st.markdown(f"""
         **Embedding 配置**
-        - 提供商：{emb_provider}
-        - 模型：{emb_model}
-        """.format(
-            emb_provider=EMBEDDING_PROVIDER,
-            emb_model=EMBEDDING_MODEL
-        ))
+        - 提供商：{emb_label}
+        - 模型：{_current_emb_model}
+        """)
 
     with config_col2:
+        # 脱敏展示：隐藏主机地址和端口详情，仅显示连接状态
+        mysql_status = "已连接" if (ctx and ctx.mysql_client and ctx.mysql_client.engine) else "未连接"
+        neo4j_status = "已连接" if NEO4J_ENABLED and (ctx and ctx.neo4j_client and ctx.neo4j_client.driver) else "未连接/未启用"
         st.markdown("""
         **数据库配置**
-        - MySQL: {mysql_host}:{mysql_port}
-        - Neo4j: {neo4j_uri}
+        - MySQL: {mysql_status}
+        - Neo4j: {neo4j_status}
         - SQL 方言：{dialect}
         """.format(
-            mysql_host=MYSQL_HOST,
-            mysql_port=MYSQL_PORT,
-            neo4j_uri=NEO4J_URI,
+            mysql_status=mysql_status,
+            neo4j_status=neo4j_status,
             dialect=SQL_DIALECT
         ))
 
@@ -891,9 +1141,14 @@ with tab4:
             few_shot="已启用" if FEW_SHOT_ENABLED else "禁用",
             top_k=FEW_SHOT_TOP_K
         ))
-    
+
     st.divider()
-    
+
+    # 模型配置 UI 面板
+    _render_model_config_panel()
+
+    st.divider()
+
     # 统计信息
     st.markdown("#### 📊 统计信息")
     if ctx and ctx.sql_generator:

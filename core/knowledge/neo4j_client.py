@@ -89,6 +89,20 @@ class Neo4jClient:
             asyncio.run(self.async_driver.close())
         logger.info("Neo4j 连接池已关闭")
 
+    @staticmethod
+    def _safe_identifier(value: str) -> str:
+        """校验 Cypher 标识符安全性（label、rel_type、属性名等）。
+
+        仅允许字母、数字和下划线，防止注入攻击。
+        Raises:
+            ValueError: 标识符包含非法字符
+        """
+        if not value or not isinstance(value, str):
+            raise ValueError(f"非法标识符: {value!r}")
+        if not value.replace('_', '').isalnum():
+            raise ValueError(f"非法标识符（仅允许字母/数字/下划线）: {value!r}")
+        return value
+
     def execute_query(self, query: str, parameters: Optional[Dict] = None) -> List[Dict]:
         """
         执行 Cypher 查询（同步）
@@ -109,7 +123,7 @@ class Neo4jClient:
                 result: Result = session.run(query, parameters or {})
                 return [record.data() for record in result]
         except Exception as e:
-            logger.error(f"Neo4j 查询执行失败：{e}, query={query}")
+            logger.error(f"Neo4j 查询执行失败：{e}, query={query[:80]}...")
             return []
 
     async def execute_query_async(self, query: str, parameters: Optional[Dict] = None) -> List[Dict]:
@@ -132,7 +146,7 @@ class Neo4jClient:
                 result = await session.run(query, parameters or {})
                 return [await record.data() for record in result]
         except Exception as e:
-            logger.error(f"Neo4j 异步查询执行失败：{e}, query={query}")
+            logger.error(f"Neo4j 异步查询执行失败：{e}, query={query[:80]}...")
             return []
 
     def get_all_nodes(self, label: Optional[str] = None) -> List[Dict]:
@@ -146,7 +160,8 @@ class Neo4jClient:
             List[Dict]: 节点列表
         """
         if label:
-            query = f"MATCH (n:`{label}`) RETURN n"
+            safe_label = self._safe_identifier(label)
+            query = f"MATCH (n:`{safe_label}`) RETURN n"
         else:
             query = "MATCH (n) RETURN n"
 
@@ -334,11 +349,12 @@ class Neo4jClient:
             Optional[Dict]: 节点信息
         """
         if label:
+            safe_label = self._safe_identifier(label)
             query = """
             MATCH (n:`{label}`)
             WHERE n.name = $name
             RETURN n
-            """.format(label=label)
+            """.format(label=safe_label)
         else:
             query = """
             MATCH (n)
@@ -836,6 +852,10 @@ class Neo4jClient:
 
     def _merge_relationship(self, rel_type: str, start_label: str, start_props: Dict[str, Any],
                             end_label: str, end_props: Dict[str, Any], properties: Dict[str, Any]):
+        # 校验所有拼入 Cypher 的标识符
+        rel_type = self._safe_identifier(rel_type)
+        start_label = self._safe_identifier(start_label)
+        end_label = self._safe_identifier(end_label)
         if start_label not in {"Database", "Table", "Column", "BusinessConcept"}:
             return
         if end_label not in {"Database", "Table", "Column", "BusinessConcept"}:

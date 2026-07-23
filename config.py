@@ -12,6 +12,83 @@ load_dotenv()
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent
 
+# ==================== 模型目录 ====================
+
+# 支持的 LLM 提供商及推荐模型
+LLM_PROVIDERS = {
+    "openai": {
+        "label": "OpenAI",
+        "default_model": "gpt-4o",
+        "needs_api_key": True,
+        "needs_base_url": False,
+        "default_base_url": "",
+    },
+    "ollama": {
+        "label": "Ollama (本地)",
+        "default_model": "gemma3:e4b",
+        "needs_api_key": False,
+        "needs_base_url": True,
+        "default_base_url": "http://localhost:11434",
+    },
+    "anthropic": {
+        "label": "Anthropic (Claude)",
+        "default_model": "claude-sonnet-4-20250514",
+        "needs_api_key": True,
+        "needs_base_url": False,
+        "default_base_url": "",
+    },
+    "dashscope": {
+        "label": "DashScope (通义千问)",
+        "default_model": "qwen-max",
+        "needs_api_key": True,
+        "needs_base_url": True,
+        "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    },
+    "deepseek": {
+        "label": "DeepSeek (深度求索)",
+        "default_model": "deepseek-chat",
+        "needs_api_key": True,
+        "needs_base_url": True,
+        "default_base_url": "https://api.deepseek.com/v1",
+    },
+    "zhipu": {
+        "label": "智谱 AI",
+        "default_model": "glm-4-flash",
+        "needs_api_key": True,
+        "needs_base_url": True,
+        "default_base_url": "https://open.bigmodel.cn/api/paas/v4",
+    },
+    "azure": {
+        "label": "Azure OpenAI",
+        "default_model": "gpt-4o",
+        "needs_api_key": True,
+        "needs_base_url": True,
+        "default_base_url": "",
+    },
+}
+
+# 支持的 Embedding 模型提供商
+EMBEDDING_PROVIDERS = {
+    "dashscope": {
+        "label": "DashScope (通义千问)",
+        "default_model": "text-embedding-v3",
+        "dimensions": 1024,
+        "needs_api_key": True,
+    },
+    "openai": {
+        "label": "OpenAI",
+        "default_model": "text-embedding-3-large",
+        "dimensions": 3072,
+        "needs_api_key": True,
+    },
+    "ollama": {
+        "label": "Ollama (本地)",
+        "default_model": "bge-m3:latest",
+        "dimensions": 1024,
+        "needs_api_key": False,
+    },
+}
+
 # ==================== MySQL 配置 ====================
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
@@ -40,8 +117,8 @@ NEO4J_CONNECTION_TIMEOUT = int(os.getenv("NEO4J_CONNECTION_TIMEOUT", "30"))  # �
 
 # ==================== LangChain 配置 ====================
 # LLM 模型配置 (支持 OpenAI、本地模型等)
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:e4b")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")  # 可选，用于本地模型或代理
 
@@ -60,13 +137,13 @@ DENSE_WEIGHT = float(os.getenv("DENSE_WEIGHT", 0.4))
 
 # FAISS 向量检索配置
 FAISS_ENABLED = os.getenv("FAISS_ENABLED", "true").lower() == "true"
-FAISS_EMBEDDING_DIM = int(os.getenv("FAISS_EMBEDDING_DIM", "1536"))  # 通义千问 v1 维度
+FAISS_EMBEDDING_DIM = int(os.getenv("FAISS_EMBEDDING_DIM", "1024"))  # bge-m3 dense 维度
 FAISS_INDEX_TYPE = os.getenv("FAISS_INDEX_TYPE", "flat")  # flat, ivf, hnsw
 
 # ==================== Embedding 配置 ====================
 # 通义千问 Embedding 模型配置
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "dashscope")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v1")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "ollama")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3:latest")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")  # 通义千问 API Key
 EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "")  # 可选 API Base URL
 

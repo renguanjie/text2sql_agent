@@ -3,6 +3,7 @@ Embedding 工厂模块
 支持多种 Embedding 模型提供商
 """
 from typing import List, Optional, Dict, Any
+from collections import OrderedDict
 import numpy as np
 from loguru import logger
 
@@ -32,7 +33,8 @@ class EmbeddingFactory:
         self.model = model
         self.api_key = api_key
         self.api_base = api_base
-        self._cache: Dict[str, np.ndarray] = {}
+        self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._cache_max_size: int = 10000  # LRU 上限，避免内存无限增长
 
         if provider == "dashscope" and not DASHSCOPE_AVAILABLE:
             logger.error("dashscope 未安装，无法使用通义千问 Embedding")
@@ -47,20 +49,25 @@ class EmbeddingFactory:
         Returns:
             np.ndarray: Embedding 向量
         """
-        # 检查缓存
+        # 检查缓存（命中时移到末尾，保持 LRU 顺序）
         if text in self._cache:
+            self._cache.move_to_end(text)
             return self._cache[text]
 
         if self.provider == "dashscope":
             embedding = self._get_dashscope_embedding(text)
         elif self.provider == "openai":
             embedding = self._get_openai_embedding(text)
+        elif self.provider == "ollama":
+            embedding = self._get_ollama_embedding(text)
         else:
             logger.warning(f"未知的 Embedding 提供商：{self.provider}，使用 TF-IDF 降级方案")
             embedding = self._get_tfidf_fallback(text)
 
-        # 缓存结果
+        # 缓存结果（LRU 淘汰）
         self._cache[text] = embedding
+        if len(self._cache) > self._cache_max_size:
+            self._cache.popitem(last=False)
         return embedding
 
     def get_embeddings_batch(self, texts: List[str]) -> np.ndarray:
@@ -91,12 +98,16 @@ class EmbeddingFactory:
                 new_embeddings = self._get_dashscope_embeddings_batch(uncached_texts)
             elif self.provider == "openai":
                 new_embeddings = self._get_openai_embeddings_batch(uncached_texts)
+            elif self.provider == "ollama":
+                new_embeddings = self._get_ollama_embeddings_batch(uncached_texts)
             else:
                 new_embeddings = np.array([self._get_tfidf_fallback(t) for t in uncached_texts])
 
-            # 缓存
+            # 缓存（LRU 淘汰）
             for idx, embedding in zip(uncached_indices, new_embeddings):
                 self._cache[texts[idx]] = embedding
+                if len(self._cache) > self._cache_max_size:
+                    self._cache.popitem(last=False)
 
         # 合并结果
         result = np.zeros((len(texts), self._get_embedding_dim()))
@@ -222,6 +233,38 @@ class EmbeddingFactory:
             logger.error(f"批量获取 OpenAI Embedding 失败：{e}")
             return np.array([self._get_tfidf_fallback(t) for t in texts])
 
+    def _get_ollama_embedding(self, text: str) -> np.ndarray:
+        """通过 Ollama REST API 获取 Embedding（无需额外 SDK）"""
+        base_url = self.api_base or "http://localhost:11434"
+        url = f"{base_url}/api/embeddings"
+        try:
+            import urllib.request
+            import json as _json
+
+            payload = _json.dumps({
+                "model": self.model,
+                "prompt": text,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            embedding = data.get("embedding", [])
+            if not embedding:
+                raise ValueError(f"Ollama 返回空 embedding: {data}")
+            return np.array(embedding, dtype=np.float32)
+        except Exception as e:
+            logger.error(f"获取 Ollama Embedding 失败：{e}")
+            return self._get_tfidf_fallback(text)
+
+    def _get_ollama_embeddings_batch(self, texts: List[str]) -> np.ndarray:
+        """批量获取 Ollama Embedding（逐条调用，Ollama REST API 不支持批量）"""
+        return np.array([self._get_ollama_embedding(t) for t in texts])
+
     def _get_tfidf_fallback(self, text: str) -> np.ndarray:
         """TF-IDF 降级方案（仅用于测试）"""
         from sklearn.feature_extraction.text import TfidfVectorizer
@@ -248,8 +291,15 @@ class EmbeddingFactory:
         elif self.provider == "openai":
             if "large" in self.model:
                 return 3072
+            elif "small" in self.model:
+                return 1536
             else:
                 return 1536
+        elif self.provider == "ollama":
+            # Ollama 模型维度各不相同，尝试从配置读取，否则返回常见默认值
+            from config import EMBEDDING_PROVIDERS
+            dim = EMBEDDING_PROVIDERS.get("ollama", {}).get("dimensions", 768)
+            return dim
         return 384
 
     def clear_cache(self):

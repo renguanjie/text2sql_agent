@@ -230,7 +230,10 @@ class ApplicationContext:
             logger.info(f"知识库索引完成：{len(documents)} 个文档 (MySQL)")
 
     def reset(self):
-        """重置所有组件状态（不关闭连接）"""
+        """重置所有组件状态，先关闭现有连接以避免泄漏"""
+        # 先关闭现有连接
+        self.shutdown()
+        # 再清空所有组件引用
         self._initialized = False
         self._llm = None
         self._neo4j_client = None

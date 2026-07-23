@@ -113,7 +113,7 @@ class MySQLClient:
                 result = conn.execute(text(query), params or {})
                 return [dict(row._mapping) for row in result]
         except Exception as e:
-            logger.error(f"MySQL 查询执行失败：{e}, query={query}")
+            logger.error(f"MySQL 查询执行失败：{e}, query={query[:80]}...")
             return []
 
     def execute_update(self, query: str, params: Optional[dict] = None) -> int:
@@ -132,7 +132,7 @@ class MySQLClient:
                 result = conn.execute(text(query), params or {})
                 return result.rowcount
         except Exception as e:
-            logger.error(f"MySQL 更新失败：{e}, query={query}")
+            logger.error(f"MySQL 更新失败：{e}, query={query[:80]}...")
             return 0
 
     def upsert_table_schema(self, table_name: str, table_comment: str = "",
@@ -282,16 +282,18 @@ class MySQLClient:
         """
         query = """
         UPDATE sql_generation_history
-        SET execution_status = %s, execution_error = %s, execution_result = %s,
+        SET execution_status = :execution_status,
+            execution_error = :execution_error,
+            execution_result = :execution_result,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = %s
+        WHERE id = :history_id
         """
-        params = (
-            execution_status,
-            execution_error,
-            json.dumps(execution_result, ensure_ascii=False, default=str) if execution_result else None,
-            history_id
-        )
+        params = {
+            "execution_status": execution_status,
+            "execution_error": execution_error,
+            "execution_result": json.dumps(execution_result, ensure_ascii=False, default=str) if execution_result else None,
+            "history_id": history_id,
+        }
         result = self.execute_update(query, params)
         return result > 0
 
@@ -459,30 +461,33 @@ class MySQLClient:
 
     def get_statistics(self) -> Dict:
         """
-        获取统计信息
+        获取统计信息（合并为单次查询，减少数据库往返）
 
         Returns:
             Dict: 统计数据
         """
-        queries = {
-            'total_history': "SELECT COUNT(*) as count FROM sql_generation_history",
-            'success_rate': """
-                SELECT
-                    SUM(CASE WHEN execution_status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as rate
-                FROM sql_generation_history WHERE execution_status != 'pending'
-            """,
-            'avg_feedback_score': "SELECT AVG(feedback_score) as score FROM sql_generation_history WHERE feedback_score IS NOT NULL",
-            'total_tables': "SELECT COUNT(*) as count FROM table_schema",
-            'total_columns': "SELECT COUNT(*) as count FROM column_schema"
-        }
-
-        stats = {}
-        for key, query in queries.items():
-            results = self.execute_query(query)
-            if results:
-                stats[key] = results[0].get(list(results[0].keys())[0])
-
-        return stats
+        query = """
+            SELECT
+                (SELECT COUNT(*) FROM sql_generation_history) AS total_history,
+                (SELECT CASE WHEN COUNT(*) = 0 THEN NULL
+                        ELSE SUM(CASE WHEN execution_status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*)
+                   END
+                 FROM sql_generation_history WHERE execution_status != 'pending') AS success_rate,
+                (SELECT AVG(feedback_score) FROM sql_generation_history WHERE feedback_score IS NOT NULL) AS avg_feedback_score,
+                (SELECT COUNT(*) FROM table_schema) AS total_tables,
+                (SELECT COUNT(*) FROM column_schema) AS total_columns
+        """
+        results = self.execute_query(query)
+        if results:
+            row = results[0]
+            return {
+                'total_history': row.get('total_history', 0),
+                'success_rate': row.get('success_rate'),
+                'avg_feedback_score': row.get('avg_feedback_score'),
+                'total_tables': row.get('total_tables', 0),
+                'total_columns': row.get('total_columns', 0),
+            }
+        return {}
 
 
 # ==================== 向后兼容（已废弃，请使用 ApplicationContext） ====================

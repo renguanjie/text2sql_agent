@@ -5,15 +5,15 @@
 import streamlit as st
 from pathlib import Path
 import sys
+import tempfile
+from urllib.parse import quote_plus
 
 # 添加项目路径
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from core.graph_builder import GraphBuilderPipeline
-from core.knowledge.neo4j_client import get_neo4j_client
 from config import (
-    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
     LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
 )
 
@@ -34,17 +34,16 @@ def render_graph_builder():
     </div>
     """, unsafe_allow_html=True)
 
-    # 初始化 Neo4j 客户端
-    if 'kg_neo4j_client' not in st.session_state:
-        try:
-            st.session_state.kg_neo4j_client = get_neo4j_client(
-                NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
-            )
-            st.session_state.kg_connected = True
-        except Exception as e:
-            st.session_state.kg_neo4j_client = None
-            st.session_state.kg_connected = False
-            st.error(f"Neo4j 连接失败：{e}")
+    # 从 ApplicationContext 获取 Neo4j 客户端（避免创建独立的 driver 实例）
+    app_ctx = st.session_state.get('app_context')
+    if app_ctx and app_ctx.neo4j_client:
+        st.session_state.kg_neo4j_client = app_ctx.neo4j_client
+        st.session_state.kg_connected = bool(app_ctx.neo4j_client.driver)
+    else:
+        st.session_state.kg_neo4j_client = None
+        st.session_state.kg_connected = False
+        if not app_ctx:
+            st.warning("⚠️ 系统未初始化，请先在主页面完成初始化")
 
     # 选项卡
     tab1, tab2, tab3 = st.tabs(["📁 DDL/JSON 文件构建", "💾 活体数据库构建", "📊 图谱状态"])
@@ -100,13 +99,14 @@ def render_graph_builder():
                 else:
                     is_json = False
 
-                # 保存上传的文件
-                if is_json:
-                    temp_path = Path("/tmp/kg_upload.json")
-                    temp_path.write_text(uploaded_file.getvalue().decode('utf-8'))
-                else:
-                    temp_path = Path("/tmp/kg_upload.sql")
-                    temp_path.write_text(uploaded_file.getvalue().decode('utf-8'))
+                # 保存上传的文件（使用唯一临时文件，避免并发覆盖）
+                suffix = ".json" if is_json else ".sql"
+                temp_file = tempfile.NamedTemporaryFile(
+                    mode='w', suffix=suffix, delete=False, encoding='utf-8'
+                )
+                temp_path = Path(temp_file.name)
+                temp_file.write(uploaded_file.getvalue().decode('utf-8'))
+                temp_file.close()
 
                 try:
                     with st.spinner("正在构建知识图谱..."):
@@ -222,11 +222,13 @@ def render_graph_builder():
             if not db_host or not db_user:
                 st.warning("请填写完整的数据库连接信息")
             else:
-                # 构建连接 URI
+                # 构建连接 URI（对用户名和密码进行 URL 编码，防止特殊字符破坏 URI 解析）
+                safe_user = quote_plus(db_user)
+                safe_password = quote_plus(db_password)
                 if db_type == "mysql":
-                    db_uri = f"mysql+mysqlconnector://{db_user}:{db_password}@{db_host}:{db_port}/{schema_name}"
+                    db_uri = f"mysql+mysqlconnector://{safe_user}:{safe_password}@{db_host}:{db_port}/{schema_name}"
                 else:
-                    db_uri = f"{db_type}://{db_user}:{db_password}@{db_host}:{db_port}/{schema_name}"
+                    db_uri = f"{db_type}://{safe_user}:{safe_password}@{db_host}:{db_port}/{schema_name}"
 
                 try:
                     with st.spinner("正在连接数据库并构建知识图谱..."):
