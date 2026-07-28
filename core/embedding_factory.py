@@ -15,6 +15,21 @@ except ImportError:
     logger.warning("dashscope 未安装，通义千问 Embedding 不可用。安装：pip install dashscope")
 
 
+class EmbeddingError(Exception):
+    """Embedding 相关错误的基类"""
+    pass
+
+
+class EmbeddingProviderError(EmbeddingError):
+    """Embedding 提供商 API 错误"""
+    pass
+
+
+class EmbeddingDimensionMismatchError(EmbeddingError):
+    """Embedding 维度不匹配错误"""
+    pass
+
+
 class EmbeddingFactory:
     """Embedding 模型工厂"""
 
@@ -35,6 +50,10 @@ class EmbeddingFactory:
         self.api_base = api_base
         self._cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._cache_max_size: int = 10000  # LRU 上限，避免内存无限增长
+
+        # 客户端缓存（避免重复创建）
+        self._openai_client = None
+        self._ollama_session = None
 
         if provider == "dashscope" and not DASHSCOPE_AVAILABLE:
             logger.error("dashscope 未安装，无法使用通义千问 Embedding")
@@ -186,15 +205,20 @@ class EmbeddingFactory:
             logger.error(f"批量获取 DashScope Embedding 失败：{e}")
             return np.array([self._get_tfidf_fallback(t) for t in texts])
 
-    def _get_openai_embedding(self, text: str) -> np.ndarray:
-        """获取 OpenAI Embedding"""
-        try:
+    def _get_openai_client(self):
+        """获取或创建缓存的 OpenAI 客户端"""
+        if self._openai_client is None:
             import openai
-
-            client = openai.OpenAI(
+            self._openai_client = openai.OpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base
             )
+        return self._openai_client
+
+    def _get_openai_embedding(self, text: str) -> np.ndarray:
+        """获取 OpenAI Embedding"""
+        try:
+            client = self._get_openai_client()
 
             response = client.embeddings.create(
                 model=self.model or "text-embedding-ada-002",
@@ -210,12 +234,7 @@ class EmbeddingFactory:
     def _get_openai_embeddings_batch(self, texts: List[str]) -> np.ndarray:
         """批量获取 OpenAI Embedding"""
         try:
-            import openai
-
-            client = openai.OpenAI(
-                api_key=self.api_key,
-                base_url=self.api_base
-            )
+            client = self._get_openai_client()
 
             # OpenAI API 支持批量输入
             response = client.embeddings.create(
@@ -233,26 +252,37 @@ class EmbeddingFactory:
             logger.error(f"批量获取 OpenAI Embedding 失败：{e}")
             return np.array([self._get_tfidf_fallback(t) for t in texts])
 
+    def _get_ollama_session(self):
+        """获取或创建缓存的 Ollama HTTP 会话（连接池）"""
+        if self._ollama_session is None:
+            import requests
+            self._ollama_session = requests.Session()
+            # 配置连接池
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=10,
+                pool_maxsize=10,
+                max_retries=3
+            )
+            self._ollama_session.mount('http://', adapter)
+            self._ollama_session.mount('https://', adapter)
+        return self._ollama_session
+
     def _get_ollama_embedding(self, text: str) -> np.ndarray:
-        """通过 Ollama REST API 获取 Embedding（无需额外 SDK）"""
+        """通过 Ollama REST API 获取 Embedding（使用连接池）"""
         base_url = self.api_base or "http://localhost:11434"
         url = f"{base_url}/api/embeddings"
         try:
-            import urllib.request
-            import json as _json
-
-            payload = _json.dumps({
-                "model": self.model,
-                "prompt": text,
-            }).encode("utf-8")
-            req = urllib.request.Request(
+            session = self._get_ollama_session()
+            response = session.post(
                 url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
+                json={
+                    "model": self.model,
+                    "prompt": text,
+                },
+                timeout=30
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = _json.loads(resp.read().decode("utf-8"))
+            response.raise_for_status()
+            data = response.json()
             embedding = data.get("embedding", [])
             if not embedding:
                 raise ValueError(f"Ollama 返回空 embedding: {data}")
@@ -303,8 +333,21 @@ class EmbeddingFactory:
         return 384
 
     def clear_cache(self):
-        """清除缓存"""
+        """清除缓存并关闭 HTTP 会话"""
         self._cache.clear()
+        # 关闭 HTTP 会话和客户端
+        if self._ollama_session is not None:
+            try:
+                self._ollama_session.close()
+            except Exception:
+                pass
+            self._ollama_session = None
+        if self._openai_client is not None:
+            try:
+                self._openai_client.close()
+            except Exception:
+                pass
+            self._openai_client = None
 
     def get_cache_size(self) -> int:
         """获取缓存大小"""
@@ -324,6 +367,10 @@ def get_embedding_factory(provider: str = "dashscope",
     """
     获取或创建 Embedding 工厂单例
 
+    .. deprecated:: 1.4
+        此函数已废弃，请使用 `ApplicationContext` 管理组件生命周期。
+        保留此函数仅为向后兼容，新功能不应使用。
+
     Args:
         provider: 提供商
         model: 模型名称
@@ -333,6 +380,13 @@ def get_embedding_factory(provider: str = "dashscope",
     Returns:
         EmbeddingFactory: 工厂实例
     """
+    import warnings
+    warnings.warn(
+        "get_embedding_factory() 已废弃，请使用 ApplicationContext 代替。"
+        "此函数将在未来版本中移除。",
+        DeprecationWarning,
+        stacklevel=2
+    )
     global _embedding_factory
     if _embedding_factory is None:
         _embedding_factory = EmbeddingFactory(provider, model, api_key, api_base)

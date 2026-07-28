@@ -172,3 +172,70 @@ STREAMLIT_HEAD = os.getenv("STREAMLIT_HEAD", "true").lower() == "true"
 HISTORY_MAX_RECORDS = int(os.getenv("HISTORY_MAX_RECORDS", 1000))
 # 自动保存历史记录
 HISTORY_AUTO_SAVE = os.getenv("HISTORY_AUTO_SAVE", "true").lower() == "true"
+
+
+# ==================== 配置验证 ====================
+def validate_config():
+    """验证配置参数的有效性，在模块加载时执行"""
+    errors = []
+
+    # 验证检索权重总和
+    if abs(BM25_WEIGHT + DENSE_WEIGHT - 1.0) > 0.01:
+        errors.append(f"检索权重总和必须为 1.0，当前：BM25_WEIGHT={BM25_WEIGHT}, DENSE_WEIGHT={DENSE_WEIGHT}")
+
+    # 验证 LLM 提供商
+    if LLM_PROVIDER not in LLM_PROVIDERS:
+        errors.append(f"未知的 LLM 提供商：{LLM_PROVIDER}，支持的提供商：{list(LLM_PROVIDERS.keys())}")
+
+    # 验证 Embedding 提供商
+    if EMBEDDING_PROVIDER not in EMBEDDING_PROVIDERS:
+        errors.append(f"未知的 Embedding 提供商：{EMBEDDING_PROVIDER}，支持的提供商：{list(EMBEDDING_PROVIDERS.keys())}")
+
+    # 验证需要 API Key 的提供商
+    if LLM_PROVIDERS.get(LLM_PROVIDER, {}).get("needs_api_key") and not LLM_API_KEY:
+        errors.append(f"LLM 提供商 {LLM_PROVIDER} 需要配置 LLM_API_KEY")
+
+    if EMBEDDING_PROVIDERS.get(EMBEDDING_PROVIDER, {}).get("needs_api_key") and not EMBEDDING_API_KEY:
+        errors.append(f"Embedding 提供商 {EMBEDDING_PROVIDER} 需要配置 EMBEDDING_API_KEY")
+
+    # 验证端口号范围
+    if not (1 <= MYSQL_PORT <= 65535):
+        errors.append(f"MySQL 端口号无效：{MYSQL_PORT}，应在 1-65535 范围内")
+
+    # 验证连接池参数
+    if MYSQL_POOL_SIZE <= 0:
+        errors.append(f"MySQL 连接池大小必须大于 0：{MYSQL_POOL_SIZE}")
+    if MYSQL_MAX_OVERFLOW < 0:
+        errors.append(f"MySQL 最大溢出连接数不能为负：{MYSQL_MAX_OVERFLOW}")
+    if NEO4J_MAX_POOL_SIZE <= 0:
+        errors.append(f"Neo4j 连接池大小必须大于 0：{NEO4J_MAX_POOL_SIZE}")
+
+    # 验证检索参数
+    if RETRIEVAL_TOP_K <= 0:
+        errors.append(f"RETRIEVAL_TOP_K 必须大于 0：{RETRIEVAL_TOP_K}")
+    if FEW_SHOT_TOP_K <= 0:
+        errors.append(f"FEW_SHOT_TOP_K 必须大于 0：{FEW_SHOT_TOP_K}")
+    if not (0 <= FEW_SHOT_MIN_SIMILARITY <= 1):
+        errors.append(f"FEW_SHOT_MIN_SIMILARITY 应在 0-1 范围内：{FEW_SHOT_MIN_SIMILARITY}")
+
+    # 验证 BM25 参数
+    if BM25_K1 <= 0:
+        errors.append(f"BM25_K1 必须大于 0：{BM25_K1}")
+    if not (0 <= BM25_B <= 1):
+        errors.append(f"BM25_B 应在 0-1 范围内：{BM25_B}")
+
+    if errors:
+        from loguru import logger
+        logger.error("配置验证失败：")
+        for error in errors:
+            logger.error(f"  - {error}")
+        raise ValueError(f"配置验证失败，共 {len(errors)} 个错误")
+
+
+# 在模块加载时执行配置验证
+try:
+    validate_config()
+except Exception as e:
+    # 如果验证失败，记录警告但不阻止模块加载（避免循环导入）
+    from loguru import logger
+    logger.warning(f"配置验证警告：{e}")
