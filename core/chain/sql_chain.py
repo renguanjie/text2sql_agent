@@ -43,7 +43,8 @@ class SQLGenerationChain:
 
     def _build_generate_messages(self, user_query: str, schema_info: Dict,
                                   knowledge_results: Optional[List[Tuple[Dict, float]]],
-                                  few_shot_examples: str) -> List:
+                                  few_shot_examples: str,
+                                  semantic_context: str = "") -> List:
         """统一的消息构建逻辑"""
         formatted_schema = self._format_schema(schema_info)
         formatted_knowledge = self._format_knowledge(knowledge_results)
@@ -51,7 +52,8 @@ class SQLGenerationChain:
             user_query=user_query,
             schema_info=formatted_schema,
             knowledge_info=formatted_knowledge,
-            few_shot_examples=few_shot_examples or ""
+            few_shot_examples=few_shot_examples or "",
+            semantic_context=semantic_context,
         )
 
     def _process_llm_response(self, response_content: str,
@@ -160,13 +162,18 @@ class SQLGenerationChain:
     def generate(self, user_query: str, schema_info: Dict,
                  knowledge_results: Optional[List[Tuple[Dict, float]]] = None,
                  session_id: Optional[str] = None,
-                 few_shot_examples: Optional[str] = None) -> Dict[str, Any]:
+                 few_shot_examples: Optional[str] = None,
+                 semantic_context: str = "") -> Dict[str, Any]:
         """生成 SQL（同步）"""
         self.stats['total_requests'] += 1
 
         try:
             messages = self._build_generate_messages(
-                user_query, schema_info, knowledge_results, few_shot_examples or ""
+                user_query,
+                schema_info,
+                knowledge_results,
+                few_shot_examples or "",
+                semantic_context,
             )
             logger.info(
                 f"调用 LLM 生成 SQL：query_id={text_fingerprint(user_query)}, "
@@ -186,13 +193,18 @@ class SQLGenerationChain:
     async def generate_async(self, user_query: str, schema_info: Dict,
                              knowledge_results: Optional[List[Tuple[Dict, float]]] = None,
                              session_id: Optional[str] = None,
-                             few_shot_examples: Optional[str] = None) -> Dict[str, Any]:
+                             few_shot_examples: Optional[str] = None,
+                             semantic_context: str = "") -> Dict[str, Any]:
         """生成 SQL（异步）"""
         self.stats['total_requests'] += 1
 
         try:
             messages = self._build_generate_messages(
-                user_query, schema_info, knowledge_results, few_shot_examples or ""
+                user_query,
+                schema_info,
+                knowledge_results,
+                few_shot_examples or "",
+                semantic_context,
             )
             logger.info(
                 f"异步调用 LLM 生成 SQL：query_id={text_fingerprint(user_query)}, "
@@ -242,6 +254,26 @@ class SQLGenerationChain:
         except Exception as e:
             logger.opt(exception=e).error("异步 SQL 修复失败")
             return {'sql': None, 'status': 'error', 'error': 'SQL 修复服务调用失败'}
+
+    def fix_sql_governed(
+        self, sql: str, issues: list[dict], semantic_context: str
+    ) -> Dict[str, Any]:
+        """使用结构化治理问题修复 SQL，且不在此层重试。"""
+        messages = self.prompt_templates.create_governed_fix_messages(
+            sql=sql, issues=issues, semantic_context=semantic_context
+        )
+        response = self._invoke_llm_with_retry(messages, max_retries=0)
+        return self._process_fix_result(self._extract_sql(response.content))
+
+    async def fix_sql_governed_async(
+        self, sql: str, issues: list[dict], semantic_context: str
+    ) -> Dict[str, Any]:
+        """异步使用结构化治理问题修复 SQL，且不在此层重试。"""
+        messages = self.prompt_templates.create_governed_fix_messages(
+            sql=sql, issues=issues, semantic_context=semantic_context
+        )
+        response = await self._ainvoke_llm_with_retry(messages, max_retries=0)
+        return self._process_fix_result(self._extract_sql(response.content))
 
     @staticmethod
     def _process_fix_result(fixed_sql: Optional[str]) -> Dict[str, Any]:
