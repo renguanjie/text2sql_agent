@@ -74,6 +74,7 @@ class _SQLAnalysis:
     active_scope_infos: tuple[_ScopeInfo, ...]
     root_output_infos: tuple[_ScopeInfo, ...]
     join_facts: tuple[_JoinFact, ...]
+    unresolved_column_indexes: frozenset[int]
 
 
 class _UnsupportedSQL(ValueError):
@@ -402,8 +403,11 @@ def _analyze_sql(
     if len(statements) != 1:
         raise ValueError("exactly one SQL statement is required")
     tree = statements[0]
-    supported_roots = (exp.Select, exp.Union, exp.Intersect, exp.Except)
-    if not isinstance(tree, supported_roots):
+    set_operations = (exp.Union, exp.Intersect, exp.Except)
+    if not isinstance(tree, exp.Select) or any(
+        isinstance(item[0] if isinstance(item, tuple) else item, set_operations)
+        for item in tree.walk()
+    ):
         raise _UnsupportedSQL("unsupported root statement")
     forbidden_nodes = {
         "Alter",
@@ -528,6 +532,7 @@ def _analyze_sql(
     ):
         raise _UnsupportedSQL("query has no resolvable source")
     columns: list[tuple[str | None, str]] = []
+    unresolved_column_indexes: set[int] = set()
     group_by: list[str] = []
     filters: list[str] = []
     for info in infos_by_scope.values():
@@ -551,6 +556,17 @@ def _analyze_sql(
                     _unique_sources(info)[0], Scope
                 ):
                     qualifier = next(iter(info.sources))
+                elif (
+                    qualifier is None
+                    and len(_unique_sources(info)) >= 2
+                    and all(isinstance(item, Scope) for item in _unique_sources(info))
+                    and all(
+                        _casefold(column.name)
+                        not in infos_by_scope[id(item)].projections
+                        for item in _unique_sources(info)
+                    )
+                ):
+                    unresolved_column_indexes.add(len(columns))
                 columns.append((qualifier, _casefold(column.name)))
 
         for expression in select.expressions:
@@ -629,6 +645,7 @@ def _analyze_sql(
         active_scope_infos=active_infos,
         root_output_infos=root_output_infos,
         join_facts=tuple(join_facts),
+        unresolved_column_indexes=frozenset(unresolved_column_indexes),
     )
 
 
@@ -756,6 +773,19 @@ def _lineage_for_analysis(
 
     def normalized_references(expression: exp.Expression, info: _ScopeInfo) -> set[str]:
         references: set[str] = set()
+        is_star = isinstance(expression, exp.Star) or (
+            isinstance(expression, exp.Column) and expression.name == "*"
+        )
+        if is_star:
+            for resolution in _expand_star(
+                expression, info, infos, semantic_indexes
+            ).values():
+                references.update(
+                    f"{aliases.get(table, table)}.{name}"
+                    for table, name in resolution.references
+                    if aliases.get(table, table) in semantic_indexes
+                )
+            return references
         for column in _immediate_columns(expression, info.scope.expression):
             resolved = _resolve_column(column, info, infos, semantic_indexes)
             references.update(
@@ -763,12 +793,6 @@ def _lineage_for_analysis(
                 for table, name in resolved.references
                 if aliases.get(table, table) in semantic_indexes
             )
-        if isinstance(expression, exp.Star):
-            for resolution in info.projections.values():
-                references.update(
-                    f"{aliases.get(table, table)}.{name}"
-                    for table, name in resolution.references
-                )
         return references
 
     supported_filter_types = (
@@ -862,6 +886,12 @@ def _lineage_for_analysis(
         info: _ScopeInfo,
         inside_aggregate: bool = False,
     ) -> None:
+        if isinstance(expression, exp.Star) or (
+            isinstance(expression, exp.Column) and expression.name == "*"
+        ):
+            if not inside_aggregate:
+                dimensions.update(normalized_references(expression, info))
+            return
         if isinstance(expression, exp.Subquery):
             child = next(
                 (
@@ -895,7 +925,23 @@ def _lineage_for_analysis(
             )
             collect_nonaggregate(expression, info)
 
-    for info in analysis.active_scope_infos:
+    lineage_scope_ids: set[int] = set()
+
+    def include_source_lineage(info: _ScopeInfo) -> None:
+        marker = id(info.scope)
+        if marker in lineage_scope_ids:
+            return
+        lineage_scope_ids.add(marker)
+        for source in _unique_sources(info):
+            if isinstance(source, Scope):
+                include_source_lineage(infos[id(source)])
+
+    for info in analysis.root_output_infos:
+        include_source_lineage(info)
+
+    for info in analysis.scope_infos:
+        if id(info.scope) not in lineage_scope_ids:
+            continue
         select = info.scope.expression
         if not isinstance(select, exp.Select):
             continue
@@ -1003,8 +1049,11 @@ class SemanticSQLValidator:
         for table in sorted(scope.tables):
             if table not in entities:
                 add("UNKNOWN_TABLE", "SQL 引用了语义模型中不存在的表", table)
-        for table, name in scope.columns:
+        for index, (table, name) in enumerate(scope.columns):
             if name == "*":
+                continue
+            if index in analysis.unresolved_column_indexes:
+                add("UNKNOWN_COLUMN", "SQL 引用了派生输入未暴露的字段", name)
                 continue
             if table is not None:
                 if table not in field_indexes or name not in field_indexes[table]:
@@ -1019,8 +1068,12 @@ class SemanticSQLValidator:
                 add("UNKNOWN_COLUMN", "SQL 引用了语义模型中不存在的字段", name)
 
         # Ambiguity.
-        for table, name in scope.columns:
-            if table is not None or name == "*":
+        for index, (table, name) in enumerate(scope.columns):
+            if (
+                index in analysis.unresolved_column_indexes
+                or table is not None
+                or name == "*"
+            ):
                 continue
             matches = sorted(
                 candidate
@@ -1082,6 +1135,7 @@ class SemanticSQLValidator:
                     if endpoint not in pair_sets:
                         continue
                     extra_signatures: set[Any] = set()
+                    extra_cross_pairs: set[frozenset[str]] = set()
                     if relation.extra_condition:
                         try:
                             extra_expression = parse_one(
@@ -1108,11 +1162,34 @@ class SemanticSQLValidator:
                                 )
                                 for atom in atoms
                             }
+                            for atom in atoms:
+                                references: set[str] = set()
+                                for column in atom.find_all(exp.Column):
+                                    signature = _expression_signature(
+                                        column,
+                                        None,
+                                        infos_by_scope,
+                                        field_indexes,
+                                        source_tables,
+                                    )
+                                    if (
+                                        isinstance(signature, tuple)
+                                        and len(signature) == 3
+                                        and signature[0] == "column"
+                                        and signature[1] in source_tables
+                                    ):
+                                        references.add(f"{signature[1]}.{signature[2]}")
+                                reference_tables = {
+                                    reference.rsplit(".", 1)[0]
+                                    for reference in references
+                                }
+                                if len(references) == 2 and len(reference_tables) == 2:
+                                    extra_cross_pairs.add(frozenset(references))
                         except Exception:
                             continue
                         if not extra_signatures.issubset(fact.atom_signatures):
                             continue
-                    if len(pair_sets - {endpoint}) > len(extra_signatures):
+                    if pair_sets - {endpoint} != extra_cross_pairs:
                         continue
                     proven = True
                     break

@@ -404,6 +404,55 @@ def test_missing_derived_output_does_not_fall_through_to_a_physical_table(
     ]
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH order_fields AS (SELECT customer_id FROM orders), "
+        "customer_fields AS (SELECT id FROM customers) "
+        "SELECT created_at FROM order_fields o "
+        "JOIN customer_fields c ON o.customer_id = c.id",
+        "SELECT created_at FROM (SELECT customer_id FROM orders) o "
+        "JOIN (SELECT id FROM customers) c ON o.customer_id = c.id",
+    ],
+)
+def test_unqualified_missing_output_stays_unresolved_across_derived_inputs(
+    validator: SemanticSQLValidator,
+    sales_snapshot: SemanticSnapshot,
+    sql: str,
+):
+    """Break caught: globally resolving a field hidden by every derived input."""
+    report = validator.validate(sql, "订单和客户", sales_snapshot)
+
+    assert ("UNKNOWN_COLUMN", ("created_at",)) in {
+        (issue.code, issue.objects) for issue in report.issues
+    }
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id FROM orders UNION SELECT id FROM orders",
+        "SELECT id FROM orders INTERSECT SELECT id FROM orders",
+        "SELECT id FROM orders EXCEPT SELECT id FROM orders",
+        "SELECT id, ("
+        "SELECT id FROM orders UNION SELECT id FROM orders"
+        ") AS other_id FROM orders",
+    ],
+)
+def test_rejects_all_set_operations_with_a_sanitized_issue(
+    validator: SemanticSQLValidator,
+    sales_snapshot: SemanticSnapshot,
+    sql: str,
+):
+    """Break caught: attempting partial semantic proof for an unsupported set operation."""
+    report = validator.validate(sql, "查询订单", sales_snapshot)
+
+    assert [(issue.stage, issue.code, issue.objects) for issue in report.issues] == [
+        ("safety", "UNSUPPORTED_SQL", ()),
+    ]
+    assert sql not in report.issues[0].message
+
+
 def test_unused_cte_metric_cannot_satisfy_the_returned_query_metric(
     validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
 ):
@@ -425,6 +474,31 @@ def test_unused_cte_time_field_cannot_satisfy_root_time_intent(
     report = validator.validate(
         "WITH decoy AS (SELECT created_at FROM orders) SELECT COUNT(*) FROM customers",
         "按月查询客户",
+        sales_snapshot,
+    )
+
+    assert "TIME_DIMENSION_REQUIRED" in {issue.code for issue in report.issues}
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "EXISTS (SELECT 1 FROM orders x "
+        "WHERE x.created_at >= '2026-01-01')",
+        "o.id = (SELECT MAX(x.id) FROM orders x "
+        "WHERE x.created_at >= '2026-01-01')",
+    ],
+)
+def test_predicate_only_subquery_time_does_not_satisfy_returned_metric_intent(
+    validator: SemanticSQLValidator,
+    sales_snapshot: SemanticSnapshot,
+    predicate: str,
+):
+    """Break caught: borrowing time evidence from a predicate-only sibling scope."""
+    report = validator.validate(
+        "SELECT SUM(o.amount) FROM orders o "
+        f"WHERE o.status = 'paid' AND {predicate}",
+        "按月统计订单金额",
         sales_snapshot,
     )
 
@@ -474,6 +548,26 @@ def test_relationship_extra_condition_is_required_and_structurally_matched(
     assert present.valid, present.issues
 
 
+def test_unrelated_cross_table_equality_cannot_substitute_for_an_extra_condition(
+    validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
+):
+    """Break caught: approving an unrelated cross-table equality by atom count alone."""
+    relationship = sales_snapshot.relationships[0].model_copy(
+        update={"extra_condition": "orders.status = 'paid'"}
+    )
+    snapshot = sales_snapshot.model_copy(update={"relationships": (relationship,)})
+
+    report = validator.validate(
+        "SELECT o.amount, c.name FROM orders o JOIN customers c "
+        "ON o.customer_id = c.id "
+        "AND o.status = 'paid' AND o.id = c.id",
+        "订单和客户",
+        snapshot,
+    )
+
+    assert "INVALID_JOIN" in {issue.code for issue in report.issues}
+
+
 def test_metric_required_filter_must_be_proven_in_relevant_predicates(
     validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
 ):
@@ -517,6 +611,28 @@ def test_non_aggregate_output_must_be_an_allowed_metric_dimension(
     )
 
     assert "DIMENSION_NOT_ALLOWED" in {issue.code for issue in report.issues}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT *, SUM(amount) FROM orders WHERE status = 'paid'",
+        "WITH exposed AS ("
+        "SELECT status, amount FROM orders WHERE status = 'paid'"
+        ") SELECT *, SUM(amount) FROM exposed",
+    ],
+)
+def test_root_star_expands_exposed_fields_for_dimension_policy(
+    validator: SemanticSQLValidator,
+    sales_snapshot: SemanticSnapshot,
+    sql: str,
+):
+    """Break caught: letting a root star hide disallowed non-aggregate dimensions."""
+    report = validator.validate(sql, "订单金额", sales_snapshot)
+
+    assert ("DIMENSION_NOT_ALLOWED", ("order_amount", "orders.status")) in {
+        (issue.code, issue.objects) for issue in report.issues
+    }
 
 
 @pytest.mark.parametrize("group_expression", ["987654 + 123456", "created_at + 987654"])
