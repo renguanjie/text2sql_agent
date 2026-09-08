@@ -1,5 +1,7 @@
 """已修复逻辑缺陷的回归测试。"""
 from contextlib import contextmanager
+import subprocess
+import sys
 from unittest.mock import AsyncMock, Mock
 
 import numpy as np
@@ -435,6 +437,35 @@ def test_field_validator_extractors_share_cte_aware_scope_behavior():
     assert validator.extract_columns_with_table(sql) == {
         "orders": {"id", "amount"},
     }
+
+
+def test_field_validator_module_preserves_optional_sqlglot_fallback():
+    """Break caught: importing the pure helper before the optional-sqlglot guard can run."""
+    script = r'''
+import builtins
+
+real_import = builtins.__import__
+def without_sqlglot(name, *args, **kwargs):
+    if name == "sqlglot" or name.startswith("sqlglot."):
+        raise ImportError("blocked for fallback test")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = without_sqlglot
+from core.sql.field_validator import SQLFieldValidator, SQLGLOT_AVAILABLE
+
+validator = SQLFieldValidator.__new__(SQLFieldValidator)
+assert SQLGLOT_AVAILABLE is False
+assert validator.extract_tables_from_sql("SELECT * FROM orders") == set()
+'''
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(__import__("pathlib").Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_neo4j_write_batch_uses_one_transaction():

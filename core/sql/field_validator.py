@@ -9,20 +9,20 @@ from sqlalchemy import create_engine, inspect
 from typing import Dict, List, Set, Tuple, Optional, Any
 from loguru import logger
 
-from core.semantic.validator import parse_sql_scope
-
 try:
     from sqlglot import exp, parse, ParseError
     from sqlglot.expressions import (
         Select, Table, Column, Identifier,
         Join, From, CTE, Subquery, Alias
     )
+    from core.semantic.validator import parse_sql_scope
     SQLGLOT_AVAILABLE = True
 except ImportError:
     SQLGLOT_AVAILABLE = False
     # 占位类型，确保模块可导入（方法内会检查 SQLGLOT_AVAILABLE）
     exp = None
     parse = None
+    parse_sql_scope = None
     ParseError = Exception
     Select = Table = Column = Identifier = Join = From = CTE = Subquery = Alias = type
     logger.warning("sqlglot 未安装，AST 解析功能将不可用。安装：pip install sqlglot")
