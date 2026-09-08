@@ -419,6 +419,24 @@ def test_legacy_graph_normalization_uses_composite_table_and_column_keys():
     assert "Column:2:orders:id" in keys
 
 
+def test_field_validator_extractors_share_cte_aware_scope_behavior():
+    """Break caught: legacy field extraction diverging from pure CTE/alias scope parsing."""
+    from core.sql.field_validator import SQLFieldValidator
+
+    validator = SQLFieldValidator.__new__(SQLFieldValidator)
+    sql = (
+        "WITH recent AS (SELECT id, amount FROM orders) "
+        "SELECT r.id, SUM(r.amount) FROM recent r GROUP BY r.id"
+    )
+
+    assert validator.extract_tables_from_sql(sql) == {"orders"}
+    assert validator.extract_columns_from_sql(sql) == {"id", "amount"}
+    assert validator.extract_table_alias_mapping(sql)["r"] == "orders"
+    assert validator.extract_columns_with_table(sql) == {
+        "orders": {"id", "amount"},
+    }
+
+
 def test_neo4j_write_batch_uses_one_transaction():
     from core.knowledge.neo4j_client import Neo4jClient
 

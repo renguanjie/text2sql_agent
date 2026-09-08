@@ -1,0 +1,670 @@
+"""Deterministic, database-independent validation of SQL against semantic snapshots."""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any
+
+from sqlglot import exp, parse, parse_one
+from sqlglot.optimizer.scope import Scope, traverse_scope
+
+from .models import SemanticMetric, SemanticSnapshot, ValidationIssue, ValidationReport
+
+
+_FieldReference = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class SQLScope:
+    """Stable, serializable facts extracted from one SQL statement."""
+
+    tables: frozenset[str]
+    aliases: Mapping[str, str]
+    columns: tuple[tuple[str | None, str], ...]
+    joins: tuple[tuple[str, str, str, str], ...]
+    group_by: tuple[str, ...]
+    filters: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "aliases", MappingProxyType(dict(self.aliases)))
+
+
+@dataclass(frozen=True)
+class _Resolution:
+    references: frozenset[_FieldReference] = frozenset()
+    known: bool = False
+
+
+@dataclass
+class _ScopeInfo:
+    scope: Scope
+    sources: dict[str, exp.Table | Scope]
+    physical_tables: frozenset[str]
+    projections: dict[str, _Resolution] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _SQLAnalysis:
+    tree: exp.Expression
+    scope: SQLScope
+    scope_infos: tuple[_ScopeInfo, ...]
+
+
+def _casefold(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _semantic_field_index(
+    semantic_indexes: Mapping[str, Iterable[str] | Mapping[str, Any]] | None,
+) -> dict[str, frozenset[str]]:
+    result: dict[str, frozenset[str]] = {}
+    for table, columns in (semantic_indexes or {}).items():
+        names = columns.keys() if isinstance(columns, Mapping) else columns
+        result[_casefold(str(table)).rsplit(".", 1)[-1]] = frozenset(
+            _casefold(str(column)) for column in names
+        )
+    return result
+
+
+def _table_name(table: exp.Table) -> str:
+    return _casefold(table.name).rsplit(".", 1)[-1]
+
+
+def _unique_sources(info: _ScopeInfo) -> tuple[exp.Table | Scope, ...]:
+    seen: set[int] = set()
+    sources: list[exp.Table | Scope] = []
+    for source in info.sources.values():
+        marker = id(source)
+        if marker not in seen:
+            sources.append(source)
+            seen.add(marker)
+    return tuple(sources)
+
+
+def _source_tables(source: exp.Table | Scope, infos: Mapping[int, _ScopeInfo]) -> frozenset[str]:
+    if isinstance(source, exp.Table):
+        return frozenset({_table_name(source)})
+    return infos[id(source)].physical_tables
+
+
+def _resolve_column(
+    column: exp.Column,
+    info: _ScopeInfo,
+    infos: Mapping[int, _ScopeInfo],
+    semantic_indexes: Mapping[str, frozenset[str]],
+    *,
+    include_projection_aliases: bool = True,
+) -> _Resolution:
+    name = _casefold(column.name)
+    qualifier = _casefold(column.table) if column.table else ""
+
+    if qualifier:
+        source = info.sources.get(qualifier)
+        if source is None:
+            return _Resolution(frozenset({(qualifier, name)}), False)
+        if isinstance(source, exp.Table):
+            return _Resolution(frozenset({(_table_name(source), name)}), True)
+        source_projection = infos[id(source)].projections
+        if name in source_projection:
+            return source_projection[name]
+        return _Resolution(known=False)
+
+    candidates: list[_Resolution] = []
+    physical_sources: list[str] = []
+    for source in _unique_sources(info):
+        if isinstance(source, exp.Table):
+            table = _table_name(source)
+            physical_sources.append(table)
+            if not semantic_indexes or name in semantic_indexes.get(table, frozenset()):
+                candidates.append(_Resolution(frozenset({(table, name)}), True))
+        else:
+            projection = infos[id(source)].projections
+            if name in projection:
+                candidates.append(projection[name])
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        return _Resolution(known=False)
+    if include_projection_aliases and name in info.projections:
+        return info.projections[name]
+    if len(set(physical_sources)) == 1:
+        return _Resolution(frozenset({(physical_sources[0], name)}), False)
+    return _Resolution(known=False)
+
+
+def _immediate_columns(expression: exp.Expression, select: exp.Select) -> tuple[exp.Column, ...]:
+    return tuple(
+        column
+        for column in expression.find_all(exp.Column)
+        if column.find_ancestor(exp.Select) is select
+    )
+
+
+def _projection_resolution(
+    expression: exp.Expression,
+    info: _ScopeInfo,
+    infos: Mapping[int, _ScopeInfo],
+    semantic_indexes: Mapping[str, frozenset[str]],
+) -> _Resolution:
+    references: set[_FieldReference] = set()
+    known = True
+    for column in _immediate_columns(expression, info.scope.expression):
+        resolved = _resolve_column(
+            column,
+            info,
+            infos,
+            semantic_indexes,
+            include_projection_aliases=False,
+        )
+        references.update(resolved.references)
+        known = known and resolved.known
+    return _Resolution(frozenset(references), known)
+
+
+def _expand_star(
+    expression: exp.Expression,
+    info: _ScopeInfo,
+    infos: Mapping[int, _ScopeInfo],
+    semantic_indexes: Mapping[str, frozenset[str]],
+) -> dict[str, _Resolution]:
+    qualifier = ""
+    if isinstance(expression, exp.Column) and expression.name == "*":
+        qualifier = _casefold(expression.table)
+
+    sources = (info.sources.get(qualifier),) if qualifier else _unique_sources(info)
+    projections: dict[str, _Resolution] = {}
+    for source in sources:
+        if source is None:
+            continue
+        if isinstance(source, exp.Table):
+            table = _table_name(source)
+            for name in sorted(semantic_indexes.get(table, frozenset())):
+                projections.setdefault(
+                    name, _Resolution(frozenset({(table, name)}), True)
+                )
+        else:
+            for name, resolution in infos[id(source)].projections.items():
+                projections.setdefault(name, resolution)
+    return projections
+
+
+def _reference_strings(
+    expression: exp.Expression,
+    info: _ScopeInfo,
+    infos: Mapping[int, _ScopeInfo],
+    semantic_indexes: Mapping[str, frozenset[str]],
+) -> tuple[str, ...]:
+    values: list[str] = []
+    for column in _immediate_columns(expression, info.scope.expression):
+        resolved = _resolve_column(column, info, infos, semantic_indexes)
+        if resolved.references:
+            values.extend(f"{table}.{name}" for table, name in sorted(resolved.references))
+        elif not resolved.known:
+            qualifier = _casefold(column.table) if column.table else ""
+            values.append(f"{qualifier}.{_casefold(column.name)}" if qualifier else _casefold(column.name))
+    if not values:
+        values.append(_casefold(expression.sql()))
+    return tuple(values)
+
+
+def _source_for_node(node: exp.Expression, info: _ScopeInfo) -> exp.Table | Scope | None:
+    name = _casefold(node.alias_or_name)
+    return info.sources.get(name)
+
+
+def _extract_joins(
+    info: _ScopeInfo,
+    infos: Mapping[int, _ScopeInfo],
+    semantic_indexes: Mapping[str, frozenset[str]],
+) -> tuple[tuple[str, str, str, str], ...]:
+    select = info.scope.expression
+    # sqlglot 21 used ``from``; current releases expose the same node as ``from_``.
+    from_clause = select.args.get("from_") or select.args.get("from")
+    if not isinstance(from_clause, exp.From) or from_clause.this is None:
+        return ()
+    left_source = _source_for_node(from_clause.this, info)
+    left_tables = set(_source_tables(left_source, infos)) if left_source is not None else set()
+    joins: list[tuple[str, str, str, str]] = []
+
+    for join in select.args.get("joins") or ():
+        right_source = _source_for_node(join.this, info)
+        right_tables = (
+            set(_source_tables(right_source, infos)) if right_source is not None else set()
+        )
+        matched = False
+        on = join.args.get("on")
+        for equality in on.find_all(exp.EQ) if isinstance(on, exp.Expression) else ():
+            if not isinstance(equality.this, exp.Column) or not isinstance(
+                equality.expression, exp.Column
+            ):
+                continue
+            left = _resolve_column(equality.this, info, infos, semantic_indexes)
+            right = _resolve_column(equality.expression, info, infos, semantic_indexes)
+            if len(left.references) != 1 or len(right.references) != 1:
+                continue
+            left_ref = next(iter(left.references))
+            right_ref = next(iter(right.references))
+            if left_ref[0] in right_tables and right_ref[0] in left_tables:
+                left_ref, right_ref = right_ref, left_ref
+            if left_ref[0] in left_tables and right_ref[0] in right_tables:
+                joins.append((left_ref[0], left_ref[1], right_ref[0], right_ref[1]))
+                matched = True
+        if not matched and left_tables and right_tables:
+            joins.append((sorted(left_tables)[0], "", sorted(right_tables)[0], ""))
+        left_tables.update(right_tables)
+    return tuple(joins)
+
+
+def _analyze_sql(
+    sql: str,
+    dialect: str,
+    semantic_indexes: Mapping[str, Iterable[str] | Mapping[str, Any]] | None,
+) -> _SQLAnalysis:
+    statements = [statement for statement in parse(sql, read=dialect) if statement is not None]
+    if len(statements) != 1:
+        raise ValueError("exactly one SQL statement is required")
+    tree = statements[0]
+    indexes = _semantic_field_index(semantic_indexes)
+    infos_by_scope: dict[int, _ScopeInfo] = {}
+    aliases: dict[str, str] = {}
+    columns: list[tuple[str | None, str]] = []
+    group_by: list[str] = []
+    filters: list[str] = []
+    joins: list[tuple[str, str, str, str]] = []
+
+    for sql_scope in traverse_scope(tree):
+        sources = {_casefold(name): source for name, source in sql_scope.sources.items()}
+        physical_tables: set[str] = set()
+        for source_name, source in sources.items():
+            source_tables = _source_tables(source, infos_by_scope)
+            physical_tables.update(source_tables)
+            if len(source_tables) == 1:
+                aliases[source_name] = next(iter(source_tables))
+            if isinstance(source, exp.Table):
+                table = _table_name(source)
+                aliases[table] = table
+
+        info = _ScopeInfo(
+            scope=sql_scope,
+            sources=sources,
+            physical_tables=frozenset(physical_tables),
+        )
+        infos_by_scope[id(sql_scope)] = info
+
+        select = sql_scope.expression
+        for expression in select.expressions:
+            unaliased = expression.this if isinstance(expression, exp.Alias) else expression
+            if isinstance(unaliased, exp.Star) or (
+                isinstance(unaliased, exp.Column) and unaliased.name == "*"
+            ):
+                info.projections.update(
+                    _expand_star(unaliased, info, infos_by_scope, indexes)
+                )
+                continue
+            output_name = _casefold(expression.alias_or_name)
+            if output_name:
+                info.projections[output_name] = _projection_resolution(
+                    unaliased, info, infos_by_scope, indexes
+                )
+
+        for column in sql_scope.columns:
+            resolved = _resolve_column(column, info, infos_by_scope, indexes)
+            if resolved.references:
+                columns.extend(sorted(resolved.references))
+            elif not resolved.known:
+                qualifier = _casefold(column.table) if column.table else None
+                if qualifier is not None:
+                    qualifier = aliases.get(qualifier, qualifier)
+                columns.append((qualifier, _casefold(column.name)))
+
+        for expression in select.expressions:
+            unaliased = expression.this if isinstance(expression, exp.Alias) else expression
+            if isinstance(unaliased, exp.Star) or (
+                isinstance(unaliased, exp.Column) and unaliased.name == "*"
+            ):
+                expanded = _expand_star(unaliased, info, infos_by_scope, indexes)
+                if expanded:
+                    for resolution in expanded.values():
+                        columns.extend(sorted(resolution.references))
+                else:
+                    for source in _unique_sources(info):
+                        for table in sorted(_source_tables(source, infos_by_scope)):
+                            columns.append((table, "*"))
+
+        group = select.args.get("group")
+        for expression in group.expressions if isinstance(group, exp.Group) else ():
+            group_by.extend(_reference_strings(expression, info, infos_by_scope, indexes))
+        for clause_name in ("where", "having"):
+            clause = select.args.get(clause_name)
+            if isinstance(clause, exp.Expression) and clause.this is not None:
+                filters.extend(
+                    _reference_strings(clause.this, info, infos_by_scope, indexes)
+                )
+        joins.extend(_extract_joins(info, infos_by_scope, indexes))
+
+    scope = SQLScope(
+        tables=frozenset(table for info in infos_by_scope.values() for table in info.physical_tables),
+        aliases=aliases,
+        columns=tuple(columns),
+        joins=tuple(joins),
+        group_by=tuple(dict.fromkeys(group_by)),
+        filters=tuple(dict.fromkeys(filters)),
+    )
+    return _SQLAnalysis(tree=tree, scope=scope, scope_infos=tuple(infos_by_scope.values()))
+
+
+def parse_sql_scope(
+    sql: str,
+    dialect: str = "mysql",
+    semantic_indexes: Mapping[str, Iterable[str] | Mapping[str, Any]] | None = None,
+) -> SQLScope:
+    """Parse one statement into deterministic scope facts without database access."""
+    return _analyze_sql(sql, dialect, semantic_indexes).scope
+
+
+def _expression_signature(
+    expression: Any,
+    info: _ScopeInfo | None,
+    infos: Mapping[int, _ScopeInfo],
+    semantic_indexes: Mapping[str, frozenset[str]],
+) -> Any:
+    if isinstance(expression, (exp.Alias, exp.Paren)):
+        return _expression_signature(expression.this, info, infos, semantic_indexes)
+    if isinstance(expression, exp.Column):
+        if info is not None:
+            resolved = _resolve_column(expression, info, infos, semantic_indexes)
+            if len(resolved.references) == 1:
+                table, name = next(iter(resolved.references))
+                return ("column", table, name)
+        name = _casefold(expression.name)
+        qualifier = _casefold(expression.table) if expression.table else ""
+        if qualifier:
+            return ("column", qualifier, name)
+        candidates = [
+            table for table, fields in semantic_indexes.items() if name in fields
+        ]
+        if len(candidates) == 1:
+            return ("column", candidates[0], name)
+        return ("column", None, name)
+    if isinstance(expression, exp.Identifier):
+        return ("identifier", _casefold(expression.name))
+    if isinstance(expression, exp.Literal):
+        return ("literal", bool(expression.is_string), expression.this)
+    if isinstance(expression, exp.Expression):
+        return (
+            expression.key,
+            tuple(
+                (key, _expression_signature(value, info, infos, semantic_indexes))
+                for key, value in sorted(expression.args.items())
+                if value is not None
+            ),
+        )
+    if isinstance(expression, list):
+        return tuple(
+            _expression_signature(value, info, infos, semantic_indexes)
+            for value in expression
+        )
+    return expression
+
+
+def _metric_terms(metric: SemanticMetric) -> tuple[str, ...]:
+    return (metric.name, metric.name_cn, *metric.synonyms)
+
+
+def _question_matches(question: str, terms: Iterable[str]) -> bool:
+    normalized_question = " ".join(_casefold(question).split())
+    return any(
+        normalized_term and normalized_term in normalized_question
+        for term in terms
+        if (normalized_term := " ".join(_casefold(term).split()))
+    )
+
+
+_TIME_GRAIN = re.compile(r"按(?:日|天|周|月|季度|季|年)")
+_DATE_LITERAL = re.compile(r"(?:\d{4}\s*年|\d{1,2}\s*月|\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?)")
+_RANGE_WORDING = re.compile(r"(?:日期|时间)(?:范围|区间)?|期间|最近|过去|本月|上月|今天|昨天|今年|去年|从.+?(?:到|至)")
+
+
+def _has_time_intent(question: str) -> bool:
+    normalized = _casefold(question)
+    return bool(
+        _TIME_GRAIN.search(normalized)
+        or _DATE_LITERAL.search(normalized)
+        or _RANGE_WORDING.search(normalized)
+    )
+
+
+class SemanticSQLValidator:
+    """Evaluate governed semantic rules without constructing database clients."""
+
+    def validate(
+        self,
+        sql: str,
+        question: str,
+        snapshot: SemanticSnapshot,
+    ) -> ValidationReport:
+        field_indexes = {
+            _casefold(entity.name): frozenset(_casefold(field.name) for field in entity.fields)
+            for entity in snapshot.entities
+        }
+        try:
+            analysis = _analyze_sql(sql, snapshot.dialect, field_indexes)
+        except Exception:
+            return ValidationReport(
+                valid=False,
+                issues=(
+                    ValidationIssue(
+                        code="SYNTAX_ERROR",
+                        message="SQL 无法解析为单条语句",
+                        stage="syntax",
+                    ),
+                ),
+            )
+
+        scope = analysis.scope
+        issues: list[ValidationIssue] = []
+        entities = {_casefold(entity.name): entity for entity in snapshot.entities}
+
+        def add(code: str, message: str, *objects: str) -> None:
+            issues.append(
+                ValidationIssue(
+                    code=code,
+                    message=message,
+                    objects=tuple(sorted({_casefold(item) for item in objects if item})),
+                )
+            )
+
+        # Object existence.
+        for table in sorted(scope.tables):
+            if table not in entities:
+                add("UNKNOWN_TABLE", "SQL 引用了语义模型中不存在的表", table)
+        for table, name in scope.columns:
+            if name == "*":
+                continue
+            if table is not None:
+                if table not in field_indexes or name not in field_indexes[table]:
+                    add("UNKNOWN_COLUMN", "SQL 引用了语义模型中不存在的字段", f"{table}.{name}")
+                continue
+            matches = sorted(
+                candidate
+                for candidate in scope.tables
+                if name in field_indexes.get(candidate, frozenset())
+            )
+            if not matches:
+                add("UNKNOWN_COLUMN", "SQL 引用了语义模型中不存在的字段", name)
+
+        # Ambiguity.
+        for table, name in scope.columns:
+            if table is not None or name == "*":
+                continue
+            matches = sorted(
+                candidate
+                for candidate in scope.tables
+                if name in field_indexes.get(candidate, frozenset())
+            )
+            if len(matches) > 1:
+                add("AMBIGUOUS_COLUMN", "无表前缀字段可匹配多个输入表", name, *matches)
+
+        # Policies.
+        denied_entities = {_casefold(name) for name in snapshot.policies.denied_entities}
+        denied_fields = {_casefold(name) for name in snapshot.policies.denied_fields}
+        for table in sorted(scope.tables & denied_entities):
+            add("POLICY_DENIED", "治理策略禁止访问该表", table)
+        seen_columns = set(scope.columns)
+        for table, name in sorted(seen_columns, key=lambda item: (item[0] or "", item[1])):
+            if table not in entities:
+                continue
+            candidate_fields = entities[table].fields if name == "*" else (
+                field for field in entities[table].fields if _casefold(field.name) == name
+            )
+            for semantic_field in candidate_fields:
+                reference = f"{table}.{_casefold(semantic_field.name)}"
+                if (
+                    reference in denied_fields
+                    or not semantic_field.directly_queryable
+                    or semantic_field.sensitivity == "restricted"
+                ):
+                    add("POLICY_DENIED", "治理策略禁止直接查询该字段", reference)
+
+        # Governed joins.
+        relationships = {
+            frozenset(
+                {
+                    f"{_casefold(relation.from_entity)}.{_casefold(relation.from_field)}",
+                    f"{_casefold(relation.to_entity)}.{_casefold(relation.to_field)}",
+                }
+            )
+            for relation in snapshot.relationships
+        }
+        for left_table, left_field, right_table, right_field in scope.joins:
+            if left_table not in entities or right_table not in entities:
+                continue
+            endpoints = frozenset(
+                {f"{left_table}.{left_field}", f"{right_table}.{right_field}"}
+            )
+            if not left_field or not right_field or endpoints not in relationships:
+                add("INVALID_JOIN", "JOIN 条件不匹配已治理关系", *sorted(endpoints))
+
+        matched_metrics = tuple(
+            metric
+            for metric in snapshot.metrics
+            if _question_matches(question, _metric_terms(metric))
+        )
+        infos_by_scope = {id(info.scope): info for info in analysis.scope_infos}
+        query_signatures = {
+            _expression_signature(expression, info, infos_by_scope, field_indexes)
+            for info in analysis.scope_infos
+            for select_expression in info.scope.expression.expressions
+            for expression in (
+                select_expression.this
+                if isinstance(select_expression, exp.Alias)
+                else select_expression,
+            )
+        }
+
+        # Matched metrics.
+        for metric in matched_metrics:
+            try:
+                metric_expression = parse_one(metric.expression, read=snapshot.dialect)
+                metric_signature = _expression_signature(
+                    metric_expression, None, infos_by_scope, field_indexes
+                )
+            except Exception:
+                metric_signature = None
+            if metric_signature is None or metric_signature not in query_signatures:
+                add("METRIC_MISMATCH", "SQL 聚合表达式与命中的治理指标不等价", metric.name)
+
+        # Dimensions.
+        for metric in matched_metrics:
+            allowed = {
+                self._resolve_snapshot_reference(reference, field_indexes)
+                for reference in metric.allowed_dimensions
+            }
+            for dimension in scope.group_by:
+                if dimension not in allowed:
+                    add(
+                        "DIMENSION_NOT_ALLOWED",
+                        "指标使用了未允许的分组维度",
+                        metric.name,
+                        dimension,
+                    )
+
+        # Time intent.
+        if _has_time_intent(question):
+            time_fields: set[str] = set()
+            for metric in matched_metrics:
+                if metric.default_time_field:
+                    time_fields.add(
+                        self._resolve_snapshot_reference(metric.default_time_field, field_indexes)
+                    )
+                time_fields.update(
+                    self._resolve_snapshot_reference(reference, field_indexes)
+                    for reference in metric.allowed_dimensions
+                    if self._is_time_reference(reference, snapshot)
+                )
+            if not time_fields:
+                time_fields = {
+                    f"{_casefold(entity.name)}.{_casefold(semantic_field.name)}"
+                    for entity in snapshot.entities
+                    for semantic_field in entity.fields
+                    if semantic_field.role == "time"
+                }
+            used_fields = {
+                f"{table}.{name}"
+                for table, name in scope.columns
+                if table is not None and name != "*"
+            }
+            if not used_fields.intersection(time_fields):
+                add(
+                    "TIME_DIMENSION_REQUIRED",
+                    "问题包含时间意图，但 SQL 未使用受治理时间字段",
+                    *sorted(time_fields),
+                )
+
+        unique: dict[tuple[str, tuple[str, ...]], ValidationIssue] = {}
+        for issue in issues:
+            unique.setdefault((issue.code, issue.objects), issue)
+        ordered = tuple(
+            sorted(unique.values(), key=lambda issue: (issue.stage, issue.code, issue.objects))
+        )
+        return ValidationReport(valid=not ordered, issues=ordered)
+
+    @staticmethod
+    def _resolve_snapshot_reference(
+        reference: str,
+        field_indexes: Mapping[str, frozenset[str]],
+    ) -> str:
+        normalized = _casefold(reference)
+        if "." in normalized:
+            table, name = normalized.rsplit(".", 1)
+            return f"{table}.{name}"
+        candidates = sorted(
+            table for table, fields in field_indexes.items() if normalized in fields
+        )
+        return f"{candidates[0]}.{normalized}" if len(candidates) == 1 else normalized
+
+    @classmethod
+    def _is_time_reference(cls, reference: str, snapshot: SemanticSnapshot) -> bool:
+        normalized = cls._resolve_snapshot_reference(
+            reference,
+            {
+                _casefold(entity.name): frozenset(
+                    _casefold(semantic_field.name) for semantic_field in entity.fields
+                )
+                for entity in snapshot.entities
+            },
+        )
+        return any(
+            normalized == f"{_casefold(entity.name)}.{_casefold(semantic_field.name)}"
+            and semantic_field.role == "time"
+            for entity in snapshot.entities
+            for semantic_field in entity.fields
+        )
+
+
+__all__ = ["SQLScope", "SemanticSQLValidator", "parse_sql_scope"]

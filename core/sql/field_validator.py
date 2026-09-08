@@ -9,6 +9,8 @@ from sqlalchemy import create_engine, inspect
 from typing import Dict, List, Set, Tuple, Optional, Any
 from loguru import logger
 
+from core.semantic.validator import parse_sql_scope
+
 try:
     from sqlglot import exp, parse, ParseError
     from sqlglot.expressions import (
@@ -82,32 +84,11 @@ class SQLFieldValidator:
             logger.warning("sqlglot 不可用，使用降级处理")
             return set()
 
-        tables = set()
-
         try:
-            # 解析 SQL 为 AST
-            parsed = parse(sql, read='mysql')
-
-            for statement in parsed:
-                if statement is None:
-                    continue
-
-                # 提取所有表引用（包括 FROM、JOIN、CTE 等）
-                for table_node in statement.find_all(Table):
-                    table_name = self._get_table_name(table_node)
-                    if table_name:
-                        tables.add(table_name.lower())
-
-                # 处理 CTE (WITH 语句)
-                for cte in statement.find_all(CTE):
-                    if cte.alias:
-                        # CTE 别名也作为"表"处理（用于后续字段验证）
-                        tables.add(cte.alias.lower())
-
-        except ParseError as e:
-            logger.warning(f"SQL 解析失败：{e}")
+            tables = set(parse_sql_scope(sql, dialect="mysql").tables)
         except Exception as e:
             logger.error(f"提取表名失败：{e}")
+            tables = set()
 
         logger.debug(f"从 SQL 中提取到表名：{tables}")
         return tables
@@ -157,55 +138,13 @@ class SQLFieldValidator:
             logger.warning("sqlglot 不可用，使用降级处理")
             return set()
 
-        columns = set()
-
         try:
-            # 解析 SQL 为 AST
-            parsed = parse(sql, read='mysql')
-
-            for statement in parsed:
-                if statement is None:
-                    continue
-
-                # 提取所有列引用
-                for col_node in statement.find_all(Column):
-                    col_name = self._get_column_name(col_node)
-                    if col_name:
-                        columns.add(col_name.lower())
-
-                # 提取 ORDER BY 中的列
-                for order in statement.find_all(exp.Ordered):
-                    if isinstance(order.this, Column):
-                        col_name = self._get_column_name(order.this)
-                        if col_name:
-                            columns.add(col_name.lower())
-
-                # 提取 GROUP BY 中的列
-                for group in statement.find_all(exp.Group):
-                    for expr in group.expressions:
-                        if isinstance(expr, Column):
-                            col_name = self._get_column_name(expr)
-                            if col_name:
-                                columns.add(col_name.lower())
-
-                # 提取 WHERE 条件中的列
-                for where in statement.find_all(exp.Where):
-                    for col_node in where.find_all(Column):
-                        col_name = self._get_column_name(col_node)
-                        if col_name:
-                            columns.add(col_name.lower())
-
-                # 提取 HAVING 中的列
-                for having in statement.find_all(exp.Having):
-                    for col_node in having.find_all(Column):
-                        col_name = self._get_column_name(col_node)
-                        if col_name:
-                            columns.add(col_name.lower())
-
-        except ParseError as e:
-            logger.warning(f"SQL 解析失败：{e}")
+            columns = {
+                name for _, name in parse_sql_scope(sql, dialect="mysql").columns
+            }
         except Exception as e:
             logger.error(f"提取字段名失败：{e}")
+            columns = set()
 
         logger.debug(f"从 SQL 中提取到字段名：{columns}")
         return columns
@@ -239,27 +178,11 @@ class SQLFieldValidator:
         if not SQLGLOT_AVAILABLE:
             return {}
 
-        alias_mapping = {}
-
         try:
-            parsed = parse(sql, read='mysql')
-
-            for statement in parsed:
-                if statement is None:
-                    continue
-
-                # 查找所有表及其别名
-                for table_node in statement.find_all(Table):
-                    table_name = self._get_table_name(table_node)
-                    alias = table_node.alias
-
-                    if table_name:
-                        if alias:
-                            alias_mapping[alias.lower()] = table_name.lower()
-                        alias_mapping[table_name.lower()] = table_name.lower()
-
+            alias_mapping = dict(parse_sql_scope(sql, dialect="mysql").aliases)
         except Exception as e:
             logger.error(f"提取表别名失败：{e}")
+            alias_mapping = {}
 
         return alias_mapping
 
@@ -276,40 +199,14 @@ class SQLFieldValidator:
         if not SQLGLOT_AVAILABLE:
             return {}
 
-        table_columns: Dict[str, Set[str]] = {}
-        table_alias_mapping = self.extract_table_alias_mapping(sql)
-
         try:
-            parsed = parse(sql, read='mysql')
-
-            for statement in parsed:
-                if statement is None:
-                    continue
-
-                for col_node in statement.find_all(Column):
-                    col_name = col_node.name.lower() if col_node.name else None
-
-                    # 获取列的表引用
-                    table_ref = None
-
-                    # 如果列有表前缀 (如 t.customer_id)
-                    if col_node.table:
-                        table_ref = col_node.table.lower()
-                        # 解析别名到实际表名
-                        table_ref = table_alias_mapping.get(table_ref, table_ref)
-
-                    # 如果没有表前缀，尝试从所有相关表中查找
-                    if not table_ref:
-                        # 对于无表前缀的列，标记为 unknown 待后续处理
-                        table_ref = 'unknown'
-
-                    if col_name and table_ref:
-                        if table_ref not in table_columns:
-                            table_columns[table_ref] = set()
-                        table_columns[table_ref].add(col_name)
-
+            table_columns: Dict[str, Set[str]] = {}
+            scope = parse_sql_scope(sql, dialect="mysql")
+            for table, column in scope.columns:
+                table_columns.setdefault(table or "unknown", set()).add(column)
         except Exception as e:
             logger.error(f"提取带表字段失败：{e}")
+            table_columns = {}
 
         return table_columns
 
