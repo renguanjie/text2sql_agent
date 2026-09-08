@@ -1,0 +1,345 @@
+{
+  "$defs": {
+    "SemanticEntity": {
+      "additionalProperties": false,
+      "properties": {
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/SemanticField"
+          },
+          "title": "Fields",
+          "type": "array"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "name_cn": {
+          "title": "Name Cn",
+          "type": "string"
+        },
+        "synonyms": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Synonyms",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "name_cn",
+        "fields"
+      ],
+      "title": "SemanticEntity",
+      "type": "object"
+    },
+    "SemanticField": {
+      "additionalProperties": false,
+      "properties": {
+        "data_type": {
+          "title": "Data Type",
+          "type": "string"
+        },
+        "directly_queryable": {
+          "default": true,
+          "title": "Directly Queryable",
+          "type": "boolean"
+        },
+        "enum_values": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Enum Values",
+          "type": "array"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "name_cn": {
+          "title": "Name Cn",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "identifier",
+            "dimension",
+            "measure",
+            "time"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "sensitivity": {
+          "default": "internal",
+          "enum": [
+            "public",
+            "internal",
+            "sensitive",
+            "restricted"
+          ],
+          "title": "Sensitivity",
+          "type": "string"
+        },
+        "synonyms": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Synonyms",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "name_cn",
+        "data_type",
+        "role"
+      ],
+      "title": "SemanticField",
+      "type": "object"
+    },
+    "SemanticMetric": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_dimensions": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Dimensions",
+          "type": "array"
+        },
+        "default_time_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Default Time Field"
+        },
+        "expression": {
+          "title": "Expression",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "name_cn": {
+          "title": "Name Cn",
+          "type": "string"
+        },
+        "required_filters": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Filters",
+          "type": "array"
+        },
+        "synonyms": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Synonyms",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "name_cn",
+        "expression"
+      ],
+      "title": "SemanticMetric",
+      "type": "object"
+    },
+    "SemanticPolicies": {
+      "additionalProperties": false,
+      "properties": {
+        "denied_entities": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Denied Entities",
+          "type": "array"
+        },
+        "denied_fields": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Denied Fields",
+          "type": "array"
+        }
+      },
+      "title": "SemanticPolicies",
+      "type": "object"
+    },
+    "SemanticRelationship": {
+      "additionalProperties": false,
+      "properties": {
+        "extra_condition": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Extra Condition"
+        },
+        "from_entity": {
+          "title": "From Entity",
+          "type": "string"
+        },
+        "from_field": {
+          "title": "From Field",
+          "type": "string"
+        },
+        "join_type": {
+          "default": "LEFT JOIN",
+          "enum": [
+            "INNER JOIN",
+            "LEFT JOIN"
+          ],
+          "title": "Join Type",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "to_entity": {
+          "title": "To Entity",
+          "type": "string"
+        },
+        "to_field": {
+          "title": "To Field",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "from_entity",
+        "from_field",
+        "to_entity",
+        "to_field"
+      ],
+      "title": "SemanticRelationship",
+      "type": "object"
+    },
+    "SemanticTerm": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "term": {
+          "title": "Term",
+          "type": "string"
+        },
+        "when": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "When"
+        }
+      },
+      "required": [
+        "term",
+        "target"
+      ],
+      "title": "SemanticTerm",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "datasource": {
+      "title": "Datasource",
+      "type": "string"
+    },
+    "dialect": {
+      "const": "mysql",
+      "title": "Dialect"
+    },
+    "entities": {
+      "items": {
+        "$ref": "#/$defs/SemanticEntity"
+      },
+      "title": "Entities",
+      "type": "array"
+    },
+    "metrics": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SemanticMetric"
+      },
+      "title": "Metrics",
+      "type": "array"
+    },
+    "model_version": {
+      "title": "Model Version",
+      "type": "string"
+    },
+    "policies": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/SemanticPolicies"
+        }
+      ],
+      "default": {
+        "denied_entities": [],
+        "denied_fields": []
+      }
+    },
+    "relationships": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SemanticRelationship"
+      },
+      "title": "Relationships",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version"
+    },
+    "terms": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/SemanticTerm"
+      },
+      "title": "Terms",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "model_version",
+    "datasource",
+    "dialect",
+    "entities"
+  ],
+  "title": "SemanticModel",
+  "type": "object"
+}

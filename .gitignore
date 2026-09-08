@@ -28,5 +28,6 @@ python_deps/*
 logs/*.log
 logs/*.log.*
 data/index_cache/
+semantic_models/.compiled/
 llm_test_report.json
 tests/llm_test_report.json

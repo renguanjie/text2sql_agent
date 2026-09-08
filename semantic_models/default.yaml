@@ -1,0 +1,30 @@
+schema_version: 1
+model_version: 1.0.0
+datasource: default
+dialect: mysql
+entities:
+  - name: example_orders
+    name_cn: 示例订单
+    fields:
+      - name: id
+        name_cn: 订单编号
+        data_type: bigint
+        role: identifier
+        sensitivity: public
+      - name: created_at
+        name_cn: 创建时间
+        data_type: datetime
+        role: time
+        sensitivity: public
+      - name: amount
+        name_cn: 金额
+        data_type: decimal
+        role: measure
+        sensitivity: public
+metrics:
+  - name: order_amount
+    name_cn: 订单金额
+    expression: SUM(example_orders.amount)
+    allowed_dimensions:
+      - example_orders.created_at
+    default_time_field: example_orders.created_at
