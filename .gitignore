@@ -22,6 +22,7 @@ python_deps/*
 # IDE / OS
 .DS_Store
 .idea/
+.worktrees/
 
 # Runtime artifacts
 logs/*.log
