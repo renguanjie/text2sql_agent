@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.pool import QueuePool
 from loguru import logger
+from sqlglot import exp, parse_one
 from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
 import json
 import uuid
@@ -145,6 +146,24 @@ class MySQLClient:
             rows = result.mappings().fetchmany(max_rows + 1)
             truncated = len(rows) > max_rows
             return [dict(row) for row in rows[:max_rows]], truncated
+
+    def explain_query(self, query: str, timeout_ms: int) -> List[Dict]:
+        """执行不改变连接会话状态的 MySQL SELECT 查询计划预检。"""
+        if timeout_ms <= 0:
+            raise ValueError("timeout_ms 必须大于 0")
+
+        statement = parse_one(query, read="mysql")
+        if not isinstance(statement, exp.Select):
+            raise ValueError("仅支持 SELECT 预检")
+
+        statement.set(
+            "hint",
+            exp.Hint(expressions=[exp.Var(this=f"MAX_EXECUTION_TIME({int(timeout_ms)})")]),
+        )
+        explain_sql = f"EXPLAIN {statement.sql(dialect='mysql')}"
+        with self.get_connection() as conn:
+            result = conn.execute(text(explain_sql))
+            return [dict(row._mapping) for row in result]
 
     def execute_update(self, query: str, params: Optional[dict] = None,
                        raise_on_error: bool = False) -> int:
