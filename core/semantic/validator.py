@@ -1302,8 +1302,12 @@ def analyze_sql_structure(
     # Evidence is isolated by final output scope, underlying source occurrence,
     # and governed field. This prevents unrelated scalar/self-join scopes from
     # manufacturing a complete calendar key for the final result.
-    time_evidence: dict[tuple[int, int, str], set[str]] = {}
-    visited_definitions: set[tuple[int, int, int]] = set()
+    time_evidence: dict[
+        tuple[int, tuple[tuple[int, str], ...], str], set[str]
+    ] = {}
+    visited_definitions: set[
+        tuple[int, tuple[tuple[int, str], ...], int, int]
+    ] = set()
 
     def unwrap_key(node: exp.Expression) -> exp.Expression:
         while isinstance(node, (exp.Alias, exp.Paren)):
@@ -1314,7 +1318,8 @@ def analyze_sql_structure(
         column: exp.Column,
         info: _ScopeInfo,
         visited: frozenset[tuple[int, str]],
-    ) -> tuple[int, str] | None:
+        occurrence_path: tuple[tuple[int, str], ...] = (),
+    ) -> tuple[tuple[tuple[int, str], ...], str] | None:
         marker = (id(info.scope), _casefold(column.sql()))
         if marker in visited:
             return None
@@ -1322,26 +1327,31 @@ def analyze_sql_structure(
         name = _casefold(column.name)
         qualifier = _casefold(column.table) if column.table else ""
 
-        def from_source(source: exp.Table | Scope | None) -> tuple[int, str] | None:
+        def from_source(
+            source_name: str, source: exp.Table | Scope | None
+        ) -> tuple[tuple[tuple[int, str], ...], str] | None:
+            source_path = occurrence_path + ((id(info.scope), source_name),)
             if isinstance(source, exp.Table):
                 table = _table_name(source)
                 if indexes and name not in indexes.get(table, frozenset()):
                     return None
-                return id(source), f"{table}.{name}"
+                return source_path, f"{table}.{name}"
             if isinstance(source, Scope):
                 source_info = infos[id(source)]
                 definition = source_info.projection_expressions.get(name)
                 definition = unwrap_key(definition) if definition is not None else None
                 if isinstance(definition, exp.Column):
-                    return column_origin(definition, source_info, visited)
+                    return column_origin(
+                        definition, source_info, visited, source_path
+                    )
             return None
 
         if qualifier:
-            return from_source(info.sources.get(qualifier))
+            return from_source(qualifier, info.sources.get(qualifier))
         candidates = tuple(
             candidate
-            for source in _unique_sources(info)
-            if (candidate := from_source(source)) is not None
+            for source_name, source in info.sources.items()
+            if (candidate := from_source(source_name, source)) is not None
         )
         return candidates[0] if len(candidates) == 1 else None
 
@@ -1362,10 +1372,55 @@ def analyze_sql_structure(
                 return False
         return True
 
+    def derived_time_definition(
+        column: exp.Column,
+        info: _ScopeInfo,
+        occurrence_path: tuple[tuple[int, str], ...],
+    ) -> tuple[_ScopeInfo, exp.Expression, tuple[tuple[int, str], ...]] | None:
+        name = _casefold(column.name)
+        qualifier = _casefold(column.table) if column.table else ""
+
+        def from_source(
+            source_name: str, source: exp.Table | Scope | None
+        ) -> tuple[_ScopeInfo, exp.Expression, tuple[tuple[int, str], ...]] | None:
+            if not isinstance(source, Scope):
+                return None
+            source_info = infos[id(source)]
+            expression = source_info.projection_expressions.get(name)
+            if expression is None:
+                return None
+            return (
+                source_info,
+                expression,
+                occurrence_path + ((id(info.scope), source_name),),
+            )
+
+        if qualifier:
+            return from_source(qualifier, info.sources.get(qualifier))
+
+        candidates: list[
+            tuple[_ScopeInfo, exp.Expression, tuple[tuple[int, str], ...]] | None
+        ] = []
+        for source_name, source in info.sources.items():
+            if isinstance(source, exp.Table):
+                table = _table_name(source)
+                if not indexes or name in indexes.get(table, frozenset()):
+                    candidates.append(None)
+                continue
+            definition = from_source(source_name, source)
+            if definition is not None:
+                candidates.append(definition)
+        if len(candidates) == 1 and candidates[0] is not None:
+            return candidates[0]
+
+        expression = info.projection_expressions.get(name)
+        return (info, expression, occurrence_path) if expression is not None else None
+
     def collect_time_key(
         node: exp.Expression,
         info: _ScopeInfo,
         output_scope_id: int,
+        occurrence_path: tuple[tuple[int, str], ...] = (),
         *,
         expand_projection_star: bool = False,
     ) -> None:
@@ -1377,12 +1432,14 @@ def analyze_sql_structure(
             columns = _immediate_columns(node, info.scope.expression)
             if len(columns) != 1:
                 return
-            origin = column_origin(columns[0], info, frozenset())
+            origin = column_origin(
+                columns[0], info, frozenset(), occurrence_path
+            )
             if origin is None:
                 return
-            source_id, reference = origin
+            source_path, reference = origin
             time_evidence.setdefault(
-                (output_scope_id, source_id, reference), set()
+                (output_scope_id, source_path, reference), set()
             ).update(facts)
             return
 
@@ -1392,28 +1449,47 @@ def analyze_sql_structure(
             if not expand_projection_star:
                 return
             qualifier = _casefold(node.table) if isinstance(node, exp.Column) else ""
-            sources = (info.sources.get(qualifier),) if qualifier else _unique_sources(info)
-            for source in sources:
+            sources = (
+                ((qualifier, info.sources.get(qualifier)),)
+                if qualifier
+                else tuple(info.sources.items())
+            )
+            for source_name, source in sources:
                 if isinstance(source, Scope):
                     source_info = infos[id(source)]
+                    source_path = occurrence_path + (
+                        (id(info.scope), source_name),
+                    )
                     for expression in source_info.projection_expressions.values():
-                        collect_time_key(expression, source_info, output_scope_id)
+                        collect_time_key(
+                            expression,
+                            source_info,
+                            output_scope_id,
+                            source_path,
+                        )
             return
 
         if not isinstance(node, exp.Column):
             return
-        derived = _derived_definition(node, info, infos, indexes)
-        if derived is None and not node.table:
-            expression = info.projection_expressions.get(_casefold(node.name))
-            derived = (info, expression) if expression is not None else None
+        derived = derived_time_definition(node, info, occurrence_path)
         if derived is None:
             return
-        definition_info, expression = derived
-        definition_marker = (output_scope_id, id(definition_info.scope), id(expression))
+        definition_info, expression, definition_path = derived
+        definition_marker = (
+            output_scope_id,
+            definition_path,
+            id(definition_info.scope),
+            id(expression),
+        )
         if definition_marker in visited_definitions:
             return
         visited_definitions.add(definition_marker)
-        collect_time_key(expression, definition_info, output_scope_id)
+        collect_time_key(
+            expression,
+            definition_info,
+            output_scope_id,
+            definition_path,
+        )
 
     for info in analysis.root_output_infos:
         select = info.scope.expression

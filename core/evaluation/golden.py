@@ -71,12 +71,14 @@ _MODEL_PARAMETER_ALLOWLIST = frozenset(
         "top_p",
     }
 )
-_MODEL_REVISION = re.compile(
-    r"(?:"
-    r"v?(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2}(?:[-.][0-9A-Za-z]+)*|"
-    r"[0-9A-Fa-f]{7,64}|"
+_MODEL_REVISION_SEMVER = re.compile(
+    r"v?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
+    r"(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
+)
+_MODEL_REVISION_GIT_HASH = re.compile(r"(?:[0-9A-Fa-f]{7,40}|[0-9A-Fa-f]{64})")
+_MODEL_REVISION_SLUG = re.compile(
     r"[A-Za-z][A-Za-z0-9]*(?:[._-][A-Za-z0-9]+){0,3}"
-    r")"
 )
 _QUANTIZATIONS = frozenset(
     {
@@ -123,17 +125,14 @@ _CREDENTIAL_VALUE = re.compile(
 _Scalar = StrictBool | StrictInt | StrictFloat | StrictStr
 
 
-def _looks_like_high_entropy_credential(value: str) -> bool:
-    if re.fullmatch(r"[0-9A-Fa-f]{7,64}", value):
+def _is_safe_model_revision(value: str) -> bool:
+    if _CREDENTIAL_VALUE.search(value):
         return False
-    categories = sum(
-        (
-            any(char.islower() for char in value),
-            any(char.isupper() for char in value),
-            any(char.isdigit() for char in value),
-        )
+    return bool(
+        _MODEL_REVISION_SEMVER.fullmatch(value)
+        or _MODEL_REVISION_GIT_HASH.fullmatch(value)
+        or (len(value) <= 24 and _MODEL_REVISION_SLUG.fullmatch(value))
     )
-    return len(value) >= 24 and categories >= 3
 
 
 class GoldenConfigurationError(ValueError):
@@ -366,9 +365,7 @@ class ModelParameter(FrozenModel):
         elif self.name == "model_revision":
             if (
                 not isinstance(value, str)
-                or not _MODEL_REVISION.fullmatch(value)
-                or _CREDENTIAL_VALUE.search(value)
-                or _looks_like_high_entropy_credential(value)
+                or not _is_safe_model_revision(value)
             ):
                 raise ValueError("model revision is not report-safe")
         elif self.name == "quantization":

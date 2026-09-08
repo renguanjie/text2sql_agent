@@ -417,6 +417,70 @@ def test_calendar_components_from_distinct_self_join_sources_do_not_combine(eval
     )
 
 
+def test_calendar_components_from_distinct_cte_aliases_do_not_combine(evaluator):
+    """Break caught: erasing two root occurrences of the same CTE scope."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT id, created_at FROM example_orders) "
+        "SELECT YEAR(a.created_at), MONTH(b.created_at), COUNT(*) "
+        "FROM base AS a JOIN base AS b ON b.id = a.id "
+        "GROUP BY YEAR(a.created_at), MONTH(b.created_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_calendar_components_keep_nested_derived_source_occurrences_distinct(evaluator):
+    """Break caught: losing root alias identity through nested derived lineage."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT id, created_at AS occurred_at FROM example_orders), "
+        "nested AS (SELECT id, occurred_at FROM base) "
+        "SELECT YEAR(a.occurred_at), MONTH(b.occurred_at), COUNT(*) "
+        "FROM nested AS a JOIN nested AS b ON b.id = a.id "
+        "GROUP BY YEAR(a.occurred_at), MONTH(b.occurred_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_projected_calendar_keys_keep_repeated_cte_occurrences_distinct(evaluator):
+    """Break caught: dropping outer source identity when resolving projected keys."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT id, YEAR(created_at) AS year_key, "
+        "MONTH(created_at) AS month_key FROM example_orders) "
+        "SELECT a.year_key, b.month_key, COUNT(*) "
+        "FROM base AS a JOIN base AS b ON b.id = a.id "
+        "GROUP BY a.year_key, b.month_key"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_nested_projected_keys_keep_repeated_cte_occurrences_distinct(evaluator):
+    """Break caught: dropping an occurrence prefix across multiple derived scopes."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT id, created_at AS occurred_at FROM example_orders), "
+        "nested AS (SELECT id, YEAR(occurred_at) AS year_key, "
+        "MONTH(occurred_at) AS month_key FROM base) "
+        "SELECT a.year_key, b.month_key, COUNT(*) "
+        "FROM nested AS a JOIN nested AS b ON b.id = a.id "
+        "GROUP BY a.year_key, b.month_key"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
 def test_calendar_component_hidden_in_case_is_not_a_direct_grain_key(evaluator):
     """Break caught: treating a temporal descendant inside CASE as a grouping component."""
     case = _case(expected_time_grain="month")
@@ -863,6 +927,9 @@ def test_model_parameter_parser_allows_only_non_sensitive_names():
         "model_revision=xoxb-123456789012-AbCdEf",
         "model_revision=sk_live_AbCdEf0123456789",
         "model_revision=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
+        "model_revision=k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3",
+        "model_revision=qwertyuiopasdfghjklzxcvbnmqwertyuiop",
+        "model_revision=azbycxdwevfugthsirjqkplomn_23456789",
         "quantization=custom format",
         "quantization=Q4_K_M?password=private",
     ],
@@ -1427,7 +1494,7 @@ def test_git_commit_lookup_has_stable_fallback(monkeypatch, tmp_path: Path):
 
 
 def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
-    snapshot: SemanticSnapshot, tmp_path: Path
+    snapshot: SemanticSnapshot, tmp_path: Path, capsys
 ):
     """Break caught: treating regression failures as malformed input or vice versa."""
     from core.semantic.compiler import SemanticCompiler
@@ -1512,6 +1579,7 @@ def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
             str(compiled),
         ]
     )
+    original_report = output.read_bytes()
     malformed = main(
         [
             "--cases",
@@ -1528,10 +1596,34 @@ def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
             str(compiled),
         ]
     )
+    opaque_revision = "k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3"
+    invalid_revision = main(
+        [
+            "--cases",
+            str(suite_path),
+            "--results",
+            str(result_path),
+            "--output",
+            str(output),
+            "--model",
+            "local-demo",
+            "--model-param",
+            f"model_revision={opaque_revision}",
+            "--semantic-version",
+            "1.0.0",
+            "--compiled-root",
+            str(compiled),
+        ]
+    )
+    console = capsys.readouterr()
 
     assert failed == 1
     assert malformed == 2
-    assert json.loads(output.read_text("utf-8"))["failed"] == 1
+    assert invalid_revision == 2
+    assert output.read_bytes() == original_report
+    assert json.loads(original_report)["failed"] == 1
+    assert opaque_revision not in console.out + console.err
+    assert opaque_revision.encode() not in original_report
 
 
 def test_repository_golden_suite_has_required_anonymous_coverage():
