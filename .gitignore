@@ -29,5 +29,7 @@ logs/*.log
 logs/*.log.*
 data/index_cache/
 semantic_models/.compiled/
+eval/results/
+eval/reports/
 llm_test_report.json
 tests/llm_test_report.json

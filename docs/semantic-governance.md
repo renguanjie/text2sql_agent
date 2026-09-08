@@ -1,0 +1,177 @@
+# 语义治理运维手册
+
+正确性内核以 Git 中的 YAML 为唯一人工语义真相源。它为 SQL 生成提供紧凑中文上下文，并在生成与执行前执行确定性校验。Neo4j 仅是已发布快照的派生检索索引：图不可用会影响召回，但不能替代、修改或覆盖 Git 语义，更不能授权执行。
+
+## 1. 默认值与边界
+
+以下配置来自 `config.py` 与 `env.example`；默认均兼容旧行为。
+
+| 变量 | 默认值 | 约束 |
+| --- | --- | --- |
+| `SEMANTIC_GOVERNANCE_ENABLED` | `false` | 仅设为 `true` 才创建语义注册表与正确性管线。 |
+| `SEMANTIC_MODEL_DIR` | `semantic_models` | 相对路径相对于项目根目录；源文件为 `<目录>/<datasource>.yaml`。 |
+| `SEMANTIC_DATASOURCE` | `default` | 必须对应一个 YAML 数据源。 |
+| `SEMANTIC_CONTEXT_MAX_CHARS` | `2400` | 必须大于 `0`。 |
+| `SEMANTIC_CONTEXT_MAX_ITEMS` | `24` | 必须大于 `0`。 |
+| `SQL_REPAIR_MAX_ATTEMPTS` | `1` | 只允许 `0` 或 `1`；`1` 是最大值。 |
+| `SQL_EXPLAIN_ENABLED` | `false` | 设为 `true` 时必须同时启用 `SEMANTIC_GOVERNANCE_ENABLED=true`。 |
+| `SQL_EXPLAIN_TIMEOUT_MS` | `3000` | 必须大于 `0`，单位毫秒。 |
+| `SQL_EXPLAIN_MAX_ESTIMATED_ROWS` | `0` | 不得为负；`0` 表示不因估算扫描行数拒绝。 |
+
+首版只接受 `schema_version: 1`、`dialect: mysql`，且 `model_version` 必须是严格的 `MAJOR.MINOR.PATCH`。模型字段角色限定为 `identifier`、`dimension`、`measure`、`time`。治理源、编译快照、Golden 用例都不得包含凭据或真实业务值。
+
+## 2. 作者 → 校验/编译 → 激活
+
+1. 在 Git 分支中编辑 `semantic_models/default.yaml`（或你的 `<datasource>.yaml`）。YAML 是唯一人工源文件；请评审实体、字段、关系、指标、术语和策略。
+2. 编译并执行交叉引用校验：
+
+   ```bash
+   .venv/bin/python scripts/compile_semantic_models.py semantic_models/default.yaml
+   ```
+
+   成功输出的格式为 `datasource@model_version content_sha256`。编译器写入 `semantic_models/.compiled/<datasource>/<model_version>.json`，并原子更新 `semantic_models/.compiled/manifest.json` 中的 `active` 映射。激活版本由该清单决定，不按文件时间推断。
+3. 检查已激活版本与摘要：
+
+   ```bash
+   .venv/bin/python -m json.tool semantic_models/.compiled/manifest.json
+   ```
+
+   相同 YAML 与编译器版本应产生相同 `content_sha256`；`compiled_at` 不参与内容摘要。若编译失败，不会生成部分快照或替换已加载的有效快照。
+
+`semantic_models/default.yaml`、`semantic_models/schema/semantic-model.schema.json` 和 `eval/golden/*.yaml` 是受版本控制的源资产；`.compiled/` 是运行产物，必须保持忽略。
+
+## 3. 显式发布到 Neo4j
+
+完成编译与清单检查后，才可将**已激活的编译快照**发布为图检索索引：
+
+```bash
+.venv/bin/python scripts/publish_semantic_model.py default \
+  --compiled-root semantic_models/.compiled
+```
+
+命令仅接受编译目录和数据源，不能以原始 YAML 绕过编译。发布是显式运维动作，不会在应用启动时自动执行；它委托现有图导入的原子覆盖路径。不要在 Neo4j 中手工编辑图来“修正”语义：下一次发布会由 Git 快照重建索引，SQL 校验始终读取注册表中的 Git 编译快照。
+
+## 4. 启动与热重载
+
+默认关闭示例：
+
+```bash
+SEMANTIC_GOVERNANCE_ENABLED=false SQL_EXPLAIN_ENABLED=false streamlit run app.py
+```
+
+启用语义治理、不启用数据库预检：
+
+```bash
+SEMANTIC_GOVERNANCE_ENABLED=true \
+SEMANTIC_MODEL_DIR=semantic_models \
+SEMANTIC_DATASOURCE=default \
+SQL_REPAIR_MAX_ATTEMPTS=1 \
+SQL_EXPLAIN_ENABLED=false \
+streamlit run app.py
+```
+
+启用 MySQL `EXPLAIN` 预检时，使用同一只读连接和超时限制；它必须依赖已启用的治理：
+
+```bash
+SEMANTIC_GOVERNANCE_ENABLED=true \
+SQL_EXPLAIN_ENABLED=true \
+SQL_EXPLAIN_TIMEOUT_MS=3000 \
+SQL_EXPLAIN_MAX_ESTIMATED_ROWS=100000 \
+streamlit run app.py
+```
+
+现有进程可由拥有 `ApplicationContext` 的运维代码调用 `reload_governance(...)`。它会先候选构建（编译、加载、校验、新生成器），成功后一次替换注册表/管线/生成器；失败时旧的不可变对象图继续服务。
+
+```python
+context.reload_governance(
+    semantic_governance_enabled=True,
+    semantic_model_dir="semantic_models",
+    semantic_datasource="default",
+    semantic_context_max_chars=2400,
+    semantic_context_max_items=24,
+    sql_repair_max_attempts=1,
+    sql_explain_enabled=False,
+    sql_explain_timeout_ms=3000,
+    sql_explain_max_estimated_rows=0,
+)
+```
+
+没有持有该上下文的部署应重启应用；启动同样会先编译、加载并验证当前数据源。首次启动的治理配置无效会失败，而不是静默降级。
+
+## 5. 生成、一次纠错与执行再授权
+
+一次受治理请求固定执行以下流程：以单一不可变快照构建受限中文语义上下文 → 生成一条 SQL → 语法/只读安全/查询范围/语义校验 →（若开启）MySQL `EXPLAIN` → 必要时将脱敏的结构化错误和最小语义片段交给模型纠错一次 → 从第一项校验重新验证修复 SQL。`repair_attempts` 只会是 `0` 或 `1`；第二次失败不会再次调用模型，且 `executable` 为 `false`。
+
+只有全部阶段通过时结果才是 `status: "success"`、`executable: true`。执行前还会用当前激活快照重新授权，并要求生成时绑定的原问题与 `semantic_version`；版本改变、上下文缺失或 SQL 重新校验失败都会拒绝执行。启用预检时，MySQL `EXPLAIN` 的数据库错误、超时、空计划或超过阈值的估算扫描行数都会阻断执行。
+
+## 6. 回滚
+
+回滚必须在 Git 源上完成，再重新编译和激活；不要回滚 Neo4j 图来代替 Git 回滚。
+
+```bash
+git checkout <已审查提交> -- semantic_models/default.yaml
+.venv/bin/python scripts/compile_semantic_models.py semantic_models/default.yaml
+.venv/bin/python -m json.tool semantic_models/.compiled/manifest.json
+.venv/bin/python scripts/publish_semantic_model.py default \
+  --compiled-root semantic_models/.compiled
+```
+
+若团队策略要求保留线性历史，使用 `git revert <变更提交>` 替代 `git checkout`。完成后重启应用或调用 `reload_governance(...)`。编译或重载失败时，已在内存中运行的旧有效快照不会被替换。
+
+## 7. Golden Set 离线评估
+
+Golden 用例在 `eval/golden/`；生成结果和报告是私有运行产物，分别写入已忽略的 `eval/results/` 与 `eval/reports/`。评测不会调用 LLM 或数据库：
+
+```bash
+.venv/bin/python scripts/evaluate_golden.py \
+  --cases eval/golden/default.yaml \
+  --results eval/results/default-results.json \
+  --output eval/reports/default-report.json \
+  --model local-model \
+  --semantic-version 1.1.0
+```
+
+退出码为：`0` 全部用例通过，`1` 已完成评测但至少一例不通过，`2` 配置/输入/快照/I/O 无效。默认报告只保存问题与 SQL 指纹、稳定错误码和摘要元数据；模型版本修订仅以 `model_revision_sha256` 摘要表示。只有明确传入 `--include-content` 才会把完整问题和 SQL 写入本地调试报告，且该文件应按敏感数据保护。
+
+## 8. 稳定错误码
+
+对外生成结果和 Golden 结果共用下列稳定错误码（定义见 `core/sql/error_codes.py`）。前端、自动化和评测应依赖代码而不是英文/中文消息文本。
+
+| 错误码 | 含义 |
+| --- | --- |
+| `AMBIGUOUS_COLUMN` | 未限定字段在输入表中无法唯一解析。 |
+| `CORRECTNESS_UNAVAILABLE` | 正确性管线暂不可用，已失败关闭。 |
+| `DIMENSION_NOT_ALLOWED` | 指标使用了未允许的维度。 |
+| `EXECUTION_CONTEXT_REQUIRED` | 受治理执行缺少所需上下文。 |
+| `EXPLAIN_FAILED` | MySQL 预检失败、超时、空计划或计划不被接受。 |
+| `GENERATION_FAILED` | SQL 生成失败。 |
+| `HISTORY_CONTEXT_MISMATCH` | 历史记录与受治理上下文不匹配。 |
+| `INVALID_JOIN` | 连接不符合已治理的关系定义。 |
+| `METRIC_MISMATCH` | 命中治理指标但聚合表达式不等价。 |
+| `POLICY_DENIED` | 引用了禁用对象或不可直接查询的敏感字段。 |
+| `QUERY_SCOPE_DENIED` | 表、schema 或阻止列表不允许该查询范围。 |
+| `REPAIR_FAILED` | 唯一一次纠错未返回有效候选或执行失败。 |
+| `SEMANTIC_VALIDATION_FAILED` | 语义校验失败且没有更具体的问题项。 |
+| `SEMANTIC_VERSION_MISMATCH` | 生成快照与执行授权快照版本不同。 |
+| `SQL_VALIDATION_FAILED` | 基础 SQL 校验失败且没有更具体分类。 |
+| `SYNTAX_ERROR` | SQL 解析或语法校验失败。 |
+| `TIME_DIMENSION_REQUIRED` | 时间问题没有使用受治理的时间字段。 |
+| `UNKNOWN_COLUMN` | 字段不存在或无法在别名作用域中解析。 |
+| `UNKNOWN_TABLE` | 表不属于激活语义模型。 |
+| `UNSAFE_SQL` | SQL 未通过只读安全校验。 |
+| `UNSUPPORTED_SQL` | SQL 结构不在可确定校验的支持范围内。 |
+
+## 9. 日志、隐私与故障排查
+
+正常日志和默认 Golden 报告不写入完整问题、SQL 字面量、数据库原始异常、连接信息或凭据。请求审计记录语义版本、阶段耗时、错误码、是否纠错与可执行性；数据库异常仅进入受控、脱敏日志。不要把报告或日志加入 Few-Shot 数据源。
+
+| 现象 | 检查与处置 |
+| --- | --- |
+| 编译失败或应用提示“语义治理配置无效” | 重新执行编译命令；检查 YAML 引用、重复名称、别名歧义、受限字段和版本/方言约束。修复 Git 源后再编译，不要手改 `.compiled/`。 |
+| `SQL_EXPLAIN_ENABLED=true` 无法启动 | 同时设置 `SEMANTIC_GOVERNANCE_ENABLED=true`，并确认超时大于零、行数阈值非负。 |
+| `EXPLAIN_FAILED` | 检查只读 MySQL 连接、超时、查询计划与扫描行数阈值；不要因预检失败跳过治理直接执行。 |
+| SQL 被拒绝 | 读取 `validation.issues[].code`，按上表修正 YAML 或请求/SQL；一次纠错已经用尽时需发起新请求。 |
+| 图检索结果与 YAML 不一致 | 重新编译、检查清单激活版本，再显式发布；Neo4j 不可作为覆盖 Git 的修复入口。 |
+| Golden CLI 返回 `2` | 检查 cases/results 格式、case/result ID、语义版本、已激活快照和输出路径。 |
+
+发布前至少运行 `.venv/bin/pytest -q`、`ruff check .`、`.venv/bin/python -m compileall -q core tests scripts`、编译器两次和 `git diff --check`。所有编译快照、评测结果、报告、日志、凭据和 IDE 文件都不得提交。

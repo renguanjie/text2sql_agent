@@ -209,6 +209,19 @@ NEON_DB_URL=postgresql://... LLM_API_KEY=... pytest tests/test_llm_integration.p
 
 测试脚本统一放在 `tests/` 目录下。原先根目录的 `test_llm_integration.py`、`test_neon_text2sql.py` 已归入该目录，并改为通过环境变量读取外部服务配置，避免在测试代码中硬编码密钥和旧工作区路径。
 
+## 正确性内核
+
+语义治理默认关闭，保留既有生成与执行行为：
+
+```bash
+SEMANTIC_GOVERNANCE_ENABLED=false
+SQL_EXPLAIN_ENABLED=false
+```
+
+启用后，Git 管理的 `semantic_models/<datasource>.yaml` 会被编译为不可变快照；SQL 在生成和执行前都会基于该快照验证。Neo4j 只保存已发布快照的派生检索索引，不能覆盖 Git 语义定义。
+
+作者、编译、激活、发布、热重载、一次纠错、执行再授权、回滚、Golden Set 评测和故障处理见[语义治理运维手册](docs/semantic-governance.md)。
+
 ## 📋 配置说明
 
 ### 环境变量完整列表
