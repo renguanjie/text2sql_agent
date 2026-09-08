@@ -1,0 +1,488 @@
+"""Fail-closed orchestration for governed SQL correctness checks."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, Literal
+from uuid import uuid4
+
+from loguru import logger
+
+from ..semantic.context import SemanticContextBuilder
+from ..semantic.models import (
+    CorrectnessResult,
+    PreflightResult,
+    SemanticSnapshot,
+    ValidationIssue,
+    ValidationReport,
+)
+from ..semantic.registry import SemanticRegistry
+from ..semantic.validator import SemanticSQLValidator
+from .preflight import MySQLExplainPreflight
+from .validator import validate_query_scope, validate_sql
+
+
+_CORRECTNESS_UNAVAILABLE = ValidationIssue(
+    code="CORRECTNESS_UNAVAILABLE",
+    message="SQL 正确性校验暂时不可用",
+    stage="semantic",
+)
+_INVALID_REPAIR = ValidationIssue(
+    code="REPAIR_FAILED",
+    message="SQL 修复未返回有效候选",
+    stage="semantic",
+)
+_REPAIR_FAILED = ValidationIssue(
+    code="REPAIR_FAILED",
+    message="SQL 修复失败",
+    stage="semantic",
+)
+
+
+class CorrectnessPipeline:
+    """Apply one pinned semantic snapshot to validation, repair, and authorization."""
+
+    def __init__(
+        self,
+        registry: SemanticRegistry,
+        context_builder: SemanticContextBuilder,
+        semantic_validator: SemanticSQLValidator,
+        preflight: MySQLExplainPreflight | None = None,
+        max_repair_attempts: Literal[0, 1] = 1,
+        blocked_tables: tuple[str, ...] = (),
+    ):
+        if type(max_repair_attempts) is not int or max_repair_attempts not in (0, 1):
+            raise ValueError("max_repair_attempts 必须是 0 或 1")
+        self.registry = registry
+        self.context_builder = context_builder
+        self.semantic_validator = semantic_validator
+        self.preflight = preflight
+        self.max_repair_attempts = max_repair_attempts
+        self.blocked_tables = blocked_tables
+
+    def process(
+        self,
+        question: str,
+        candidate_sql: str,
+        repair: Callable[[str, list[dict], str], dict] | None = None,
+        allowed_tables: tuple[str, ...] = (),
+        allowed_schemas: tuple[str, ...] = (),
+    ) -> CorrectnessResult:
+        initial = self._initial_validation(
+            question,
+            candidate_sql,
+            allowed_tables,
+            allowed_schemas,
+        )
+        if isinstance(initial, CorrectnessResult):
+            return initial
+        snapshot, validation = initial
+        if validation.valid:
+            return self._result(candidate_sql, snapshot, validation, 0)
+        if repair is None or self.max_repair_attempts == 0:
+            return self._result(candidate_sql, snapshot, validation, 0)
+
+        context = self._build_repair_context(
+            question, candidate_sql, snapshot, validation
+        )
+        if isinstance(context, CorrectnessResult):
+            return context
+
+        try:
+            repair_result = repair(
+                candidate_sql,
+                self._public_issues(validation),
+                context,
+            )
+        except Exception as exc:
+            self._log_internal_failure("repair", exc)
+            return self._repair_error(
+                candidate_sql, snapshot, validation, _REPAIR_FAILED
+            )
+        return self._complete_repair(
+            question,
+            candidate_sql,
+            repair_result,
+            snapshot,
+            validation,
+            allowed_tables,
+            allowed_schemas,
+        )
+
+    async def process_async(
+        self,
+        question: str,
+        candidate_sql: str,
+        repair: Callable[[str, list[dict], str], Awaitable[dict]] | None = None,
+        allowed_tables: tuple[str, ...] = (),
+        allowed_schemas: tuple[str, ...] = (),
+    ) -> CorrectnessResult:
+        initial = self._initial_validation(
+            question,
+            candidate_sql,
+            allowed_tables,
+            allowed_schemas,
+        )
+        if isinstance(initial, CorrectnessResult):
+            return initial
+        snapshot, validation = initial
+        if validation.valid:
+            return self._result(candidate_sql, snapshot, validation, 0)
+        if repair is None or self.max_repair_attempts == 0:
+            return self._result(candidate_sql, snapshot, validation, 0)
+
+        context = self._build_repair_context(
+            question, candidate_sql, snapshot, validation
+        )
+        if isinstance(context, CorrectnessResult):
+            return context
+
+        try:
+            repair_result = await repair(
+                candidate_sql,
+                self._public_issues(validation),
+                context,
+            )
+        except Exception as exc:
+            self._log_internal_failure("repair", exc)
+            return self._repair_error(
+                candidate_sql, snapshot, validation, _REPAIR_FAILED
+            )
+        return self._complete_repair(
+            question,
+            candidate_sql,
+            repair_result,
+            snapshot,
+            validation,
+            allowed_tables,
+            allowed_schemas,
+        )
+
+    def authorize_execution(
+        self,
+        question: str,
+        sql: str,
+        expected_semantic_version: str,
+        allowed_tables: tuple[str, ...] = (),
+        allowed_schemas: tuple[str, ...] = (),
+    ) -> CorrectnessResult:
+        try:
+            snapshot = self.registry.get_snapshot()
+        except Exception as exc:
+            self._log_internal_failure("snapshot", exc)
+            return self._error_result(sql, None, 0)
+
+        if snapshot.model_version != expected_semantic_version:
+            validation = ValidationReport(
+                valid=False,
+                issues=(
+                    ValidationIssue(
+                        code="SEMANTIC_VERSION_MISMATCH",
+                        message="SQL 生成版本与当前语义版本不一致",
+                        stage="semantic",
+                    ),
+                ),
+            )
+            return self._result(sql, snapshot, validation, 0)
+
+        try:
+            validation = self._validate_once(
+                question,
+                sql,
+                snapshot,
+                run_preflight=True,
+                allowed_tables=allowed_tables,
+                allowed_schemas=allowed_schemas,
+            )
+        except Exception as exc:
+            self._log_internal_failure("authorization", exc)
+            return self._error_result(sql, snapshot.model_version, 0)
+        return self._result(sql, snapshot, validation, 0)
+
+    def _initial_validation(
+        self,
+        question: str,
+        candidate_sql: str,
+        allowed_tables: tuple[str, ...],
+        allowed_schemas: tuple[str, ...],
+    ) -> tuple[SemanticSnapshot, ValidationReport] | CorrectnessResult:
+        try:
+            snapshot = self.registry.get_snapshot()
+        except Exception as exc:
+            self._log_internal_failure("snapshot", exc)
+            return self._error_result(candidate_sql, None, 0)
+
+        try:
+            validation = self._validate_once(
+                question,
+                candidate_sql,
+                snapshot,
+                run_preflight=True,
+                allowed_tables=allowed_tables,
+                allowed_schemas=allowed_schemas,
+            )
+        except Exception as exc:
+            self._log_internal_failure("validation", exc)
+            return self._error_result(candidate_sql, snapshot.model_version, 0)
+        return snapshot, validation
+
+    def _build_repair_context(
+        self,
+        question: str,
+        sql: str,
+        snapshot: SemanticSnapshot,
+        validation: ValidationReport,
+    ) -> str | CorrectnessResult:
+        try:
+            return self.context_builder.build(question, snapshot).rendered
+        except Exception as exc:
+            self._log_internal_failure("repair_context", exc)
+            return self._repair_error(sql, snapshot, validation, _REPAIR_FAILED, 0)
+
+    def _complete_repair(
+        self,
+        question: str,
+        original_sql: str,
+        repair_result: Any,
+        snapshot: SemanticSnapshot,
+        original_validation: ValidationReport,
+        allowed_tables: tuple[str, ...],
+        allowed_schemas: tuple[str, ...],
+    ) -> CorrectnessResult:
+        repaired_sql = self._repaired_sql(repair_result)
+        if repaired_sql is None:
+            return self._repair_error(
+                original_sql, snapshot, original_validation, _INVALID_REPAIR
+            )
+        try:
+            validation = self._validate_once(
+                question,
+                repaired_sql,
+                snapshot,
+                run_preflight=True,
+                allowed_tables=allowed_tables,
+                allowed_schemas=allowed_schemas,
+            )
+        except Exception as exc:
+            self._log_internal_failure("repair_validation", exc)
+            return self._error_result(repaired_sql, snapshot.model_version, 1)
+        return self._result(repaired_sql, snapshot, validation, 1)
+
+    def _validate_once(
+        self,
+        question: str,
+        sql: str,
+        snapshot: SemanticSnapshot,
+        run_preflight: bool,
+        allowed_tables: tuple[str, ...] = (),
+        allowed_schemas: tuple[str, ...] = (),
+    ) -> ValidationReport:
+        if not isinstance(sql, str) or not sql.strip():
+            return ValidationReport(
+                valid=False,
+                issues=(
+                    ValidationIssue(
+                        code="SYNTAX_ERROR",
+                        message="SQL 语法校验失败",
+                        stage="syntax",
+                    ),
+                ),
+            )
+
+        syntax = validate_sql(sql, dialect=snapshot.dialect)
+        if not isinstance(syntax, Mapping):
+            raise TypeError("legacy validator returned a non-mapping result")
+        if syntax.get("valid") is not True:
+            return self._from_legacy_validation(syntax)
+
+        scope = validate_query_scope(
+            sql,
+            allowed_tables=list(allowed_tables)
+            or [entity.name for entity in snapshot.entities],
+            allowed_schemas=list(allowed_schemas),
+            blocked_tables=list(self.blocked_tables),
+            dialect=snapshot.dialect,
+        )
+        if not isinstance(scope, Mapping):
+            raise TypeError("scope validator returned a non-mapping result")
+        if scope.get("valid") is not True:
+            return self._from_scope_validation(scope)
+
+        semantic = self.semantic_validator.validate(sql, question, snapshot)
+        if not isinstance(semantic, ValidationReport):
+            raise TypeError("semantic validator returned an invalid result")
+        if not semantic.valid:
+            return self._ensure_failed_report(
+                semantic,
+                code="SEMANTIC_VALIDATION_FAILED",
+                message="SQL 未通过语义校验",
+                stage="semantic",
+            )
+
+        if run_preflight and self.preflight is not None:
+            preflight = self.preflight.check(sql)
+            if not isinstance(preflight, PreflightResult):
+                raise TypeError("preflight returned an invalid result")
+            if not preflight.valid:
+                return self._from_preflight(preflight)
+            if preflight.issues:
+                return ValidationReport(valid=False, issues=preflight.issues)
+        return semantic
+
+    @staticmethod
+    def _from_legacy_validation(result: Mapping[str, Any]) -> ValidationReport:
+        if result.get("syntax_valid") is False:
+            issue = ValidationIssue(
+                code="SYNTAX_ERROR",
+                message="SQL 语法校验失败",
+                stage="syntax",
+            )
+        elif result.get("execution_valid") is False:
+            issue = ValidationIssue(
+                code="UNSAFE_SQL",
+                message="SQL 未通过只读安全校验",
+                stage="safety",
+            )
+        else:
+            issue = ValidationIssue(
+                code="SQL_VALIDATION_FAILED",
+                message="SQL 未通过基础校验",
+                stage="safety",
+            )
+        return ValidationReport(valid=False, issues=(issue,))
+
+    @staticmethod
+    def _from_scope_validation(result: Mapping[str, Any]) -> ValidationReport:
+        tables = result.get("tables")
+        objects = (
+            tuple(sorted({item for item in tables if isinstance(item, str)}))
+            if isinstance(tables, (list, tuple, set, frozenset))
+            else ()
+        )
+        return ValidationReport(
+            valid=False,
+            issues=(
+                ValidationIssue(
+                    code="QUERY_SCOPE_DENIED",
+                    message="SQL 查询范围不被允许",
+                    objects=objects,
+                    stage="safety",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _from_preflight(result: PreflightResult) -> ValidationReport:
+        if result.issues:
+            return ValidationReport(valid=False, issues=result.issues)
+        return ValidationReport(
+            valid=False,
+            issues=(
+                ValidationIssue(
+                    code="EXPLAIN_FAILED",
+                    message="数据库预检失败",
+                    stage="preflight",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _ensure_failed_report(
+        report: ValidationReport,
+        *,
+        code: str,
+        message: str,
+        stage: Literal["syntax", "safety", "semantic", "preflight"],
+    ) -> ValidationReport:
+        if report.issues:
+            return report
+        return ValidationReport(
+            valid=False,
+            issues=(ValidationIssue(code=code, message=message, stage=stage),),
+        )
+
+    @staticmethod
+    def _public_issues(validation: ValidationReport) -> list[dict]:
+        return [issue.model_dump(mode="json") for issue in validation.issues]
+
+    @staticmethod
+    def _repaired_sql(result: Any) -> str | None:
+        if not isinstance(result, Mapping):
+            return None
+        try:
+            status = result.get("status")
+            sql = result.get("sql")
+        except Exception:
+            return None
+        if type(status) is not str or status != "success":
+            return None
+        if type(sql) is not str or not sql.strip():
+            return None
+        return sql.strip()
+
+    @staticmethod
+    def _result(
+        sql: str,
+        snapshot: SemanticSnapshot,
+        validation: ValidationReport,
+        repair_attempts: Literal[0, 1],
+    ) -> CorrectnessResult:
+        executable = validation.valid
+        return CorrectnessResult(
+            status="success" if executable else "rejected",
+            sql=sql,
+            semantic_version=snapshot.model_version,
+            validation=validation,
+            repair_attempts=repair_attempts,
+            executable=executable,
+        )
+
+    @staticmethod
+    def _error_result(
+        sql: str,
+        semantic_version: str | None,
+        repair_attempts: Literal[0, 1],
+    ) -> CorrectnessResult:
+        return CorrectnessResult(
+            status="error",
+            sql=sql,
+            semantic_version=semantic_version,
+            validation=ValidationReport(
+                valid=False,
+                issues=(_CORRECTNESS_UNAVAILABLE,),
+            ),
+            repair_attempts=repair_attempts,
+            executable=False,
+        )
+
+    @staticmethod
+    def _repair_error(
+        sql: str,
+        snapshot: SemanticSnapshot,
+        validation: ValidationReport,
+        issue: ValidationIssue,
+        repair_attempts: Literal[0, 1] = 1,
+    ) -> CorrectnessResult:
+        return CorrectnessResult(
+            status="error",
+            sql=sql,
+            semantic_version=snapshot.model_version,
+            validation=ValidationReport(
+                valid=False,
+                issues=(*validation.issues, issue),
+            ),
+            repair_attempts=repair_attempts,
+            executable=False,
+        )
+
+    @staticmethod
+    def _log_internal_failure(stage: str, exc: Exception) -> None:
+        logger.error(
+            "SQL correctness internal failure: error_id={} stage={} exception_type={}",
+            uuid4().hex,
+            stage,
+            type(exc).__name__,
+        )
+
+
+__all__ = ["CorrectnessPipeline"]
