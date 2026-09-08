@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import unicodedata
 from hashlib import sha256
 from typing import Any
 
@@ -10,6 +12,26 @@ from .models import SemanticSnapshot
 
 class SemanticPublishError(RuntimeError):
     """Raised when Neo4j rejects a semantic graph publication."""
+
+
+def _term_definition_hash(term: str, target: str, when: str | None) -> str:
+    canonical = json.dumps(
+        {
+            "term": _normalize_definition_value(term),
+            "target": _normalize_definition_value(target),
+            "when": _normalize_definition_value(when),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(canonical).hexdigest()
+
+
+def _normalize_definition_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return unicodedata.normalize("NFKC", value).strip()
 
 
 def build_v2_payload(snapshot: SemanticSnapshot, database_id: int) -> dict[str, Any]:
@@ -122,7 +144,7 @@ def build_v2_payload(snapshot: SemanticSnapshot, database_id: int) -> dict[str, 
         node(
             "BusinessConcept",
             {
-                "name": f"metric:{metric.name}",
+                "name": f"metric:{snapshot.datasource}:{metric.name}",
                 "display_label": metric.name_cn,
                 "concept_type": "metric",
                 "expression": metric.expression,
@@ -136,7 +158,10 @@ def build_v2_payload(snapshot: SemanticSnapshot, database_id: int) -> dict[str, 
         node(
             "BusinessConcept",
             {
-                "name": f"term:{term.term}",
+                "name": (
+                    f"term:{snapshot.datasource}:{term.term}:"
+                    f"{_term_definition_hash(term.term, term.target, term.when)}"
+                ),
                 "display_label": term.term,
                 "concept_type": "term",
                 "target": term.target,
