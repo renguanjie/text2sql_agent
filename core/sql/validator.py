@@ -320,16 +320,18 @@ class SQLValidator:
                     'tree': None
                 }
 
-        except SQLParseError as e:
+        except SQLParseError as exc:
+            log_safe_exception("sqlfluff_parse_tree", exc, sql=sql)
             return {
                 'success': False,
-                'error': f'解析错误：{str(e)}',
+                'error': 'SQL 解析失败',
                 'tree': None
             }
-        except Exception as e:
+        except Exception as exc:
+            log_safe_exception("sqlfluff_parse_tree", exc, sql=sql)
             return {
                 'success': False,
-                'error': f'解析失败：{str(e)}',
+                'error': 'SQL 解析失败',
                 'tree': None
             }
 

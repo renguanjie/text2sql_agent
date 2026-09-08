@@ -20,6 +20,10 @@ from config import (
     LLM_PROVIDERS, EMBEDDING_PROVIDERS,
     RETRIEVAL_TOP_K, PROMPT_MAX_LENGTH, SQL_DIALECT, SQL_VALIDATION_ENABLED, SQL_MAX_LENGTH,
     SQL_QUERY_MAX_ROWS, SQL_QUERY_TIMEOUT_MS, SQL_SCOPE_ENFORCEMENT, SQL_BLOCKED_TABLES,
+    SEMANTIC_GOVERNANCE_ENABLED, SEMANTIC_MODEL_DIR, SEMANTIC_DATASOURCE,
+    SEMANTIC_CONTEXT_MAX_CHARS, SEMANTIC_CONTEXT_MAX_ITEMS,
+    SQL_REPAIR_MAX_ATTEMPTS, SQL_EXPLAIN_ENABLED, SQL_EXPLAIN_TIMEOUT_MS,
+    SQL_EXPLAIN_MAX_ESTIMATED_ROWS,
     BM25_K1, BM25_B, BM25_WEIGHT, DENSE_WEIGHT,
     FAISS_ENABLED, FAISS_EMBEDDING_DIM, FAISS_INDEX_TYPE,
     INDEX_CACHE_ENABLED, INDEX_CACHE_DIR,
@@ -32,6 +36,10 @@ from config import (
 )
 from core.app_context import ApplicationContext
 from core.sql.validator import validate_sql
+from core.utils.correctness_ui import (
+    execution_is_disabled,
+    structured_validation_messages,
+)
 from core.utils.upload_limits import UploadValidationError, read_uploaded_text
 from loguru import logger
 import uuid
@@ -295,6 +303,15 @@ def initialize_system():
         'sql_query_timeout_ms': SQL_QUERY_TIMEOUT_MS,
         'sql_scope_enforcement': SQL_SCOPE_ENFORCEMENT,
         'sql_blocked_tables': SQL_BLOCKED_TABLES,
+        'semantic_governance_enabled': SEMANTIC_GOVERNANCE_ENABLED,
+        'semantic_model_dir': SEMANTIC_MODEL_DIR,
+        'semantic_datasource': SEMANTIC_DATASOURCE,
+        'semantic_context_max_chars': SEMANTIC_CONTEXT_MAX_CHARS,
+        'semantic_context_max_items': SEMANTIC_CONTEXT_MAX_ITEMS,
+        'sql_repair_max_attempts': SQL_REPAIR_MAX_ATTEMPTS,
+        'sql_explain_enabled': SQL_EXPLAIN_ENABLED,
+        'sql_explain_timeout_ms': SQL_EXPLAIN_TIMEOUT_MS,
+        'sql_explain_max_estimated_rows': SQL_EXPLAIN_MAX_ESTIMATED_ROWS,
         'bm25_k1': BM25_K1, 'bm25_b': BM25_B,
         'bm25_weight': BM25_WEIGHT, 'dense_weight': DENSE_WEIGHT,
         'faiss_enabled': FAISS_ENABLED, 'faiss_embedding_dim': FAISS_EMBEDDING_DIM,
@@ -312,6 +329,7 @@ def initialize_system():
         logger.info("系统初始化完成")
         return True
     else:
+        st.session_state.initialization_error = app_ctx.initialization_error
         logger.error("系统初始化失败")
         return None
 
@@ -563,7 +581,10 @@ with st.sidebar:
                 st.success("✅ 初始化成功!")
                 st.rerun()
             else:
-                st.error("初始化失败，请检查配置")
+                st.error(
+                    st.session_state.get("initialization_error")
+                    or "初始化失败，请检查配置"
+                )
 
     st.divider()
 
@@ -861,7 +882,11 @@ with tab1:
     with col1:
         generate_btn = st.button("🚀 生成 SQL", type="primary", use_container_width=True)
     with col2:
-        execute_btn = st.button("▶️ 执行 SQL", use_container_width=True)
+        execute_btn = st.button(
+            "▶️ 执行 SQL",
+            use_container_width=True,
+            disabled=execution_is_disabled(st.session_state.last_result),
+        )
     with col3:
         copy_btn = st.button("📋 复制 SQL", use_container_width=True)
 
@@ -903,7 +928,7 @@ with tab1:
                 3. 查询问题与知识库内容不匹配 - 尝试调整查询措辞
                 """)
 
-            if result.get('status') == 'success' and result.get('sql'):
+            if result.get('status') in {'success', 'rejected'} and result.get('sql'):
                 st.session_state.last_sql = result['sql']
                 st.session_state.last_result = result
 
@@ -928,13 +953,26 @@ with tab1:
                 if validation['valid']:
                     st.success("✅ SQL 校验通过")
                 else:
-                    st.warning(f"⚠️ SQL 校验问题：{', '.join(validation['errors'])}")
+                    structured = structured_validation_messages(result)
+                    if structured:
+                        for message in structured:
+                            st.warning(f"⚠️ SQL 校验问题：{message}")
+                    else:
+                        st.warning(
+                            f"⚠️ SQL 校验问题：{', '.join(validation.get('errors', []))}"
+                        )
 
                 # 添加到历史
                 st.session_state.history.append({
                     'query': user_query,
+                    'user_query': result.get('user_query', user_query),
                     'sql': result['sql'],
                     'status': result.get('status'),
+                    'semantic_version': result.get('semantic_version'),
+                    'validation': result.get('validation'),
+                    'executable': result.get('executable'),
+                    'allowed_tables': result.get('allowed_tables'),
+                    'allowed_schemas': result.get('allowed_schemas'),
                     'timestamp': '刚刚'
                 })
 
@@ -965,6 +1003,12 @@ with tab1:
         with sql_container:
             st.code(st.session_state.last_sql, language='sql', line_numbers=False)
 
+            persisted_validation = structured_validation_messages(
+                st.session_state.last_result
+            )
+            for message in persisted_validation:
+                st.warning(f"⚠️ SQL 校验问题：{message}")
+
             if copy_btn:
                 st.info("💡 点击代码块右上角的复制按钮即可复制 SQL")
 
@@ -976,6 +1020,10 @@ with tab1:
                 history_id=(st.session_state.last_result or {}).get('history_id'),
                 allowed_tables=(st.session_state.last_result or {}).get('allowed_tables'),
                 allowed_schemas=(st.session_state.last_result or {}).get('allowed_schemas'),
+                user_query=(st.session_state.last_result or {}).get('user_query'),
+                semantic_version=(st.session_state.last_result or {}).get(
+                    'semantic_version'
+                ),
             )
 
         if exec_result.get('status') == 'success':
@@ -988,7 +1036,12 @@ with tab1:
             if data:
                 st.dataframe(data, use_container_width=True, height=300)
         else:
-            st.error(f"❌ 执行失败：{exec_result.get('error', '未知错误')}")
+            structured = structured_validation_messages(exec_result)
+            if structured:
+                for message in structured:
+                    st.error(f"❌ 执行失败：{message}")
+            else:
+                st.error(f"❌ 执行失败：{exec_result.get('error', '未知错误')}")
 
     # 无输入提示
     if generate_btn and not user_query:
@@ -1029,6 +1082,7 @@ with tab2:
                 with col1:
                     if st.button("📥 使用此 SQL", key=f"use_{i}", use_container_width=True):
                         st.session_state.last_sql = item['sql']
+                        st.session_state.last_result = item
                         st.rerun()
                 with col2:
                     if st.button("📋 复制", key=f"copy_{i}", use_container_width=True):

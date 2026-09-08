@@ -5,13 +5,12 @@ SQL 生成器模块
 """
 from typing import Dict, List, Optional, Any, Tuple
 from loguru import logger
-import uuid
 
 from ..retrieval.bm25_tfidf import KnowledgeRetriever
 from ..chain.sql_chain import SQLGenerationChain, QueryRewriteChain
 from ..history.mysql_client import MySQLClient
 from .dialect_detector import SQLDialectDetector
-from ..utils.log_sanitizer import sanitize_sql, text_fingerprint
+from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
 from .validator import (
     constrain_read_query,
     is_safe_read_query,
@@ -27,13 +26,15 @@ class SQLGenerator:
                  sql_chain: SQLGenerationChain,
                  mysql_client: Optional[MySQLClient] = None,
                  config: Optional[Dict] = None,
-                 neo4j_client=None):
+                 neo4j_client=None,
+                 correctness_pipeline=None):
         self.llm = llm
         self.knowledge_retriever = knowledge_retriever
         self.sql_chain = sql_chain
         self.mysql_client = mysql_client
         self.config = config or {}
         self.neo4j_client = neo4j_client
+        self.correctness_pipeline = correctness_pipeline
 
         self.rewrite_chain = QueryRewriteChain(
             llm, prompt_max_length=self.config.get('prompt_max_length', 4000)
@@ -100,7 +101,15 @@ class SQLGenerator:
         validation = result.get('validation')
         if validation:
             validation_status = 'success' if validation.get('valid') else 'fail'
-            validation_error = '; '.join(validation.get('errors', [])) or None
+            issues = validation.get('issues')
+            if isinstance(issues, (list, tuple)):
+                validation_error = '; '.join(
+                    issue.get('code')
+                    for issue in issues
+                    if isinstance(issue, dict) and isinstance(issue.get('code'), str)
+                ) or None
+            else:
+                validation_error = '; '.join(validation.get('errors', [])) or None
         else:
             validation_status = 'pending'
             validation_error = result.get('error')
@@ -171,6 +180,149 @@ class SQLGenerator:
         result['allowed_schemas'] = [database] if database else []
         result['target_database_id'] = ctx.get('detected_database_id')
 
+    def _prepare_governed_context(
+        self, user_query: str
+    ) -> tuple[str, str | None, Dict[str, Any] | None]:
+        """Build generation context from this generator's immutable registry pair."""
+        if self.correctness_pipeline is None:
+            return "", None, None
+        try:
+            snapshot = self.correctness_pipeline.registry.get_snapshot()
+            semantic_context = self.correctness_pipeline.context_builder.build(
+                user_query, snapshot
+            )
+            return semantic_context.rendered, snapshot.model_version, None
+        except Exception as exc:
+            log_safe_exception("governed_generation_context", exc)
+            return "", None, self._governed_error_payload(
+                code="CORRECTNESS_UNAVAILABLE",
+                message="SQL 正确性校验暂时不可用",
+                semantic_version=None,
+                sql=None,
+            )
+
+    @staticmethod
+    def _governed_error_payload(
+        *,
+        code: str,
+        message: str,
+        semantic_version: str | None,
+        sql: str | None,
+        stage: str = "semantic",
+    ) -> Dict[str, Any]:
+        return {
+            'sql': sql,
+            'status': 'error',
+            'error': message,
+            'semantic_version': semantic_version,
+            'validation': {
+                'valid': False,
+                'issues': [{
+                    'code': code,
+                    'message': message,
+                    'objects': [],
+                    'stage': stage,
+                }],
+            },
+            'repair_attempts': 0,
+            'executable': False,
+        }
+
+    @staticmethod
+    def _merge_correctness_result(
+        result: Dict[str, Any], correctness, user_query: str
+    ) -> None:
+        result.update({
+            'sql': correctness.sql,
+            'status': correctness.status,
+            'semantic_version': correctness.semantic_version,
+            'validation': correctness.validation.model_dump(mode='json'),
+            'repair_attempts': correctness.repair_attempts,
+            'executable': correctness.executable,
+            'user_query': user_query,
+        })
+
+    @staticmethod
+    def _reject_mixed_semantic_version(
+        result: Dict[str, Any], expected_version: str, actual_version: str | None
+    ) -> None:
+        result.update({
+            'status': 'rejected',
+            'semantic_version': actual_version,
+            'validation': {
+                'valid': False,
+                'issues': [{
+                    'code': 'SEMANTIC_VERSION_MISMATCH',
+                    'message': 'SQL 生成版本与校验语义版本不一致',
+                    'objects': [],
+                    'stage': 'semantic',
+                }],
+            },
+            'executable': False,
+        })
+
+    def _govern_candidate_sync(
+        self,
+        result: Dict[str, Any],
+        user_query: str,
+        semantic_version: str,
+    ) -> None:
+        if result.get('status') != 'success' or not result.get('sql'):
+            failure = self._governed_error_payload(
+                code='GENERATION_FAILED',
+                message='未生成可供正确性校验的 SQL',
+                semantic_version=semantic_version,
+                sql=result.get('sql'),
+                stage='syntax',
+            )
+            failure['error'] = result.get('error') or failure['error']
+            result.update(failure)
+            result['user_query'] = user_query
+            return
+        correctness = self.correctness_pipeline.process(
+            question=user_query,
+            candidate_sql=result['sql'],
+            repair=self.sql_chain.fix_sql_governed,
+            allowed_tables=tuple(result.get('allowed_tables') or ()),
+            allowed_schemas=tuple(result.get('allowed_schemas') or ()),
+        )
+        self._merge_correctness_result(result, correctness, user_query)
+        if correctness.semantic_version != semantic_version:
+            self._reject_mixed_semantic_version(
+                result, semantic_version, correctness.semantic_version
+            )
+
+    async def _govern_candidate_async(
+        self,
+        result: Dict[str, Any],
+        user_query: str,
+        semantic_version: str,
+    ) -> None:
+        if result.get('status') != 'success' or not result.get('sql'):
+            failure = self._governed_error_payload(
+                code='GENERATION_FAILED',
+                message='未生成可供正确性校验的 SQL',
+                semantic_version=semantic_version,
+                sql=result.get('sql'),
+                stage='syntax',
+            )
+            failure['error'] = result.get('error') or failure['error']
+            result.update(failure)
+            result['user_query'] = user_query
+            return
+        correctness = await self.correctness_pipeline.process_async(
+            question=user_query,
+            candidate_sql=result['sql'],
+            repair=self.sql_chain.fix_sql_governed_async,
+            allowed_tables=tuple(result.get('allowed_tables') or ()),
+            allowed_schemas=tuple(result.get('allowed_schemas') or ()),
+        )
+        self._merge_correctness_result(result, correctness, user_query)
+        if correctness.semantic_version != semantic_version:
+            self._reject_mixed_semantic_version(
+                result, semantic_version, correctness.semantic_version
+            )
+
     # ==================== 公共方法 ====================
 
     def _build_pipeline_context(self, final_query: str, detected_dialect: str,
@@ -240,21 +392,34 @@ class SQLGenerator:
 
         ctx = self._prepare_pipeline(user_query, target_dialect, target_database_id, use_few_shot)
 
+        semantic_context, semantic_version, governance_error = (
+            self._prepare_governed_context(user_query)
+        )
+        if governance_error is not None:
+            governance_error['user_query'] = user_query
+            return governance_error
+
         # 7. 生成 SQL
-        result = self.sql_chain.generate(
+        generation_kwargs = dict(
             user_query=ctx['final_query'],
             schema_info=ctx['schema_info'],
             knowledge_results=ctx['knowledge_results'],
             session_id=session_id,
             few_shot_examples=ctx['few_shot_examples']
         )
+        if self.correctness_pipeline is not None:
+            generation_kwargs['semantic_context'] = semantic_context
+        result = self.sql_chain.generate(**generation_kwargs)
         self._attach_execution_scope(result, ctx)
-        self._validate_generation_result(
-            result,
-            ctx['detected_dialect'],
-            result['allowed_tables'],
-            result['allowed_schemas'],
-        )
+        if self.correctness_pipeline is not None:
+            self._govern_candidate_sync(result, user_query, semantic_version or '')
+        else:
+            self._validate_generation_result(
+                result,
+                ctx['detected_dialect'],
+                result['allowed_tables'],
+                result['allowed_schemas'],
+            )
 
         # 8. 保存历史
         if auto_save_history:
@@ -276,21 +441,36 @@ class SQLGenerator:
             user_query, target_dialect, target_database_id, use_few_shot
         )
 
+        semantic_context, semantic_version, governance_error = (
+            self._prepare_governed_context(user_query)
+        )
+        if governance_error is not None:
+            governance_error['user_query'] = user_query
+            return governance_error
+
         # 7. 异步生成 SQL
-        result = await self.sql_chain.generate_async(
+        generation_kwargs = dict(
             user_query=ctx['final_query'],
             schema_info=ctx['schema_info'],
             knowledge_results=ctx['knowledge_results'],
             session_id=session_id,
             few_shot_examples=ctx['few_shot_examples']
         )
+        if self.correctness_pipeline is not None:
+            generation_kwargs['semantic_context'] = semantic_context
+        result = await self.sql_chain.generate_async(**generation_kwargs)
         self._attach_execution_scope(result, ctx)
-        self._validate_generation_result(
-            result,
-            ctx['detected_dialect'],
-            result['allowed_tables'],
-            result['allowed_schemas'],
-        )
+        if self.correctness_pipeline is not None:
+            await self._govern_candidate_async(
+                result, user_query, semantic_version or ''
+            )
+        else:
+            self._validate_generation_result(
+                result,
+                ctx['detected_dialect'],
+                result['allowed_tables'],
+                result['allowed_schemas'],
+            )
 
         # 8. 保存历史
         if auto_save_history:
@@ -417,12 +597,52 @@ class SQLGenerator:
 
     def execute_sql(self, sql: str, history_id: Optional[int] = None,
                     allowed_tables: Optional[List[str]] = None,
-                    allowed_schemas: Optional[List[str]] = None) -> Dict[str, Any]:
+                    allowed_schemas: Optional[List[str]] = None,
+                    user_query: Optional[str] = None,
+                    semantic_version: Optional[str] = None) -> Dict[str, Any]:
         """执行 SQL"""
+        if self.correctness_pipeline is not None:
+            if not user_query or not semantic_version:
+                return self._governed_error_payload(
+                    code='EXECUTION_CONTEXT_REQUIRED',
+                    message='执行前需要原问题和语义版本',
+                    semantic_version=semantic_version,
+                    sql=sql,
+                ) | {'data': None}
+            authorization = self.correctness_pipeline.authorize_execution(
+                question=user_query,
+                sql=sql,
+                expected_semantic_version=semantic_version,
+                allowed_tables=tuple(allowed_tables or ()),
+                allowed_schemas=tuple(allowed_schemas or ()),
+            )
+            if not authorization.executable:
+                public = {
+                    'status': 'error',
+                    'error': (
+                        authorization.validation.issues[0].message
+                        if authorization.validation.issues
+                        else 'SQL 执行授权失败'
+                    ),
+                    'data': None,
+                    'sql': authorization.sql,
+                    'semantic_version': authorization.semantic_version,
+                    'validation': authorization.validation.model_dump(mode='json'),
+                    'repair_attempts': authorization.repair_attempts,
+                    'executable': False,
+                }
+                if history_id and self.mysql_client:
+                    self.mysql_client.update_sql_execution(
+                        history_id=history_id,
+                        execution_status='fail',
+                        execution_error=public['error'],
+                    )
+                return public
+
         if not self.mysql_client:
             return {'status': 'error', 'error': 'MySQL 客户端未连接', 'data': None}
 
-        logger.info(f"执行 SQL 摘要：{sanitize_sql(sql)}")
+        logger.info("准备执行 SQL：sql_id={}", text_fingerprint(sql))
 
         try:
             safety_error = self._get_query_safety_error(sql, allowed_tables, allowed_schemas)
@@ -462,9 +682,8 @@ class SQLGenerator:
                 'status': 'success', 'error': None,
                 'data': results, 'row_count': len(results), 'truncated': truncated
             }
-        except Exception as e:
-            error_id = uuid.uuid4().hex[:12]
-            logger.opt(exception=e).error(f"SQL 执行失败，error_id={error_id}")
+        except Exception as exc:
+            error_id = log_safe_exception("sql_execute", exc, sql=sql)
             public_error = f"查询执行失败，请联系管理员并提供错误编号 {error_id}"
             if history_id and self.mysql_client:
                 self.mysql_client.update_sql_execution(
@@ -507,6 +726,12 @@ class SQLGenerator:
 
     def fix_and_retry(self, history_id: int, error: str) -> Dict[str, Any]:
         """修复 SQL 并重试"""
+        if self.correctness_pipeline is not None:
+            return {
+                'status': 'error',
+                'error': '语义治理模式下请重新生成 SQL',
+                'data': None,
+            }
         if not self.mysql_client:
             return {'status': 'error', 'error': 'MySQL 客户端未连接'}
         history = self.mysql_client.get_history_detail(history_id)
@@ -548,7 +773,8 @@ class SQLGenerator:
 
 
 def create_sql_generator(llm, neo4j_client, mysql_client, config: Optional[Dict] = None,
-                         embedding_factory: Optional = None) -> SQLGenerator:
+                         embedding_factory: Optional = None,
+                         correctness_pipeline=None) -> SQLGenerator:
     """创建 SQL 生成器工厂函数"""
     config = config or {}
 
@@ -584,7 +810,8 @@ def create_sql_generator(llm, neo4j_client, mysql_client, config: Optional[Dict]
         knowledge_retriever=knowledge_retriever,
         sql_chain=sql_chain,
         mysql_client=mysql_client,
-        config=config
+        config=config,
+        correctness_pipeline=correctness_pipeline,
     )
 
     # 5. 构建知识库索引
@@ -594,7 +821,9 @@ def create_sql_generator(llm, neo4j_client, mysql_client, config: Optional[Dict]
     # 6. 构建 Few-Shot 索引
     if mysql_client and config.get('few_shot_enabled', True):
         try:
-            history_records = mysql_client.get_history_list(limit=100)
+            history_records = mysql_client.get_successful_history_for_few_shot(
+                limit=100
+            )
             knowledge_retriever.build_few_shot_index(history_records)
             logger.info(f"Few-Shot 索引构建完成，共 {len(knowledge_retriever.history_records)} 条成功记录")
         except Exception as e:

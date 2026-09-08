@@ -179,6 +179,21 @@ SQL_BLOCKED_TABLES = [
     ).split(',') if value.strip()
 ]
 
+# 语义治理与执行预检（默认关闭以保持旧调用行为）
+SEMANTIC_GOVERNANCE_ENABLED = (
+    os.getenv("SEMANTIC_GOVERNANCE_ENABLED", "false").lower() == "true"
+)
+SEMANTIC_MODEL_DIR = os.getenv("SEMANTIC_MODEL_DIR", "semantic_models")
+SEMANTIC_DATASOURCE = os.getenv("SEMANTIC_DATASOURCE", "default")
+SEMANTIC_CONTEXT_MAX_CHARS = int(os.getenv("SEMANTIC_CONTEXT_MAX_CHARS", "2400"))
+SEMANTIC_CONTEXT_MAX_ITEMS = int(os.getenv("SEMANTIC_CONTEXT_MAX_ITEMS", "24"))
+SQL_REPAIR_MAX_ATTEMPTS = int(os.getenv("SQL_REPAIR_MAX_ATTEMPTS", "1"))
+SQL_EXPLAIN_ENABLED = os.getenv("SQL_EXPLAIN_ENABLED", "false").lower() == "true"
+SQL_EXPLAIN_TIMEOUT_MS = int(os.getenv("SQL_EXPLAIN_TIMEOUT_MS", "3000"))
+SQL_EXPLAIN_MAX_ESTIMATED_ROWS = int(
+    os.getenv("SQL_EXPLAIN_MAX_ESTIMATED_ROWS", "0")
+)
+
 # ==================== 日志配置 ====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = PROJECT_ROOT / "logs" / "app.log"
@@ -241,6 +256,30 @@ def validate_config():
         errors.append(f"SQL_QUERY_MAX_ROWS 必须大于 0：{SQL_QUERY_MAX_ROWS}")
     if SQL_QUERY_TIMEOUT_MS <= 0:
         errors.append(f"SQL_QUERY_TIMEOUT_MS 必须大于 0：{SQL_QUERY_TIMEOUT_MS}")
+    if SQL_REPAIR_MAX_ATTEMPTS not in (0, 1):
+        errors.append(
+            "SQL_REPAIR_MAX_ATTEMPTS 必须是 0 或 1："
+            f"{SQL_REPAIR_MAX_ATTEMPTS}"
+        )
+    if SEMANTIC_CONTEXT_MAX_CHARS <= 0:
+        errors.append(
+            "SEMANTIC_CONTEXT_MAX_CHARS 必须大于 0："
+            f"{SEMANTIC_CONTEXT_MAX_CHARS}"
+        )
+    if SEMANTIC_CONTEXT_MAX_ITEMS <= 0:
+        errors.append(
+            "SEMANTIC_CONTEXT_MAX_ITEMS 必须大于 0："
+            f"{SEMANTIC_CONTEXT_MAX_ITEMS}"
+        )
+    if SQL_EXPLAIN_TIMEOUT_MS <= 0:
+        errors.append(
+            f"SQL_EXPLAIN_TIMEOUT_MS 必须大于 0：{SQL_EXPLAIN_TIMEOUT_MS}"
+        )
+    if SQL_EXPLAIN_MAX_ESTIMATED_ROWS < 0:
+        errors.append(
+            "SQL_EXPLAIN_MAX_ESTIMATED_ROWS 不能为负："
+            f"{SQL_EXPLAIN_MAX_ESTIMATED_ROWS}"
+        )
     if PROMPT_MAX_LENGTH < 1000:
         errors.append(f"PROMPT_MAX_LENGTH 不应小于 1000：{PROMPT_MAX_LENGTH}")
     if UPLOAD_MAX_BYTES <= 0 or GRAPH_MAX_NODES <= 0 or GRAPH_MAX_EDGES <= 0:
@@ -260,10 +299,5 @@ def validate_config():
         raise ValueError(f"配置验证失败，共 {len(errors)} 个错误")
 
 
-# 在模块加载时执行配置验证
-try:
-    validate_config()
-except Exception as e:
-    # 如果验证失败，记录警告但不阻止模块加载（避免循环导入）
-    from loguru import logger
-    logger.warning(f"配置验证警告：{e}")
+# 在模块加载时执行配置验证；无效安全配置必须阻止应用启动。
+validate_config()

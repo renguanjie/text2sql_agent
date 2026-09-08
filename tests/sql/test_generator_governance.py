@@ -1,0 +1,648 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from loguru import logger
+
+from core.semantic.context import SemanticContextBuilder
+from core.semantic.models import (
+    CorrectnessResult,
+    SemanticEntity,
+    SemanticField,
+    SemanticMetric,
+    SemanticSnapshot,
+    ValidationIssue,
+    ValidationReport,
+)
+from core.semantic.validator import SemanticSQLValidator
+from core.sql.correctness import CorrectnessPipeline
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class StaticRegistry:
+    def __init__(self, snapshot: SemanticSnapshot):
+        self.snapshot = snapshot
+
+    def get_snapshot(self) -> SemanticSnapshot:
+        return self.snapshot
+
+
+def _snapshot(version: str = "1.0.0") -> SemanticSnapshot:
+    return SemanticSnapshot(
+        schema_version=1,
+        model_version=version,
+        datasource="sales",
+        dialect="mysql",
+        entities=(
+            SemanticEntity(
+                name="orders",
+                name_cn="订单",
+                fields=(
+                    SemanticField(
+                        name="id",
+                        name_cn="订单号",
+                        data_type="bigint",
+                        role="identifier",
+                    ),
+                    SemanticField(
+                        name="amount",
+                        name_cn="金额",
+                        data_type="decimal",
+                        role="measure",
+                    ),
+                    SemanticField(
+                        name="created_at",
+                        name_cn="下单时间",
+                        data_type="datetime",
+                        role="time",
+                    ),
+                ),
+            ),
+        ),
+        metrics=(
+            SemanticMetric(
+                name="order_amount",
+                name_cn="订单金额",
+                expression="SUM(orders.amount)",
+                allowed_dimensions=("orders.created_at",),
+                default_time_field="orders.created_at",
+            ),
+        ),
+        source_sha256="0" * 64,
+        content_sha256="1" * 64,
+        compiler_version="1",
+        compiled_at="2026-09-09T00:00:00Z",
+    )
+
+
+def _pipeline(*, max_repair_attempts: int = 1) -> CorrectnessPipeline:
+    return CorrectnessPipeline(
+        registry=StaticRegistry(_snapshot()),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+        max_repair_attempts=max_repair_attempts,
+    )
+
+
+def _generator(
+    *,
+    pipeline: CorrectnessPipeline | Mock | None,
+    mysql_client=None,
+    candidate_sql: str = "SELECT SUM(amount) FROM orders",
+):
+    from core.sql.generator import SQLGenerator
+
+    retriever = Mock()
+    retriever.history_index = None
+    chain = Mock()
+    chain.dialect = "mysql"
+    chain.retrieval_top_k = 3
+    generated = {"status": "success", "sql": candidate_sql, "matched_knowledge": []}
+    chain.generate.return_value = dict(generated)
+    chain.generate_async = AsyncMock(return_value=dict(generated))
+    chain.fix_sql_governed.return_value = {
+        "status": "success",
+        "sql": "SELECT SUM(amount) FROM orders",
+        "error": None,
+    }
+    chain.fix_sql_governed_async = AsyncMock(
+        return_value={
+            "status": "success",
+            "sql": "SELECT SUM(amount) FROM orders",
+            "error": None,
+        }
+    )
+    generator = SQLGenerator(
+        Mock(),
+        retriever,
+        chain,
+        mysql_client=mysql_client,
+        config={
+            "sql_dialect": "mysql",
+            "sql_query_max_rows": 5,
+            "sql_query_timeout_ms": 2500,
+        },
+        correctness_pipeline=pipeline,
+    )
+    context = {
+        "final_query": "订单金额",
+        "detected_dialect": "mysql",
+        "detected_database_id": None,
+        "knowledge_results": [],
+        "few_shot_examples": "",
+        "schema_info": {
+            "tables": [{"table_name": "orders"}],
+            "columns": [{"table_name": "orders", "column_name": "amount"}],
+            "relationships": [],
+        },
+    }
+    generator._prepare_pipeline = Mock(return_value=context)
+    generator._prepare_pipeline_async = AsyncMock(return_value=context)
+    return generator
+
+
+@contextmanager
+def capture_loguru(caplog):
+    caplog.set_level(logging.DEBUG)
+    sink_id = logger.add(caplog.handler, format="{message}", level="DEBUG")
+    try:
+        yield
+    finally:
+        logger.remove(sink_id)
+
+
+def _write_model(path: Path, *, version: str = "1.0.0") -> None:
+    path.write_text(
+        f"""
+schema_version: 1
+model_version: {version}
+datasource: sales
+dialect: mysql
+entities:
+  - name: orders
+    name_cn: 订单
+    fields:
+      - {{name: id, name_cn: 订单号, data_type: bigint, role: identifier}}
+      - {{name: amount, name_cn: 金额, data_type: decimal, role: measure}}
+metrics:
+  - name: order_amount
+    name_cn: 订单金额
+    expression: SUM(orders.amount)
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _governance_config(model_dir: Path) -> dict:
+    return {
+        "semantic_governance_enabled": True,
+        "semantic_model_dir": str(model_dir),
+        "semantic_datasource": "sales",
+        "semantic_context_max_chars": 2400,
+        "semantic_context_max_items": 24,
+        "sql_repair_max_attempts": 1,
+        "sql_explain_enabled": False,
+        "sql_explain_timeout_ms": 3000,
+        "sql_explain_max_estimated_rows": 0,
+    }
+
+
+def _import_config(**updates: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "LLM_PROVIDER": "ollama",
+            "EMBEDDING_PROVIDER": "ollama",
+            **updates,
+        }
+    )
+    return subprocess.run(
+        [sys.executable, "-c", "import config"],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_generator_returns_governed_result_and_injects_the_same_semantic_context():
+    """Catches bypassing governance or omitting the governed generation context."""
+    generator = _generator(pipeline=_pipeline())
+
+    result = generator.generate_sql("订单金额", auto_save_history=False)
+
+    assert result["semantic_version"] == "1.0.0"
+    assert result["repair_attempts"] == 0
+    assert result["executable"] is True
+    assert result["validation"] == {"valid": True, "issues": []}
+    assert result["user_query"] == "订单金额"
+    semantic_context = generator.sql_chain.generate.call_args.kwargs["semantic_context"]
+    assert "版本: sales@1.0.0" in semantic_context
+    assert "指标: 订单金额 = SUM(orders.amount)" in semantic_context
+
+
+@pytest.mark.asyncio
+async def test_async_generator_uses_the_shared_correctness_pipeline_and_result_adapter():
+    """Catches async generation skipping or reshaping the shared governed result."""
+    generator = _generator(pipeline=_pipeline())
+
+    result = await generator.generate_sql_async("订单金额", auto_save_history=False)
+
+    assert result["semantic_version"] == "1.0.0"
+    assert result["repair_attempts"] == 0
+    assert result["executable"] is True
+    assert result["validation"] == {"valid": True, "issues": []}
+    semantic_context = generator.sql_chain.generate_async.call_args.kwargs[
+        "semantic_context"
+    ]
+    assert "版本: sales@1.0.0" in semantic_context
+
+
+def test_generator_delegates_one_governed_repair_to_task_7_api():
+    """Catches generator-local repair loops or use of the legacy raw-error repair API."""
+    generator = _generator(
+        pipeline=_pipeline(max_repair_attempts=1),
+        candidate_sql="SELECT COUNT(*) FROM orders",
+    )
+
+    result = generator.generate_sql("订单金额", auto_save_history=False)
+
+    assert result["status"] == "success"
+    assert result["repair_attempts"] == 1
+    generator.sql_chain.fix_sql_governed.assert_called_once()
+    generator.sql_chain.fix_sql.assert_not_called()
+
+
+def test_governed_history_is_saved_after_rejection_with_only_structured_codes():
+    """Catches saving pre-governance success or promoting rejected SQL to Few-Shot."""
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    generator = _generator(
+        pipeline=_pipeline(max_repair_attempts=0),
+        mysql_client=mysql,
+        candidate_sql="SELECT COUNT(*) FROM orders",
+    )
+
+    result = generator.generate_sql("订单金额")
+
+    assert result["status"] == "rejected"
+    assert result["executable"] is False
+    saved = mysql.save_sql_history.call_args.kwargs
+    assert saved["generated_sql"] == "SELECT COUNT(*) FROM orders"
+    assert saved["validation_status"] == "fail"
+    assert saved["validation_error"] == "METRIC_MISMATCH"
+    generator.knowledge_retriever.add_history_record.assert_not_called()
+
+
+def test_disabled_governance_preserves_legacy_result_shape_and_chain_call():
+    """Catches governance fields or new prompt arguments leaking into default-off mode."""
+    generator = _generator(pipeline=None)
+
+    result = generator.generate_sql("查询订单", auto_save_history=False)
+
+    assert "sql" in result
+    assert "semantic_version" not in result
+    assert "repair_attempts" not in result
+    assert "executable" not in result
+    assert "user_query" not in result
+    assert "semantic_context" not in generator.sql_chain.generate.call_args.kwargs
+
+
+def test_governed_execute_requires_original_question_and_semantic_version():
+    """Catches execution authorization without the generation-time semantic context."""
+    mysql = Mock()
+    generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
+
+    result = generator.execute_sql("SELECT SUM(amount) FROM orders")
+
+    assert result["status"] == "error"
+    assert "原问题和语义版本" in result["error"]
+    assert result["validation"]["issues"][0]["code"] == "EXECUTION_CONTEXT_REQUIRED"
+    mysql.execute_query_limited.assert_not_called()
+
+
+def test_execute_reauthorizes_before_applying_row_and_timeout_constraints(monkeypatch):
+    """Catches LIMIT/timeout rewriting or database access before fresh authorization."""
+    import core.sql.generator as generator_module
+
+    events: list[str] = []
+    pipeline = Mock()
+
+    def authorize(**_kwargs):
+        events.append("authorize")
+        return CorrectnessResult(
+            status="success",
+            sql="SELECT SUM(amount) FROM orders",
+            semantic_version="1.0.0",
+            validation=ValidationReport(valid=True),
+            repair_attempts=0,
+            executable=True,
+        )
+
+    pipeline.authorize_execution.side_effect = authorize
+    mysql = Mock()
+    mysql.execute_query_limited.side_effect = lambda *_args, **_kwargs: (
+        events.append("execute") or ([{"total": 3}], False)
+    )
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+
+    def constrain(sql: str, **_kwargs) -> str:
+        events.append("constrain")
+        return f"{sql} LIMIT 6"
+
+    monkeypatch.setattr(generator_module, "constrain_read_query", constrain)
+
+    result = generator.execute_sql(
+        "SELECT SUM(amount) FROM orders",
+        allowed_tables=["orders"],
+        allowed_schemas=[],
+        user_query="订单金额",
+        semantic_version="1.0.0",
+    )
+
+    assert result["status"] == "success"
+    assert events == ["authorize", "constrain", "execute"]
+    pipeline.authorize_execution.assert_called_once_with(
+        question="订单金额",
+        sql="SELECT SUM(amount) FROM orders",
+        expected_semantic_version="1.0.0",
+        allowed_tables=("orders",),
+        allowed_schemas=(),
+    )
+
+
+def test_failed_reauthorization_returns_structured_issues_without_database_access():
+    """Catches version/semantic rejection being flattened or ignored by execution."""
+    pipeline = Mock()
+    pipeline.authorize_execution.return_value = CorrectnessResult(
+        status="rejected",
+        sql="SELECT SUM(amount) FROM orders",
+        semantic_version="1.1.0",
+        validation=ValidationReport(
+            valid=False,
+            issues=(
+                ValidationIssue(
+                    code="SEMANTIC_VERSION_MISMATCH",
+                    message="SQL 生成版本与当前语义版本不一致",
+                ),
+            ),
+        ),
+        repair_attempts=0,
+        executable=False,
+    )
+    mysql = Mock()
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+
+    result = generator.execute_sql(
+        "SELECT SUM(amount) FROM orders",
+        user_query="订单金额",
+        semantic_version="1.0.0",
+    )
+
+    assert result["status"] == "error"
+    assert result["executable"] is False
+    assert result["validation"]["issues"][0]["code"] == (
+        "SEMANTIC_VERSION_MISMATCH"
+    )
+    mysql.execute_query_limited.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "updates,variable",
+    [
+        (
+            {"SEMANTIC_GOVERNANCE_ENABLED": "true", "SQL_REPAIR_MAX_ATTEMPTS": "2"},
+            "SQL_REPAIR_MAX_ATTEMPTS",
+        ),
+        ({"SEMANTIC_CONTEXT_MAX_CHARS": "0"}, "SEMANTIC_CONTEXT_MAX_CHARS"),
+        ({"SEMANTIC_CONTEXT_MAX_ITEMS": "0"}, "SEMANTIC_CONTEXT_MAX_ITEMS"),
+        ({"SQL_EXPLAIN_TIMEOUT_MS": "0"}, "SQL_EXPLAIN_TIMEOUT_MS"),
+        ({"SQL_EXPLAIN_MAX_ESTIMATED_ROWS": "-1"}, "SQL_EXPLAIN_MAX_ESTIMATED_ROWS"),
+    ],
+)
+def test_invalid_governance_environment_fails_import(updates: dict, variable: str):
+    """Catches invalid governance configuration being downgraded to a warning."""
+    result = _import_config(**updates)
+
+    assert result.returncode != 0
+    assert variable in result.stdout + result.stderr
+
+
+def test_governance_configuration_defaults_are_exact():
+    """Catches changing a compatibility or safety default during environment parsing."""
+    names = (
+        "SEMANTIC_GOVERNANCE_ENABLED",
+        "SEMANTIC_MODEL_DIR",
+        "SEMANTIC_DATASOURCE",
+        "SEMANTIC_CONTEXT_MAX_CHARS",
+        "SEMANTIC_CONTEXT_MAX_ITEMS",
+        "SQL_REPAIR_MAX_ATTEMPTS",
+        "SQL_EXPLAIN_ENABLED",
+        "SQL_EXPLAIN_TIMEOUT_MS",
+        "SQL_EXPLAIN_MAX_ESTIMATED_ROWS",
+    )
+    env = os.environ.copy()
+    for name in names:
+        env.pop(name, None)
+    env.update({"LLM_PROVIDER": "ollama", "EMBEDDING_PROVIDER": "ollama"})
+    script = """
+import json
+import config
+names = %r
+print(json.dumps({name: getattr(config, name) for name in names}, sort_keys=True))
+""" % (names,)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout.strip()) == {
+        "SEMANTIC_GOVERNANCE_ENABLED": False,
+        "SEMANTIC_MODEL_DIR": "semantic_models",
+        "SEMANTIC_DATASOURCE": "default",
+        "SEMANTIC_CONTEXT_MAX_CHARS": 2400,
+        "SEMANTIC_CONTEXT_MAX_ITEMS": 24,
+        "SQL_REPAIR_MAX_ATTEMPTS": 1,
+        "SQL_EXPLAIN_ENABLED": False,
+        "SQL_EXPLAIN_TIMEOUT_MS": 3000,
+        "SQL_EXPLAIN_MAX_ESTIMATED_ROWS": 0,
+    }
+
+
+def test_create_app_context_from_env_threads_all_governance_values(monkeypatch):
+    """Catches parsed governance settings being dropped at the construction boundary."""
+    import config
+    from core.app_context import create_app_context_from_env
+
+    expected = {
+        "SEMANTIC_GOVERNANCE_ENABLED": True,
+        "SEMANTIC_MODEL_DIR": "/tmp/models",
+        "SEMANTIC_DATASOURCE": "sales",
+        "SEMANTIC_CONTEXT_MAX_CHARS": 1700,
+        "SEMANTIC_CONTEXT_MAX_ITEMS": 13,
+        "SQL_REPAIR_MAX_ATTEMPTS": 0,
+        "SQL_EXPLAIN_ENABLED": True,
+        "SQL_EXPLAIN_TIMEOUT_MS": 900,
+        "SQL_EXPLAIN_MAX_ESTIMATED_ROWS": 8000,
+    }
+    for name, value in expected.items():
+        monkeypatch.setattr(config, name, value, raising=False)
+
+    context = create_app_context_from_env()
+
+    assert {
+        "semantic_governance_enabled": True,
+        "semantic_model_dir": "/tmp/models",
+        "semantic_datasource": "sales",
+        "semantic_context_max_chars": 1700,
+        "semantic_context_max_items": 13,
+        "sql_repair_max_attempts": 0,
+        "sql_explain_enabled": True,
+        "sql_explain_timeout_ms": 900,
+        "sql_explain_max_estimated_rows": 8000,
+    }.items() <= context.config.items()
+
+
+def test_governance_reload_builds_candidate_then_atomically_replaces_pair(
+    tmp_path: Path, monkeypatch
+):
+    """Catches in-place mutation of the live registry before candidate validation."""
+    from core.app_context import ApplicationContext
+
+    source = tmp_path / "sales.yaml"
+    _write_model(source)
+    context = ApplicationContext({"semantic_governance_enabled": False})
+    context._llm = Mock()
+    context._knowledge_retriever = Mock()
+    context._sql_chain = Mock()
+    context._mysql_client = Mock()
+    old_registry = object()
+    old_generator = object()
+    context._semantic_registry = old_registry
+    context._correctness_pipeline = object()
+    context._sql_generator = old_generator
+    candidate_generator = object()
+    build_generator = Mock(return_value=candidate_generator)
+    monkeypatch.setattr(
+        context, "_build_sql_generator", build_generator, raising=False
+    )
+
+    context.reload_governance(**_governance_config(tmp_path))
+
+    assert context.semantic_registry is not old_registry
+    assert context.semantic_registry.get_snapshot().model_version == "1.0.0"
+    assert context.correctness_pipeline.registry is context.semantic_registry
+    assert context.sql_generator is candidate_generator
+    assert build_generator.call_args.kwargs["correctness_pipeline"] is (
+        context.correctness_pipeline
+    )
+
+
+def test_failed_governance_reload_keeps_old_registry_generator_and_config(
+    tmp_path: Path,
+):
+    """Catches a failed candidate reload corrupting the live governance pair."""
+    from core.app_context import ApplicationContext, ApplicationConfigurationError
+
+    (tmp_path / "sales.yaml").write_text(
+        "password=secret invalid yaml: [", encoding="utf-8"
+    )
+    context = ApplicationContext({"semantic_governance_enabled": False})
+    old_registry = object()
+    old_pipeline = object()
+    old_generator = object()
+    context._semantic_registry = old_registry
+    context._correctness_pipeline = old_pipeline
+    context._sql_generator = old_generator
+    context._mysql_client = Mock()
+
+    with pytest.raises(ApplicationConfigurationError, match="语义治理配置无效"):
+        context.reload_governance(**_governance_config(tmp_path))
+
+    assert context.config == {"semantic_governance_enabled": False}
+    assert context.semantic_registry is old_registry
+    assert context.correctness_pipeline is old_pipeline
+    assert context.sql_generator is old_generator
+
+
+def test_initial_governance_failure_exposes_only_stable_configuration_error(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """Catches startup surfacing compiler content or leaving partial components live."""
+    from core.app_context import ApplicationContext
+
+    (tmp_path / "sales.yaml").write_text(
+        "password=secret invalid yaml: [", encoding="utf-8"
+    )
+    context = ApplicationContext(_governance_config(tmp_path))
+    for method in (
+        "_init_llm",
+        "_init_neo4j",
+        "_init_mysql",
+        "_init_embedding",
+        "_init_retriever",
+        "_init_sql_chain",
+        "_init_sql_generator",
+        "_load_knowledge_base",
+        "_load_few_shot_history",
+    ):
+        monkeypatch.setattr(context, method, Mock())
+
+    with capture_loguru(caplog):
+        initialized = context.ensure_initialized()
+
+    assert initialized is False
+    assert context.initialization_error == "语义治理配置无效"
+    assert "secret" not in caplog.text
+    assert "invalid yaml" not in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_ui_helpers_disable_rejected_sql_and_ignore_unstructured_error_details():
+    """Catches UI execution enablement or rendering of raw database error strings."""
+    from core.utils.correctness_ui import (
+        execution_is_disabled,
+        structured_validation_messages,
+    )
+
+    result = {
+        "executable": False,
+        "error": "password=secret database=private",
+        "validation": {
+            "valid": False,
+            "issues": [
+                {
+                    "code": "POLICY_DENIED",
+                    "message": "字段不允许直接查询",
+                    "objects": ["customers.mobile"],
+                    "stage": "semantic",
+                }
+            ],
+        },
+    }
+
+    assert execution_is_disabled(result) is True
+    assert execution_is_disabled({"sql": "SELECT 1"}) is False
+    assert structured_validation_messages(result) == [
+        "[POLICY_DENIED] 字段不允许直接查询"
+    ]
+
+
+def test_execute_exception_log_uses_safe_metadata_without_sql_or_traceback(caplog):
+    """Catches execute_sql logging traceback, exception text, SQL, or database details."""
+    mysql = Mock()
+    mysql.get_table_schema.return_value = [{"table_name": "private_orders"}]
+    mysql.execute_query_limited.side_effect = RuntimeError(
+        "password=secret database=prod_private"
+    )
+    generator = _generator(pipeline=None, mysql_client=mysql)
+    sql = "SELECT visible_amount FROM private_orders"
+
+    with capture_loguru(caplog):
+        result = generator.execute_sql(sql)
+
+    assert result["status"] == "fail"
+    assert "secret" not in caplog.text
+    assert "prod_private" not in caplog.text
+    assert "visible_amount" not in caplog.text
+    assert "private_orders" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "stage=sql_execute" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)

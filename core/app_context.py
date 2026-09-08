@@ -2,8 +2,15 @@
 应用上下文 - 统一管理所有组件的生命周期
 替代原有的全局单例模式
 """
+from pathlib import Path
 from typing import Dict, Any
 from loguru import logger
+
+from core.utils.log_sanitizer import log_safe_exception
+
+
+class ApplicationConfigurationError(ValueError):
+    """Stable public error raised for invalid application configuration."""
 
 
 class ApplicationContext:
@@ -18,6 +25,7 @@ class ApplicationContext:
         """
         self.config = config
         self._initialized = False
+        self._initialization_error = None
 
         # 组件实例（延迟初始化）
         self._llm = None
@@ -27,6 +35,8 @@ class ApplicationContext:
         self._knowledge_retriever = None
         self._sql_generator = None
         self._sql_chain = None
+        self._semantic_registry = None
+        self._correctness_pipeline = None
 
     @property
     def llm(self):
@@ -57,6 +67,18 @@ class ApplicationContext:
         return self._sql_chain
 
     @property
+    def semantic_registry(self):
+        return self._semantic_registry
+
+    @property
+    def correctness_pipeline(self):
+        return self._correctness_pipeline
+
+    @property
+    def initialization_error(self):
+        return self._initialization_error
+
+    @property
     def is_initialized(self) -> bool:
         return self._initialized
 
@@ -74,15 +96,24 @@ class ApplicationContext:
             self._init_embedding()
             self._init_retriever()
             self._init_sql_chain()
+            self._init_governance()
             self._init_sql_generator()
             self._load_knowledge_base()
             self._load_few_shot_history()
 
             self._initialized = True
+            self._initialization_error = None
             logger.info("系统初始化完成")
             return True
 
+        except ApplicationConfigurationError as exc:
+            self._initialization_error = str(exc)
+            logger.error("系统初始化失败：{}", self._initialization_error)
+            self.shutdown()
+            self._initialized = False
+            return False
         except Exception as e:
+            self._initialization_error = "系统初始化失败"
             logger.error(f"系统初始化失败：{e}")
             self.shutdown()
             self._initialized = False
@@ -198,26 +229,103 @@ class ApplicationContext:
             prompt_max_length=self.config.get('prompt_max_length', 4000),
         )
 
-    def _init_sql_generator(self):
-        """初始化 SQL 生成器"""
+    @staticmethod
+    def _resolve_semantic_model_dir(config: Dict[str, Any]) -> Path:
+        model_dir = Path(config.get('semantic_model_dir', 'semantic_models'))
+        if model_dir.is_absolute():
+            return model_dir
+        return Path(__file__).resolve().parents[1] / model_dir
+
+    def _build_governance_components(self, config: Dict[str, Any]):
+        """Compile and validate a complete candidate pair before publication."""
+        if not config.get('semantic_governance_enabled', False):
+            return None, None
+
+        from core.semantic.compiler import SemanticCompiler
+        from core.semantic.context import SemanticContextBuilder
+        from core.semantic.registry import SemanticRegistry
+        from core.semantic.validator import SemanticSQLValidator
+        from core.sql.correctness import CorrectnessPipeline
+        from core.sql.preflight import MySQLExplainPreflight
+
+        try:
+            model_dir = self._resolve_semantic_model_dir(config)
+            datasource = config.get('semantic_datasource', 'default')
+            source = model_dir / f"{datasource}.yaml"
+            compiled_root = model_dir / '.compiled'
+            SemanticCompiler().compile_file(source, compiled_root)
+            registry = SemanticRegistry(compiled_root, datasource)
+            registry.load_active()
+            context_builder = SemanticContextBuilder(
+                max_chars=config.get('semantic_context_max_chars', 2400),
+                max_items=config.get('semantic_context_max_items', 24),
+            )
+            preflight = None
+            if config.get('sql_explain_enabled', False):
+                preflight = MySQLExplainPreflight(
+                    self._mysql_client,
+                    timeout_ms=config.get('sql_explain_timeout_ms', 3000),
+                    max_estimated_rows=config.get(
+                        'sql_explain_max_estimated_rows', 0
+                    ),
+                )
+            pipeline = CorrectnessPipeline(
+                registry=registry,
+                context_builder=context_builder,
+                semantic_validator=SemanticSQLValidator(),
+                preflight=preflight,
+                max_repair_attempts=config.get('sql_repair_max_attempts', 1),
+                blocked_tables=tuple(config.get('sql_blocked_tables') or ()),
+            )
+            return registry, pipeline
+        except Exception as exc:
+            log_safe_exception("semantic_governance_config", exc)
+            raise ApplicationConfigurationError("语义治理配置无效") from None
+
+    def _init_governance(self) -> None:
+        """Initialize the optional governed snapshot and pipeline."""
+        registry, pipeline = self._build_governance_components(self.config)
+        self._semantic_registry = registry
+        self._correctness_pipeline = pipeline
+
+    def _build_sql_generator(
+        self,
+        *,
+        llm,
+        knowledge_retriever,
+        sql_chain,
+        config: Dict[str, Any],
+        correctness_pipeline,
+    ):
         from core.sql.generator import SQLGenerator
-        self._sql_generator = SQLGenerator(
-            llm=self._llm,
-            knowledge_retriever=self._knowledge_retriever,
-            sql_chain=self._sql_chain,
+
+        return SQLGenerator(
+            llm=llm,
+            knowledge_retriever=knowledge_retriever,
+            sql_chain=sql_chain,
             mysql_client=self._mysql_client,
-            config=self._generator_config(self.config),
+            config=self._generator_config(config),
             neo4j_client=(
                 self._neo4j_client
                 if self._neo4j_client and self._neo4j_client.driver else None
-            )
+            ),
+            correctness_pipeline=correctness_pipeline,
+        )
+
+    def _init_sql_generator(self):
+        """初始化 SQL 生成器"""
+        self._sql_generator = self._build_sql_generator(
+            llm=self._llm,
+            knowledge_retriever=self._knowledge_retriever,
+            sql_chain=self._sql_chain,
+            config=self.config,
+            correctness_pipeline=self._correctness_pipeline,
         )
 
     def reload_llm(self, **updates: Any) -> None:
         """为当前会话事务式重载 LLM 链路。"""
         from core.chain.sql_chain import SQLGenerationChain
         from core.llm_factory import create_llm
-        from core.sql.generator import SQLGenerator
 
         candidate_config = {**self.config, **updates}
         candidate_llm = create_llm(
@@ -232,13 +340,12 @@ class ApplicationContext:
             retrieval_top_k=candidate_config.get('retrieval_top_k', 5),
             prompt_max_length=candidate_config.get('prompt_max_length', 4000),
         )
-        candidate_generator = SQLGenerator(
+        candidate_generator = self._build_sql_generator(
             llm=candidate_llm,
             knowledge_retriever=self._knowledge_retriever,
             sql_chain=candidate_chain,
-            mysql_client=self._mysql_client,
-            config=self._generator_config(candidate_config),
-            neo4j_client=self._neo4j_client if getattr(self._neo4j_client, 'driver', None) else None,
+            config=candidate_config,
+            correctness_pipeline=self._correctness_pipeline,
         )
         self.config = candidate_config
         self._llm = candidate_llm
@@ -250,7 +357,6 @@ class ApplicationContext:
         """为当前会话构建新检索链路，成功后一次性替换旧组件。"""
         from core.embedding_factory import EmbeddingFactory
         from core.retrieval.bm25_tfidf import KnowledgeRetriever
-        from core.sql.generator import SQLGenerator
 
         candidate_config = {**self.config, **updates}
         candidate_embedding = EmbeddingFactory(
@@ -265,15 +371,12 @@ class ApplicationContext:
                 embedding_factory=candidate_embedding,
             )
             self._populate_retriever(candidate_retriever, candidate_config)
-            candidate_generator = SQLGenerator(
+            candidate_generator = self._build_sql_generator(
                 llm=self._llm,
                 knowledge_retriever=candidate_retriever,
                 sql_chain=self._sql_chain,
-                mysql_client=self._mysql_client,
-                config=self._generator_config(candidate_config),
-                neo4j_client=(
-                    self._neo4j_client if getattr(self._neo4j_client, 'driver', None) else None
-                ),
+                config=candidate_config,
+                correctness_pipeline=self._correctness_pipeline,
             )
         except Exception:
             try:
@@ -293,6 +396,26 @@ class ApplicationContext:
                 old_embedding.clear_cache()
             except Exception as cleanup_error:
                 logger.warning(f"旧 Embedding 缓存清理失败：{cleanup_error}")
+
+    def reload_governance(self, **updates: Any) -> None:
+        """Candidate-build governance and atomically replace registry/generator."""
+        candidate_config = {**self.config, **updates}
+        candidate_registry, candidate_pipeline = self._build_governance_components(
+            candidate_config
+        )
+        candidate_generator = self._build_sql_generator(
+            llm=self._llm,
+            knowledge_retriever=self._knowledge_retriever,
+            sql_chain=self._sql_chain,
+            config=candidate_config,
+            correctness_pipeline=candidate_pipeline,
+        )
+
+        self.config = candidate_config
+        self._semantic_registry = candidate_registry
+        self._correctness_pipeline = candidate_pipeline
+        self._sql_generator = candidate_generator
+        self._initialized = True
 
     def _populate_retriever(self, retriever, config: Dict[str, Any]) -> None:
         """把当前知识与执行成功历史加载到候选检索器。"""
@@ -417,6 +540,9 @@ class ApplicationContext:
         self._knowledge_retriever = None
         self._sql_generator = None
         self._sql_chain = None
+        self._semantic_registry = None
+        self._correctness_pipeline = None
+        self._initialization_error = None
         logger.info("应用上下文已重置")
 
     def shutdown(self):
@@ -495,4 +621,14 @@ def create_app_context_from_env() -> ApplicationContext:
         'sql_query_timeout_ms': config.SQL_QUERY_TIMEOUT_MS,
         'sql_scope_enforcement': config.SQL_SCOPE_ENFORCEMENT,
         'sql_blocked_tables': config.SQL_BLOCKED_TABLES,
+        # Semantic governance and EXPLAIN
+        'semantic_governance_enabled': config.SEMANTIC_GOVERNANCE_ENABLED,
+        'semantic_model_dir': config.SEMANTIC_MODEL_DIR,
+        'semantic_datasource': config.SEMANTIC_DATASOURCE,
+        'semantic_context_max_chars': config.SEMANTIC_CONTEXT_MAX_CHARS,
+        'semantic_context_max_items': config.SEMANTIC_CONTEXT_MAX_ITEMS,
+        'sql_repair_max_attempts': config.SQL_REPAIR_MAX_ATTEMPTS,
+        'sql_explain_enabled': config.SQL_EXPLAIN_ENABLED,
+        'sql_explain_timeout_ms': config.SQL_EXPLAIN_TIMEOUT_MS,
+        'sql_explain_max_estimated_rows': config.SQL_EXPLAIN_MAX_ESTIMATED_ROWS,
     })

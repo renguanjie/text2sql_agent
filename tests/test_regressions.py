@@ -444,6 +444,61 @@ def test_sql_fix_exception_result_and_log_do_not_leak(monkeypatch, caplog):
     assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
 
 
+def test_sql_parse_exception_result_and_log_do_not_leak(monkeypatch, caplog):
+    """Catches SQLValidator.parse exposing raw parser failures at its public boundary."""
+    import core.sql.validator as validator_module
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("password=secret SQL SELECT hidden database=private")
+
+    monkeypatch.setattr(validator_module.sqlfluff, "parse", explode)
+    validator = validator_module.SQLValidator(dialect="mysql")
+
+    with capture_loguru(caplog):
+        result = validator.parse("SELECT visible FROM orders")
+
+    assert result == {
+        "success": False,
+        "error": "SQL 解析失败",
+        "tree": None,
+    }
+    assert "secret" not in caplog.text
+    assert "hidden" not in caplog.text
+    assert "private" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "stage=sqlfluff_parse_tree" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
+
+
+def test_generator_factory_loads_only_execution_success_history_for_few_shot():
+    """Catches rejected or merely generated history entering Few-Shot at startup."""
+    from core.sql.generator import create_sql_generator
+
+    neo4j = Mock()
+    neo4j.get_schema_metadata.return_value = {"tables": [], "columns": []}
+    mysql = Mock()
+    mysql.get_successful_history_for_few_shot.return_value = [
+        {
+            "id": 7,
+            "user_query": "订单金额",
+            "generated_sql": "SELECT SUM(amount) FROM orders",
+            "validation_status": "success",
+            "execution_status": "success",
+        }
+    ]
+
+    generator = create_sql_generator(
+        Mock(), neo4j, mysql, config={"few_shot_enabled": True}
+    )
+
+    mysql.get_successful_history_for_few_shot.assert_called_once_with(limit=100)
+    mysql.get_history_list.assert_not_called()
+    assert generator.knowledge_retriever.history_records == (
+        mysql.get_successful_history_for_few_shot.return_value
+    )
+
+
 def test_read_query_constraint_adds_limit_and_mysql_timeout_hint():
     from core.sql.validator import constrain_read_query
 
