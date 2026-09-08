@@ -999,6 +999,9 @@ def test_model_parameter_parser_allows_only_non_sensitive_names():
         "model_revision=1.2.3+k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3",
         "model_revision=1.2.3+AKIAIOSFODNN7EXAMPLE",
         "model_revision=1.2.3+sk-proj-AbCdEf0123456789",
+        "model_revision=unknown",
+        "model_revision=1.2.3+unknown",
+        "model_revision=buildghp_AbCdEf0123",
         "model_revision=v1.2.3",
         "quantization=custom format",
         "quantization=Q4_K_M?password=private",
@@ -1040,6 +1043,9 @@ def test_model_parameter_direct_construction_uses_the_same_safe_specs():
         "1.2.3+cu121",
         "1.2.3+build.20260909",
         "1.2.3+nightly",
+        "darwinArm64",
+        "macOSArm64",
+        "buildA1B2",
         "abcdef1234567890abcdef1234567890abcdef12",
     ],
 )
@@ -1049,8 +1055,8 @@ def test_model_revision_accepts_only_narrow_nonsecret_identifiers(revision):
     )
 
 
-def test_model_revision_entropy_guard_applies_at_24_character_metadata_boundary():
-    """Break caught: treating the maximum metadata length as sufficient safety."""
+def test_model_revision_allowlist_applies_at_24_character_metadata_boundary():
+    """Break caught: treating maximum metadata length as permission for unknown labels."""
     opaque_metadata = "aB1cD2eF.gH3iJ4kL.mN5oP6"
     descriptive_metadata = "build.release.candidate1"
     assert len(opaque_metadata) == len(descriptive_metadata) == 24
@@ -1076,8 +1082,8 @@ def test_model_revision_entropy_guard_applies_at_24_character_metadata_boundary(
         "aB1.cD2.eF3.gH4.iJ5.kL6",
     ],
 )
-def test_model_revision_checks_each_segment_and_joined_metadata_for_opacity(metadata):
-    """Break caught: splitting or padding an opaque token to evade one check level."""
+def test_model_revision_checks_each_segment_against_the_safe_grammar(metadata):
+    """Break caught: splitting or padding an unknown token to evade the grammar."""
     with pytest.raises(GoldenConfigurationError) as caught:
         parse_model_parameters([f"model_revision=1.2.3+{metadata}"])
 
@@ -1096,6 +1102,35 @@ def test_report_serializes_parameter_summary_as_a_sorted_mapping(snapshot: Seman
     assert report.model_dump(mode="json")["model_parameters"] == {
         "seed": 17,
         "temperature": 0,
+    }
+
+
+@pytest.mark.parametrize("include_content", [False, True])
+def test_report_fingerprints_model_revision_in_every_content_mode(
+    snapshot: SemanticSnapshot,
+    tmp_path: Path,
+    include_content: bool,
+):
+    """Break caught: report serialization exposing a directly constructed revision."""
+    revision = "darwinArm64"
+    evaluator = GoldenEvaluator(
+        snapshot,
+        model_parameters=(ModelParameter(name="model_revision", value=revision),),
+        include_content=include_content,
+    )
+    report = evaluator.evaluate_results(
+        [(_case(), _result("SELECT id FROM example_orders"))]
+    )
+
+    path = evaluator.write_report(report, tmp_path / f"report-{include_content}.json")
+    serialized = path.read_text("utf-8")
+    payload = json.loads(serialized)
+
+    assert revision not in serialized
+    assert payload["model_parameters"] == {
+        "model_revision_sha256": (
+            "sha256:4836d72421a3a46f96e9690258835298916d97d0b20740f320ba993f77a9068f"
+        )
     }
 
 

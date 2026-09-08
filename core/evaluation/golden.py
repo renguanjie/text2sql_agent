@@ -85,6 +85,47 @@ _MODEL_REVISION_VERSION_LIKE = re.compile(r"[vV]\d+\.\d+\.\d+(?:[-+.]|$)")
 _MODEL_REVISION_MAX_LENGTH = 64
 _MODEL_REVISION_METADATA_MAX_LENGTH = 24
 _MODEL_REVISION_IDENTIFIER_MAX_LENGTH = 16
+_MODEL_REVISION_SAFE_ATOMS = frozenset(
+    {
+        "alpha",
+        "amd64",
+        "arm64",
+        "beta",
+        "build",
+        "candidate",
+        "cpu",
+        "cuda",
+        "darwin",
+        "dev",
+        "gpu",
+        "latest",
+        "linux",
+        "macOS",
+        "main",
+        "master",
+        "nightly",
+        "rc",
+        "release",
+        "rocm",
+        "snapshot",
+        "stable",
+        "windows",
+        "x86_64",
+    }
+)
+_MODEL_REVISION_NUMERIC_ATOM = re.compile(r"[0-9]{1,8}")
+_MODEL_REVISION_CHANNEL_ATOM = re.compile(
+    r"(?:alpha|beta|candidate|dev|rc|release|snapshot)[0-9]{1,4}"
+)
+_MODEL_REVISION_ACCELERATOR_ATOM = re.compile(
+    r"(?:cu[0-9]{2,4}|(?:cuda|rocm)[0-9]{1,4})"
+)
+_MODEL_REVISION_PLATFORM_ATOM = re.compile(
+    r"(?:darwin|linux|macOS|windows)(?:Amd64|Arm64|X86_64)"
+)
+_MODEL_REVISION_BUILD_ATOM = re.compile(
+    r"build(?=[A-Za-z0-9]{1,8}$)(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]+"
+)
 _QUANTIZATIONS = frozenset(
     {
         "NONE",
@@ -118,48 +159,32 @@ _SENSITIVE_PARAMETER_TEXT = re.compile(
 )
 _CREDENTIAL_VALUE = re.compile(
     r"(?:"
-    r"(?:^|[._-])(?:sk-(?:(?:proj|svcacct)-)?|gh[pousr]_|github_pat_|"
+    r"(?:sk-(?:(?:proj|svcacct)-)?|gh[pousr]_|github_pat_|"
     r"glpat-|AIza|ya29\.|xox[baprs]-|(?:sk|pk|rk)_(?:live|test)_|"
     r"whsec_|Bearer[._-])|"
-    r"^(?:(?:A3T[A-Z0-9])|AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|"
-    r"ANVA|AROA)[A-Z0-9]{16}$|"
-    r"^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$"
+    r"(?:(?:A3T[A-Z0-9])|AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|"
+    r"ANVA|AROA)[A-Z0-9]{16}|"
+    r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
     r")",
     re.IGNORECASE,
 )
 _Scalar = StrictBool | StrictInt | StrictFloat | StrictStr
 
 
-def _looks_like_opaque_revision_token(value: str) -> bool:
-    token = "".join(char for char in value if char.isalnum())
-    if len(token) < 8:
-        return False
-
-    counts = Counter(token)
-    entropy = -sum(
-        (count / len(token)) * math.log2(count / len(token))
-        for count in counts.values()
+def _is_safe_revision_atom(value: str) -> bool:
+    return bool(
+        value in _MODEL_REVISION_SAFE_ATOMS
+        or _MODEL_REVISION_NUMERIC_ATOM.fullmatch(value)
+        or _MODEL_REVISION_CHANNEL_ATOM.fullmatch(value)
+        or _MODEL_REVISION_ACCELERATOR_ATOM.fullmatch(value)
+        or _MODEL_REVISION_PLATFORM_ATOM.fullmatch(value)
+        or _MODEL_REVISION_BUILD_ATOM.fullmatch(value)
     )
-    unique_ratio = len(counts) / len(token)
 
-    def character_class(char: str) -> str:
-        if char.islower():
-            return "lower"
-        if char.isupper():
-            return "upper"
-        return "digit"
 
-    classes = tuple(character_class(char) for char in token)
-    transitions = sum(left != right for left, right in zip(classes, classes[1:]))
-    mixed_opaque = (
-        entropy >= 2.75
-        and unique_ratio >= 0.75
-        and transitions >= max(3, len(token) // 3)
-    )
-    dense_opaque = (
-        len(token) >= 12 and entropy >= 3.5 and unique_ratio >= 0.85
-    )
-    return mixed_opaque or dense_opaque
+def _is_safe_revision_identifier(value: str) -> bool:
+    atoms = value.split("-")
+    return bool(atoms) and all(_is_safe_revision_atom(atom) for atom in atoms)
 
 
 def _is_safe_model_revision(value: str) -> bool:
@@ -187,12 +212,9 @@ def _is_safe_model_revision(value: str) -> bool:
             len(identifier) > _MODEL_REVISION_IDENTIFIER_MAX_LENGTH
             or _SENSITIVE_PARAMETER_TEXT.search(identifier)
             or _CREDENTIAL_VALUE.search(identifier)
-            or _looks_like_opaque_revision_token(identifier)
+            or not _is_safe_revision_identifier(identifier)
             for identifier in metadata
         ):
-            return False
-        compact_metadata = "".join(metadata)
-        if _looks_like_opaque_revision_token(compact_metadata):
             return False
         if prerelease is not None and any(
             len(identifier) > 1 and identifier.startswith("0")
@@ -204,9 +226,13 @@ def _is_safe_model_revision(value: str) -> bool:
 
     if _MODEL_REVISION_VERSION_LIKE.match(value):
         return False
-    return bool(
-        _MODEL_REVISION_GIT_HASH.fullmatch(value)
-        or (len(value) <= 24 and _MODEL_REVISION_SLUG.fullmatch(value))
+    if _MODEL_REVISION_GIT_HASH.fullmatch(value):
+        return True
+    if len(value) > 24 or not _MODEL_REVISION_SLUG.fullmatch(value):
+        return False
+    return all(
+        _is_safe_revision_atom(atom)
+        for atom in re.split(r"[.-]", value)
     )
 
 
@@ -590,7 +616,15 @@ class EvaluationReport(FrozenModel):
     def serialize_model_parameters(
         self, parameters: tuple[ModelParameter, ...]
     ) -> dict[str, _Scalar]:
-        return {parameter.name: parameter.value for parameter in parameters}
+        serialized: dict[str, _Scalar] = {}
+        for parameter in parameters:
+            if parameter.name == "model_revision":
+                serialized["model_revision_sha256"] = (
+                    f"sha256:{_fingerprint(str(parameter.value))}"
+                )
+            else:
+                serialized[parameter.name] = parameter.value
+        return serialized
 
     def deterministic_dump(self) -> dict:
         """Return comparable report content without intentionally variable timings."""
