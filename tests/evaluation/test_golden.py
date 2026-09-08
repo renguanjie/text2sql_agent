@@ -945,7 +945,12 @@ def test_model_parameter_parser_allows_only_non_sensitive_names():
         ModelParameter(name="temperature", value=0),
     )
 
-    for raw in ("api_key=secret", "endpoint=https://invalid.example", "token=secret"):
+    for raw in (
+        "api_key=secret",
+        "endpoint=https://invalid.example",
+        "token=secret",
+        "model_revision_sha256=sha256:" + "a" * 64,
+    ):
         with pytest.raises(GoldenConfigurationError) as caught:
             parse_model_parameters([raw])
         assert caught.value.code == "MODEL_PARAMETER_DENIED"
@@ -1023,12 +1028,31 @@ def test_model_parameter_direct_construction_uses_the_same_safe_specs():
         ("temperature", True),
         ("top_p", 2),
         ("seed", -1),
+        ("model_revision", "darwinArm64"),
         ("model_revision", "secret=private"),
         ("model_revision", "sk-proj-AbCdEf0123456789"),
+        ("model_revision_sha256", "darwinArm64"),
+        ("model_revision_sha256", "sha256:" + "A" * 64),
+        ("model_revision_sha256", "sha256:" + "a" * 63),
         ("quantization", "unknown"),
     ):
         with pytest.raises(ValidationError):
             ModelParameter(name=name, value=value)
+
+    digest = ModelParameter(
+        name="model_revision_sha256",
+        value=(
+            "sha256:4836d72421a3a46f96e9690258835298916d97d0b20740f320ba993f77a9068f"
+        ),
+    )
+    for update in (
+        {"name": "model_revision"},
+        {"name": "temperature"},
+        {"value": "darwinArm64"},
+        {"value": "sha256:" + "A" * 64},
+    ):
+        with pytest.raises(ValidationError):
+            digest.model_copy(update=update)
 
 
 @pytest.mark.parametrize(
@@ -1050,9 +1074,13 @@ def test_model_parameter_direct_construction_uses_the_same_safe_specs():
     ],
 )
 def test_model_revision_accepts_only_narrow_nonsecret_identifiers(revision):
-    assert parse_model_parameters([f"model_revision={revision}"]) == (
-        ModelParameter(name="model_revision", value=revision),
-    )
+    parameter, = parse_model_parameters([f"model_revision={revision}"])
+
+    assert parameter.name == "model_revision_sha256"
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", parameter.value)
+    assert revision not in repr(parameter)
+    assert revision not in json.dumps(parameter.model_dump(mode="json"))
+    assert revision not in parameter.model_dump_json()
 
 
 def test_model_revision_allowlist_applies_at_24_character_metadata_boundary():
@@ -1065,14 +1093,12 @@ def test_model_revision_allowlist_applies_at_24_character_metadata_boundary():
         parse_model_parameters([f"model_revision=1.2.3+{opaque_metadata}"])
 
     assert caught.value.code == "INVALID_MODEL_PARAMETER"
-    assert parse_model_parameters(
+    parameter, = parse_model_parameters(
         [f"model_revision=1.2.3+{descriptive_metadata}"]
-    ) == (
-        ModelParameter(
-            name="model_revision",
-            value=f"1.2.3+{descriptive_metadata}",
-        ),
     )
+    assert parameter.name == "model_revision_sha256"
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", parameter.value)
+    assert descriptive_metadata not in repr(parameter)
 
 
 @pytest.mark.parametrize(
@@ -1111,16 +1137,22 @@ def test_report_fingerprints_model_revision_in_every_content_mode(
     tmp_path: Path,
     include_content: bool,
 ):
-    """Break caught: report serialization exposing a directly constructed revision."""
+    """Break caught: a parsed revision surviving in any report representation."""
     revision = "darwinArm64"
+    parameters = parse_model_parameters([f"model_revision={revision}"])
     evaluator = GoldenEvaluator(
         snapshot,
-        model_parameters=(ModelParameter(name="model_revision", value=revision),),
+        model_parameters=parameters,
         include_content=include_content,
     )
     report = evaluator.evaluate_results(
         [(_case(), _result("SELECT id FROM example_orders"))]
     )
+
+    assert revision not in repr(parameters)
+    assert revision not in repr(report)
+    assert revision not in json.dumps(report.model_dump(mode="json"))
+    assert revision not in report.model_dump_json()
 
     path = evaluator.write_report(report, tmp_path / f"report-{include_content}.json")
     serialized = path.read_text("utf-8")

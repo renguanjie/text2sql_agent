@@ -18,6 +18,7 @@ from typing import Literal
 
 import yaml
 from pydantic import (
+    ConfigDict,
     Field,
     StrictBool,
     StrictFloat,
@@ -58,11 +59,13 @@ _ASSERTION_CODES = frozenset(
 )
 _REPORT_ERROR_CODES = PUBLIC_SQL_RESULT_ERROR_CODES | {"EVALUATION_SQL_INVALID"}
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
-_MODEL_PARAMETER_ALLOWLIST = frozenset(
+_MODEL_REVISION_INPUT_NAME = "model_revision"
+_MODEL_REVISION_DIGEST_NAME = "model_revision_sha256"
+_MODEL_PARAMETER_INPUT_ALLOWLIST = frozenset(
     {
         "context_length",
         "max_tokens",
-        "model_revision",
+        _MODEL_REVISION_INPUT_NAME,
         "quantization",
         "repeat_penalty",
         "seed",
@@ -71,6 +74,10 @@ _MODEL_PARAMETER_ALLOWLIST = frozenset(
         "top_p",
     }
 )
+_MODEL_PARAMETER_REPORT_ALLOWLIST = (
+    _MODEL_PARAMETER_INPUT_ALLOWLIST - {_MODEL_REVISION_INPUT_NAME}
+) | {_MODEL_REVISION_DIGEST_NAME}
+_MODEL_REVISION_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _MODEL_REVISION_SEMVER = re.compile(
     r"(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\."
     r"(?P<patch>0|[1-9]\d*)"
@@ -423,13 +430,20 @@ class GoldenResults(FrozenModel):
 
 
 class ModelParameter(FrozenModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        protected_namespaces=(),
+        revalidate_instances="always",
+    )
+
     name: StrictStr
     value: _Scalar
 
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str) -> str:
-        if value not in _MODEL_PARAMETER_ALLOWLIST:
+        if value not in _MODEL_PARAMETER_REPORT_ALLOWLIST:
             raise ValueError("model parameter is not report-safe")
         return value
 
@@ -463,16 +477,28 @@ class ModelParameter(FrozenModel):
         elif self.name == "seed":
             if type(value) is not int or not 0 <= value <= 2**63 - 1:
                 raise ValueError("model parameter value is out of range")
-        elif self.name == "model_revision":
+        elif self.name == _MODEL_REVISION_DIGEST_NAME:
             if (
                 not isinstance(value, str)
-                or not _is_safe_model_revision(value)
+                or not _MODEL_REVISION_DIGEST.fullmatch(value)
             ):
-                raise ValueError("model revision is not report-safe")
+                raise ValueError("model revision digest is not report-safe")
         elif self.name == "quantization":
             if not isinstance(value, str) or value.upper() not in _QUANTIZATIONS:
                 raise ValueError("quantization is unsupported")
         return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> "ModelParameter":
+        _ = deep
+        payload: dict[str, object] = {"name": self.name, "value": self.value}
+        if update is not None:
+            payload.update(update)
+        return type(self).model_validate(payload)
 
 
 class RuleRate(FrozenModel):
@@ -616,15 +642,7 @@ class EvaluationReport(FrozenModel):
     def serialize_model_parameters(
         self, parameters: tuple[ModelParameter, ...]
     ) -> dict[str, _Scalar]:
-        serialized: dict[str, _Scalar] = {}
-        for parameter in parameters:
-            if parameter.name == "model_revision":
-                serialized["model_revision_sha256"] = (
-                    f"sha256:{_fingerprint(str(parameter.value))}"
-                )
-            else:
-                serialized[parameter.name] = parameter.value
-        return serialized
+        return {parameter.name: parameter.value for parameter in parameters}
 
     def deterministic_dump(self) -> dict:
         """Return comparable report content without intentionally variable timings."""
@@ -738,15 +756,17 @@ def load_golden_results(path: Path) -> GoldenResults:
 
 def parse_model_parameters(values: Sequence[str]) -> tuple[ModelParameter, ...]:
     parsed: dict[str, _Scalar] = {}
+    seen_names: set[str] = set()
     for raw in values:
         if "=" not in raw:
             raise GoldenConfigurationError("INVALID_MODEL_PARAMETER")
         name, raw_value = raw.split("=", 1)
         name = name.strip()
-        if name not in _MODEL_PARAMETER_ALLOWLIST:
+        if name not in _MODEL_PARAMETER_INPUT_ALLOWLIST:
             raise GoldenConfigurationError("MODEL_PARAMETER_DENIED")
-        if name in parsed:
+        if name in seen_names:
             raise GoldenConfigurationError("DUPLICATE_MODEL_PARAMETER")
+        seen_names.add(name)
         try:
             value = json.loads(raw_value)
         except json.JSONDecodeError:
@@ -757,6 +777,18 @@ def parse_model_parameters(values: Sequence[str]) -> tuple[ModelParameter, ...]:
             raise GoldenConfigurationError("INVALID_MODEL_PARAMETER")
         if isinstance(value, str) and (not value or len(value) > 128 or "\n" in value):
             raise GoldenConfigurationError("INVALID_MODEL_PARAMETER")
+        if name == _MODEL_REVISION_INPUT_NAME:
+            if (
+                not isinstance(value, str)
+                or any(
+                    unicodedata.category(char).startswith("C")
+                    for char in value
+                )
+                or not _is_safe_model_revision(value)
+            ):
+                raise GoldenConfigurationError("INVALID_MODEL_PARAMETER")
+            name = _MODEL_REVISION_DIGEST_NAME
+            value = f"sha256:{_fingerprint(value)}"
         parsed[name] = value
     try:
         return tuple(
