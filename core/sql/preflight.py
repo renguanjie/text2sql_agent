@@ -39,14 +39,14 @@ class MySQLExplainPreflight:
         """Return a fail-closed result from a MySQL EXPLAIN plan."""
         try:
             plan = self.client.explain_query(sql, self.timeout_ms)
+            if not plan:
+                return failed_preflight("数据库未返回查询计划")
+
+            estimated_rows = sum(max(0, int(row.get("rows") or 0)) for row in plan)
         except Exception:
             logger.exception("MySQL EXPLAIN 失败：query={}", sanitize_sql(sql))
             return failed_preflight("数据库预检失败")
 
-        if not plan:
-            return failed_preflight("数据库未返回查询计划")
-
-        estimated_rows = sum(max(0, int(row.get("rows") or 0)) for row in plan)
         if self.max_estimated_rows and estimated_rows > self.max_estimated_rows:
             return failed_preflight("预计扫描行数超过限制", estimated_rows)
 

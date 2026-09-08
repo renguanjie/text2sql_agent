@@ -103,3 +103,22 @@ def test_preflight_sums_only_nonnegative_estimated_rows_when_limit_disabled():
 
     assert result.valid
     assert result.estimated_rows == 12
+
+
+@pytest.mark.parametrize(
+    "plan",
+    ([{"rows": "not-a-number"}], [None]),
+    ids=["non_numeric_rows", "non_mapping_row"],
+)
+def test_preflight_masks_malformed_plan_rows(plan):
+    """Catches malformed MySQL plan rows escaping the fail-closed result contract."""
+    from core.sql.preflight import MySQLExplainPreflight
+
+    client = Mock()
+    client.explain_query.return_value = plan
+
+    result = MySQLExplainPreflight(client, timeout_ms=3000).check("SELECT 1")
+
+    assert not result.valid
+    assert result.issues[0].code == "EXPLAIN_FAILED"
+    assert result.issues[0].message == "数据库预检失败"
