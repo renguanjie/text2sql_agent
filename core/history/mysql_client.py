@@ -342,8 +342,9 @@ class MySQLClient:
                             execution_result: Optional[Any] = None,
                             session_id: Optional[str] = None,
                             generated_sql: Optional[str] = None,
-                            expected_user_query: Optional[str] = None,
-                            require_validation_success: bool = False) -> bool:
+                            require_validation_success: bool = False,
+                            *,
+                            expected_user_query: Optional[str] = None) -> bool:
         """
         更新 SQL 执行结果
 

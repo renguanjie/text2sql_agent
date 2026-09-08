@@ -415,6 +415,35 @@ def test_generator_discards_request_when_prepared_description_fails(monkeypatch)
     assert replay.executable is False
 
 
+def test_sync_generator_discards_request_when_generation_context_is_malformed(
+    monkeypatch,
+):
+    """A kwargs-building failure after issuance must not leave a live token."""
+    pipeline = _pipeline()
+    issued = []
+    prepare = pipeline.prepare_generation
+
+    def capture(question: str):
+        request = prepare(question)
+        issued.append(request)
+        return request
+
+    monkeypatch.setattr(pipeline, "prepare_generation", capture)
+    generator = _generator(pipeline=pipeline)
+    monkeypatch.setattr(generator, "_prepare_pipeline", lambda *_args: {})
+
+    with pytest.raises(KeyError, match="final_query"):
+        generator.generate_sql("订单金额", auto_save_history=False)
+
+    with pytest.raises(ValueError, match="invalid or expired"):
+        pipeline.describe_prepared(issued[0])
+    replay = pipeline.process_prepared(
+        issued[0], "SELECT SUM(amount) FROM orders"
+    )
+    assert replay.status == "error"
+    assert replay.executable is False
+
+
 @pytest.mark.asyncio
 async def test_async_generator_discards_prepared_request_on_generation_failure(
     monkeypatch,
@@ -445,6 +474,40 @@ async def test_async_generator_discards_prepared_request_on_generation_failure(
         issued[0], "SELECT SUM(amount) FROM orders"
     )
     assert result["status"] == "error"
+    assert replay.status == "error"
+    assert replay.executable is False
+
+
+@pytest.mark.asyncio
+async def test_async_generator_discards_request_when_generation_context_is_malformed(
+    monkeypatch,
+):
+    """Async kwargs-building failure must release its issued capability."""
+    pipeline = _pipeline()
+    issued = []
+    prepare = pipeline.prepare_generation
+
+    def capture(question: str):
+        request = prepare(question)
+        issued.append(request)
+        return request
+
+    monkeypatch.setattr(pipeline, "prepare_generation", capture)
+    generator = _generator(pipeline=pipeline)
+
+    async def malformed_context(*_args):
+        return {}
+
+    monkeypatch.setattr(generator, "_prepare_pipeline_async", malformed_context)
+
+    with pytest.raises(KeyError, match="final_query"):
+        await generator.generate_sql_async("订单金额", auto_save_history=False)
+
+    with pytest.raises(ValueError, match="invalid or expired"):
+        pipeline.describe_prepared(issued[0])
+    replay = pipeline.process_prepared(
+        issued[0], "SELECT SUM(amount) FROM orders"
+    )
     assert replay.status == "error"
     assert replay.executable is False
 

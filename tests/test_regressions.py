@@ -560,6 +560,31 @@ def test_guarded_history_update_binds_session_sql_and_validation_status():
     assert params["expected_user_query"] == "original question"
 
 
+def test_history_update_preserves_legacy_seven_positional_arguments():
+    """The old seventh positional bool must remain the validation-success flag."""
+    from core.history.mysql_client import MySQLClient
+
+    client = MySQLClient.__new__(MySQLClient)
+    client.execute_update = Mock(return_value=1)
+
+    updated = client.update_sql_execution(
+        7,
+        "success",
+        None,
+        None,
+        "session-a",
+        "SELECT 1",
+        True,
+    )
+
+    query, params = client.execute_update.call_args.args
+    normalized_query = " ".join(query.split())
+    assert updated is True
+    assert "validation_status = 'success'" in normalized_query
+    assert "user_query = :expected_user_query" not in normalized_query
+    assert "expected_user_query" not in params
+
+
 def test_read_query_constraint_adds_limit_and_mysql_timeout_hint():
     from core.sql.validator import constrain_read_query
 

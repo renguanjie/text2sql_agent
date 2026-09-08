@@ -513,17 +513,17 @@ class SQLGenerator:
             governance_error['user_query'] = user_query
             return governance_error
 
-        # 7. 生成 SQL
-        generation_kwargs = dict(
-            user_query=ctx['final_query'],
-            schema_info=ctx['schema_info'],
-            knowledge_results=ctx['knowledge_results'],
-            session_id=session_id,
-            few_shot_examples=ctx['few_shot_examples']
-        )
-        if self.correctness_pipeline is not None:
-            generation_kwargs['semantic_context'] = semantic_context
         try:
+            # 7. 生成 SQL
+            generation_kwargs = dict(
+                user_query=ctx['final_query'],
+                schema_info=ctx['schema_info'],
+                knowledge_results=ctx['knowledge_results'],
+                session_id=session_id,
+                few_shot_examples=ctx['few_shot_examples']
+            )
+            if self.correctness_pipeline is not None:
+                generation_kwargs['semantic_context'] = semantic_context
             result = self.sql_chain.generate(**generation_kwargs)
             self._attach_execution_scope(result, ctx)
             if self.correctness_pipeline is not None:
@@ -574,17 +574,17 @@ class SQLGenerator:
             governance_error['user_query'] = user_query
             return governance_error
 
-        # 7. 异步生成 SQL
-        generation_kwargs = dict(
-            user_query=ctx['final_query'],
-            schema_info=ctx['schema_info'],
-            knowledge_results=ctx['knowledge_results'],
-            session_id=session_id,
-            few_shot_examples=ctx['few_shot_examples']
-        )
-        if self.correctness_pipeline is not None:
-            generation_kwargs['semantic_context'] = semantic_context
         try:
+            # 7. 异步生成 SQL
+            generation_kwargs = dict(
+                user_query=ctx['final_query'],
+                schema_info=ctx['schema_info'],
+                knowledge_results=ctx['knowledge_results'],
+                session_id=session_id,
+                few_shot_examples=ctx['few_shot_examples']
+            )
+            if self.correctness_pipeline is not None:
+                generation_kwargs['semantic_context'] = semantic_context
             result = await self.sql_chain.generate_async(**generation_kwargs)
             self._attach_execution_scope(result, ctx)
             if self.correctness_pipeline is not None:
