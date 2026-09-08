@@ -1036,6 +1036,10 @@ def test_model_parameter_direct_construction_uses_the_same_safe_specs():
         "1.2.3",
         "1.2.3-rc.1+cpu",
         "1.2.3+build.01",
+        "1.2.3-dev.snapshot+linux.amd64",
+        "1.2.3+cu121",
+        "1.2.3+build.20260909",
+        "1.2.3+nightly",
         "abcdef1234567890abcdef1234567890abcdef12",
     ],
 )
@@ -1043,6 +1047,41 @@ def test_model_revision_accepts_only_narrow_nonsecret_identifiers(revision):
     assert parse_model_parameters([f"model_revision={revision}"]) == (
         ModelParameter(name="model_revision", value=revision),
     )
+
+
+def test_model_revision_entropy_guard_applies_at_24_character_metadata_boundary():
+    """Break caught: treating the maximum metadata length as sufficient safety."""
+    opaque_metadata = "aB1cD2eF.gH3iJ4kL.mN5oP6"
+    descriptive_metadata = "build.release.candidate1"
+    assert len(opaque_metadata) == len(descriptive_metadata) == 24
+
+    with pytest.raises(GoldenConfigurationError) as caught:
+        parse_model_parameters([f"model_revision=1.2.3+{opaque_metadata}"])
+
+    assert caught.value.code == "INVALID_MODEL_PARAMETER"
+    assert parse_model_parameters(
+        [f"model_revision=1.2.3+{descriptive_metadata}"]
+    ) == (
+        ModelParameter(
+            name="model_revision",
+            value=f"1.2.3+{descriptive_metadata}",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "aB1cD2eF.aaaaaaaaaaaaaaa",
+        "aB1.cD2.eF3.gH4.iJ5.kL6",
+    ],
+)
+def test_model_revision_checks_each_segment_and_joined_metadata_for_opacity(metadata):
+    """Break caught: splitting or padding an opaque token to evade one check level."""
+    with pytest.raises(GoldenConfigurationError) as caught:
+        parse_model_parameters([f"model_revision=1.2.3+{metadata}"])
+
+    assert caught.value.code == "INVALID_MODEL_PARAMETER"
 
 
 def test_report_serializes_parameter_summary_as_a_sorted_mapping(snapshot: SemanticSnapshot):
@@ -1673,7 +1712,7 @@ def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
             str(compiled),
         ]
     )
-    opaque_revision = "1.2.3+k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3"
+    opaque_revision = "1.2.3+aB1cD2eF.gH3iJ4kL.mN5oP6"
     invalid_revision = main(
         [
             "--cases",
@@ -1692,12 +1731,33 @@ def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
             str(compiled),
         ]
     )
+    missing_output = tmp_path / "missing-report.json"
+    invalid_revision_without_existing_output = main(
+        [
+            "--cases",
+            str(suite_path),
+            "--results",
+            str(result_path),
+            "--output",
+            str(missing_output),
+            "--model",
+            "local-demo",
+            "--model-param",
+            f"model_revision={opaque_revision}",
+            "--semantic-version",
+            "1.0.0",
+            "--compiled-root",
+            str(compiled),
+        ]
+    )
     console = capsys.readouterr()
 
     assert failed == 1
     assert malformed == 2
     assert invalid_revision == 2
+    assert invalid_revision_without_existing_output == 2
     assert output.read_bytes() == original_report
+    assert not missing_output.exists()
     assert json.loads(original_report)["failed"] == 1
     assert opaque_revision not in console.out + console.err
     assert opaque_revision.encode() not in original_report

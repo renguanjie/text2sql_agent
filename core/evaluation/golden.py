@@ -130,6 +130,38 @@ _CREDENTIAL_VALUE = re.compile(
 _Scalar = StrictBool | StrictInt | StrictFloat | StrictStr
 
 
+def _looks_like_opaque_revision_token(value: str) -> bool:
+    token = "".join(char for char in value if char.isalnum())
+    if len(token) < 8:
+        return False
+
+    counts = Counter(token)
+    entropy = -sum(
+        (count / len(token)) * math.log2(count / len(token))
+        for count in counts.values()
+    )
+    unique_ratio = len(counts) / len(token)
+
+    def character_class(char: str) -> str:
+        if char.islower():
+            return "lower"
+        if char.isupper():
+            return "upper"
+        return "digit"
+
+    classes = tuple(character_class(char) for char in token)
+    transitions = sum(left != right for left, right in zip(classes, classes[1:]))
+    mixed_opaque = (
+        entropy >= 2.75
+        and unique_ratio >= 0.75
+        and transitions >= max(3, len(token) // 3)
+    )
+    dense_opaque = (
+        len(token) >= 12 and entropy >= 3.5 and unique_ratio >= 0.85
+    )
+    return mixed_opaque or dense_opaque
+
+
 def _is_safe_model_revision(value: str) -> bool:
     if (
         len(value) > _MODEL_REVISION_MAX_LENGTH
@@ -155,8 +187,12 @@ def _is_safe_model_revision(value: str) -> bool:
             len(identifier) > _MODEL_REVISION_IDENTIFIER_MAX_LENGTH
             or _SENSITIVE_PARAMETER_TEXT.search(identifier)
             or _CREDENTIAL_VALUE.search(identifier)
+            or _looks_like_opaque_revision_token(identifier)
             for identifier in metadata
         ):
+            return False
+        compact_metadata = "".join(metadata)
+        if _looks_like_opaque_revision_token(compact_metadata):
             return False
         if prerelease is not None and any(
             len(identifier) > 1 and identifier.startswith("0")
