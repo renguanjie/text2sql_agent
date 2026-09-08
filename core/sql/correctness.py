@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Literal
-from uuid import uuid4
-
-from loguru import logger
 
 from ..semantic.context import SemanticContextBuilder
 from ..semantic.models import (
@@ -18,6 +15,7 @@ from ..semantic.models import (
 )
 from ..semantic.registry import SemanticRegistry
 from ..semantic.validator import SemanticSQLValidator
+from ..utils.log_sanitizer import log_safe_exception
 from .preflight import MySQLExplainPreflight
 from .validator import validate_query_scope, validate_sql
 
@@ -297,8 +295,12 @@ class CorrectnessPipeline:
 
         scope = validate_query_scope(
             sql,
+            # Per the public plan contract, () means "not supplied": tables
+            # therefore default to the pinned snapshot rather than deny-all.
             allowed_tables=list(allowed_tables)
             or [entity.name for entity in snapshot.entities],
+            # Passing an explicit empty list means qualified schemas are denied;
+            # callers must name every schema they intend to permit.
             allowed_schemas=list(allowed_schemas),
             blocked_tables=list(self.blocked_tables),
             dialect=snapshot.dialect,
@@ -477,12 +479,7 @@ class CorrectnessPipeline:
 
     @staticmethod
     def _log_internal_failure(stage: str, exc: Exception) -> None:
-        logger.error(
-            "SQL correctness internal failure: error_id={} stage={} exception_type={}",
-            uuid4().hex,
-            stage,
-            type(exc).__name__,
-        )
+        log_safe_exception(stage, exc)
 
 
 __all__ = ["CorrectnessPipeline"]

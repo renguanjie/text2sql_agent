@@ -8,6 +8,8 @@ from sqlfluff.core import Linter
 from sqlfluff.core.errors import SQLParseError
 from loguru import logger
 
+from ..utils.log_sanitizer import log_safe_exception
+
 
 SYSTEM_SCHEMAS = {"information_schema", "mysql", "performance_schema", "sys", "pg_catalog"}
 DEFAULT_BLOCKED_TABLES = {
@@ -19,25 +21,30 @@ def validate_query_scope(sql: str, allowed_tables: Optional[List[str]] = None,
                          allowed_schemas: Optional[List[str]] = None,
                          blocked_tables: Optional[List[str]] = None,
                          dialect: str = "mysql") -> Dict[str, Any]:
-    """使用 AST 校验查询引用的库表，正确忽略 CTE 别名。"""
+    """使用 AST 校验查询引用的库表，正确忽略 CTE 别名。
+
+    ``allowed_schemas=None`` preserves the legacy unrestricted API, while an
+    explicit empty list denies every schema-qualified table. Caller-provided
+    blocked tables always extend the built-in internal-table blacklist.
+    """
     try:
         import sqlglot
         from sqlglot import exp
 
         statement = sqlglot.parse_one(sql, read=dialect)
     except Exception as exc:
-        return {'valid': False, 'errors': [f'SQL 无法解析：{exc}'], 'tables': []}
+        log_safe_exception("query_scope_parse", exc, sql=sql, level="warning")
+        return {'valid': False, 'errors': ['SQL 无法解析'], 'tables': []}
 
     cte_names = {cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)}
     allowed_table_set = {
         str(name).lower().split('.')[-1] for name in (allowed_tables or []) if name
     }
     allowed_schema_set = {str(name).lower() for name in (allowed_schemas or []) if name}
-    blocked_table_set = {
-        str(name).lower() for name in (
-            DEFAULT_BLOCKED_TABLES if blocked_tables is None else blocked_tables
-        ) if name
-    }
+    blocked_table_set = {name.lower() for name in DEFAULT_BLOCKED_TABLES}
+    blocked_table_set.update(
+        str(name).lower() for name in (blocked_tables or []) if name
+    )
     errors = []
     tables = []
 
@@ -52,7 +59,11 @@ def validate_query_scope(sql: str, allowed_tables: Optional[List[str]] = None,
             errors.append(f"禁止访问内部表：{qualified_name}")
         if schema_name in SYSTEM_SCHEMAS:
             errors.append(f"禁止访问系统 Schema：{schema_name}")
-        elif schema_name and allowed_schema_set and schema_name not in allowed_schema_set:
+        elif (
+            schema_name
+            and allowed_schemas is not None
+            and schema_name not in allowed_schema_set
+        ):
             errors.append(f"Schema 不在允许范围内：{schema_name}")
         if allowed_tables is not None and table_name not in allowed_table_set:
             errors.append(f"表不在允许范围内：{qualified_name}")
@@ -90,7 +101,7 @@ def is_safe_read_query(sql: str, dialect: str = "mysql") -> bool:
 
         statements = [statement for statement in sqlglot.parse(sql, read=dialect) if statement is not None]
     except Exception as exc:
-        logger.warning(f"SQL 安全解析失败，拒绝执行：{exc}")
+        log_safe_exception("read_only_parse", exc, sql=sql, level="warning")
         return False
 
     if len(statements) != 1:
@@ -187,18 +198,18 @@ class SQLValidator:
                 'raw_violations': result
             }
 
-        except SQLParseError as e:
-            logger.error(f"SQL 解析错误：{e}")
+        except SQLParseError as exc:
+            log_safe_exception("sqlfluff_parse", exc, sql=sql)
             return {
                 'valid': False,
-                'errors': [f'解析错误：{str(e)}'],
+                'errors': ['SQL 解析失败'],
                 'warnings': []
             }
-        except Exception as e:
-            logger.error(f"SQL 校验失败：{e}")
+        except Exception as exc:
+            log_safe_exception("sqlfluff_validate", exc, sql=sql)
             return {
                 'valid': False,
-                'errors': [f'校验失败：{str(e)}'],
+                'errors': ['SQL 校验失败'],
                 'warnings': []
             }
 
@@ -219,19 +230,27 @@ class SQLValidator:
                 'error': 'SQL 语句为空'
             }
 
+        formatter = getattr(sqlfluff, "format", None)
+        if not callable(formatter):
+            return {
+                'formatted_sql': sql,
+                'success': False,
+                'error': '当前 SQLFluff 版本不支持格式化'
+            }
+
         try:
-            formatted = sqlfluff.format(sql, dialect=self.dialect)
+            formatted = formatter(sql, dialect=self.dialect)
             return {
                 'formatted_sql': formatted,
                 'success': True,
                 'error': None
             }
-        except Exception as e:
-            logger.error(f"SQL 格式化失败：{e}")
+        except Exception as exc:
+            log_safe_exception("sqlfluff_format", exc, sql=sql, level="warning")
             return {
                 'formatted_sql': sql,  # 返回原 SQL
                 'success': False,
-                'error': str(e)
+                'error': 'SQL 格式化失败'
             }
 
     def fix(self, sql: str) -> Dict[str, Any]:
@@ -259,12 +278,12 @@ class SQLValidator:
                 'success': True,
                 'errors': []
             }
-        except Exception as e:
-            logger.error(f"SQL 自动修复失败：{e}")
+        except Exception as exc:
+            log_safe_exception("sqlfluff_fix", exc, sql=sql)
             return {
                 'fixed_sql': sql,  # 返回原 SQL
                 'success': False,
-                'errors': [str(e)]
+                'errors': ['SQL 自动修复失败']
             }
 
     def parse(self, sql: str) -> Dict[str, Any]:

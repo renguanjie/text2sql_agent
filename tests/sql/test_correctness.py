@@ -464,3 +464,80 @@ async def test_async_repair_awaits_once_and_revalidates(pipeline):
     assert result.repair_attempts == 1
     assert result.executable is True
     assert calls == ["SELECT COUNT(*) FROM orders"]
+
+
+def test_process_empty_scope_tuples_use_snapshot_tables_but_no_qualified_schema(
+    pipeline,
+):
+    """Catches empty public defaults becoming deny-all tables or allow-all schemas."""
+    unqualified = pipeline.process("查询订单", "SELECT id FROM orders")
+    qualified = pipeline.process("查询订单", "SELECT id FROM private.orders")
+
+    assert unqualified.status == "success"
+    assert qualified.status == "rejected"
+    assert qualified.validation.issues[0].code == "QUERY_SCOPE_DENIED"
+
+
+@pytest.mark.asyncio
+async def test_async_custom_blocklist_does_not_disable_builtin_blocked_tables():
+    """Catches custom blocked tables replacing the immutable internal blacklist."""
+    from core.sql.correctness import CorrectnessPipeline
+
+    internal = SemanticEntity(
+        name="sql_generation_history",
+        name_cn="内部历史",
+        fields=(
+            SemanticField(
+                name="id",
+                name_cn="编号",
+                data_type="bigint",
+                role="identifier",
+            ),
+        ),
+    )
+    base_snapshot = _snapshot()
+    snapshot = base_snapshot.model_copy(
+        update={"entities": (*base_snapshot.entities, internal)}
+    )
+    pipeline = CorrectnessPipeline(
+        registry=MutableRegistry(snapshot),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+        blocked_tables=("audit_log",),
+    )
+
+    result = await pipeline.process_async(
+        "查询内部历史", "SELECT id FROM sql_generation_history"
+    )
+
+    assert result.status == "rejected"
+    assert result.validation.issues[0].code == "QUERY_SCOPE_DENIED"
+
+
+def test_authorize_execution_requires_explicit_permission_for_qualified_schema(
+    registry: MutableRegistry,
+):
+    """Catches execution authorization accepting arbitrary qualified schemas."""
+    from core.sql.correctness import CorrectnessPipeline
+
+    pipeline = CorrectnessPipeline(
+        registry=registry,
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+    )
+
+    denied = pipeline.authorize_execution(
+        question="查询订单",
+        sql="SELECT id FROM private.orders",
+        expected_semantic_version="1.0.0",
+    )
+    allowed = pipeline.authorize_execution(
+        question="查询订单",
+        sql="SELECT id FROM private.orders",
+        expected_semantic_version="1.0.0",
+        allowed_schemas=("private",),
+    )
+
+    assert denied.status == "rejected"
+    assert denied.validation.issues[0].code == "QUERY_SCOPE_DENIED"
+    assert allowed.status == "success"

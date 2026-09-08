@@ -1,11 +1,24 @@
 """已修复逻辑缺陷的回归测试。"""
 from contextlib import contextmanager
+import logging
+import re
 import subprocess
 import sys
 from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
+from loguru import logger
+
+
+@contextmanager
+def capture_loguru(caplog):
+    caplog.set_level(logging.DEBUG)
+    sink_id = logger.add(caplog.handler, format="{message}", level="DEBUG")
+    try:
+        yield
+    finally:
+        logger.remove(sink_id)
 
 
 def test_dialect_keyword_returns_database_id():
@@ -251,6 +264,184 @@ def test_query_scope_rejects_cross_schema_blocked_and_unknown_tables():
         allowed_tables=["sql_generation_history"],
         blocked_tables=["sql_generation_history"],
     )["valid"]
+
+
+def test_query_scope_distinguishes_unspecified_and_explicit_empty_schema_lists():
+    """Catches an explicit no-schema boundary being treated as unrestricted."""
+    from core.sql.validator import validate_query_scope
+
+    assert validate_query_scope(
+        "SELECT id FROM private.orders",
+        allowed_tables=["orders"],
+        allowed_schemas=None,
+    )["valid"]
+    assert not validate_query_scope(
+        "SELECT id FROM private.orders",
+        allowed_tables=["orders"],
+        allowed_schemas=[],
+    )["valid"]
+    assert validate_query_scope(
+        "SELECT id FROM private.orders",
+        allowed_tables=["orders"],
+        allowed_schemas=["private"],
+    )["valid"]
+
+
+def test_query_scope_custom_blocklist_preserves_builtin_internal_tables():
+    """Catches caller-specific blocks replacing the built-in safety blacklist."""
+    from core.sql.validator import validate_query_scope
+
+    result = validate_query_scope(
+        "SELECT id FROM sql_generation_history",
+        allowed_tables=["sql_generation_history"],
+        blocked_tables=["audit_log"],
+    )
+    custom = validate_query_scope(
+        "SELECT id FROM audit_log",
+        allowed_tables=["audit_log"],
+        blocked_tables=["audit_log"],
+    )
+
+    assert not result["valid"]
+    assert not custom["valid"]
+
+
+def test_sql_validation_exception_log_is_structured_and_sanitized(
+    monkeypatch, caplog
+):
+    """Catches SQLFluff exception text leaking through validator logs or results."""
+    import core.sql.validator as validator_module
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("password=secret SQL SELECT hidden database=private")
+
+    monkeypatch.setattr(validator_module.sqlfluff, "lint", explode)
+    validator = validator_module.SQLValidator(dialect="mysql")
+
+    with capture_loguru(caplog):
+        result = validator.validate("SELECT visible FROM orders")
+
+    assert result["errors"] == ["SQL 校验失败"]
+    assert "secret" not in caplog.text
+    assert "hidden" not in caplog.text
+    assert "private" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "stage=sqlfluff_validate" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
+
+
+def test_missing_optional_sqlfluff_formatter_does_not_emit_error_log(
+    monkeypatch, caplog
+):
+    """Catches optional formatting support generating false validation errors."""
+    import core.sql.validator as validator_module
+
+    monkeypatch.delattr(validator_module.sqlfluff, "format", raising=False)
+
+    with capture_loguru(caplog):
+        result = validator_module.validate_sql("SELECT id FROM orders")
+
+    assert result["valid"]
+    assert result["formatted_sql"] == "SELECT id FROM orders"
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_sql_format_exception_is_warning_only_and_does_not_leak(
+    monkeypatch, caplog
+):
+    """Catches formatting failures being logged as SQL validation errors."""
+    import core.sql.validator as validator_module
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("password=secret SQL SELECT hidden database=private")
+
+    monkeypatch.setattr(validator_module.sqlfluff, "format", explode, raising=False)
+    validator = validator_module.SQLValidator(dialect="mysql")
+
+    with capture_loguru(caplog):
+        result = validator.format("SELECT visible FROM orders")
+
+    assert not result["success"]
+    assert result["error"] == "SQL 格式化失败"
+    assert "secret" not in caplog.text
+    assert "hidden" not in caplog.text
+    assert "private" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "stage=sqlfluff_format" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_scope_parse_exception_result_and_log_do_not_leak(
+    monkeypatch, caplog
+):
+    """Catches parser exception text escaping through scope results or logs."""
+    import sqlglot
+
+    from core.sql.validator import validate_query_scope
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("password=secret SQL SELECT hidden database=private")
+
+    monkeypatch.setattr(sqlglot, "parse_one", explode)
+
+    with capture_loguru(caplog):
+        result = validate_query_scope("SELECT visible FROM orders")
+
+    assert result["errors"] == ["SQL 无法解析"]
+    assert "secret" not in caplog.text
+    assert "hidden" not in caplog.text
+    assert "private" not in caplog.text
+    assert "stage=query_scope_parse" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
+
+
+def test_read_only_parse_exception_log_does_not_leak(monkeypatch, caplog):
+    """Catches parser exception text leaking from the read-only safety guard."""
+    import sqlglot
+
+    from core.sql.validator import is_safe_read_query
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("password=secret SQL SELECT hidden database=private")
+
+    monkeypatch.setattr(sqlglot, "parse", explode)
+
+    with capture_loguru(caplog):
+        result = is_safe_read_query("SELECT visible FROM orders")
+
+    assert result is False
+    assert "secret" not in caplog.text
+    assert "hidden" not in caplog.text
+    assert "private" not in caplog.text
+    assert "stage=read_only_parse" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
+
+
+def test_sql_fix_exception_result_and_log_do_not_leak(monkeypatch, caplog):
+    """Catches SQLFluff fix exception text leaking through results or logs."""
+    import core.sql.validator as validator_module
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("password=secret SQL SELECT hidden database=private")
+
+    monkeypatch.setattr(validator_module.sqlfluff, "fix", explode)
+    validator = validator_module.SQLValidator(dialect="mysql")
+
+    with capture_loguru(caplog):
+        result = validator.fix("SELECT visible FROM orders")
+
+    assert result["errors"] == ["SQL 自动修复失败"]
+    assert "secret" not in caplog.text
+    assert "hidden" not in caplog.text
+    assert "private" not in caplog.text
+    assert "stage=sqlfluff_fix" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
 
 
 def test_read_query_constraint_adds_limit_and_mysql_timeout_hint():

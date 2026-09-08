@@ -3,6 +3,10 @@
 提供统一的日志脱敏函数，防止敏感信息泄露
 """
 import hashlib
+from typing import Literal
+from uuid import uuid4
+
+from loguru import logger
 
 
 def truncate_log(text: str, max_length: int = 100, suffix: str = "...") -> str:
@@ -84,6 +88,25 @@ def sanitize_query(query: str, max_length: int = 60) -> str:
 def text_fingerprint(text: str) -> str:
     """返回不可逆短摘要，用于关联日志而不记录原始用户内容。"""
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+
+
+def log_safe_exception(
+    stage: str,
+    exc: Exception,
+    *,
+    sql: str | None = None,
+    level: Literal["error", "warning"] = "error",
+) -> str:
+    """Log exception metadata without traceback, exception text, or raw SQL."""
+    error_id = uuid4().hex
+    message = "operation_failure error_id={} stage={} exception_type={}"
+    args = [error_id, stage, type(exc).__name__]
+    if isinstance(sql, str):
+        message += " sql_id={}"
+        args.append(text_fingerprint(sql))
+    log = logger.warning if level == "warning" else logger.error
+    log(message, *args)
+    return error_id
 
 
 def mask_sensitive(text: str, pattern: str = r'(password|api_key|token|secret)\s*[=:]\s*\S+',

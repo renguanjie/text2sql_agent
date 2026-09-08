@@ -1,7 +1,20 @@
 from contextlib import contextmanager
+import logging
+import re
 from unittest.mock import Mock
 
 import pytest
+from loguru import logger
+
+
+@contextmanager
+def capture_loguru(caplog):
+    caplog.set_level(logging.DEBUG)
+    sink_id = logger.add(caplog.handler, format="{message}", level="DEBUG")
+    try:
+        yield
+    finally:
+        logger.remove(sink_id)
 
 
 def test_mysql_explain_emits_hinted_select_without_session_mutation_or_limit():
@@ -122,3 +135,27 @@ def test_preflight_masks_malformed_plan_rows(plan):
     assert not result.valid
     assert result.issues[0].code == "EXPLAIN_FAILED"
     assert result.issues[0].message == "数据库预检失败"
+
+
+def test_preflight_exception_log_contains_metadata_without_sensitive_text(caplog):
+    """Catches database exception text or traceback leaking from preflight logs."""
+    from core.sql.preflight import MySQLExplainPreflight
+
+    client = Mock()
+    client.explain_query.side_effect = RuntimeError(
+        "password=secret SQL SELECT hidden database=private"
+    )
+
+    with capture_loguru(caplog):
+        result = MySQLExplainPreflight(client, timeout_ms=3000).check(
+            "SELECT visible FROM orders"
+        )
+
+    assert not result.valid
+    assert "secret" not in caplog.text
+    assert "hidden" not in caplog.text
+    assert "private" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "stage=mysql_explain" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
