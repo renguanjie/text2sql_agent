@@ -365,6 +365,90 @@ async def test_generator_correctness_error_has_stable_top_level_fallback(use_asy
     assert "secret" not in str(result)
 
 
+def test_sync_generator_discards_prepared_request_when_chain_raises(monkeypatch):
+    """An exception before correctness processing must not leave a live token."""
+    pipeline = _pipeline()
+    issued = []
+    prepare = pipeline.prepare_generation
+
+    def capture(question: str):
+        request = prepare(question)
+        issued.append(request)
+        return request
+
+    monkeypatch.setattr(pipeline, "prepare_generation", capture)
+    generator = _generator(pipeline=pipeline)
+    generator.sql_chain.generate.side_effect = RuntimeError("LLM unavailable")
+
+    with pytest.raises(RuntimeError, match="LLM unavailable"):
+        generator.generate_sql("订单金额", auto_save_history=False)
+
+    replay = pipeline.process_prepared(
+        issued[0], "SELECT SUM(amount) FROM orders"
+    )
+    assert replay.status == "error"
+    assert replay.executable is False
+
+
+def test_generator_discards_request_when_prepared_description_fails(monkeypatch):
+    """Failure between issuance and return must release the server-side state."""
+    pipeline = _pipeline()
+    issued = []
+
+    def fail_description(request):
+        issued.append(request)
+        raise RuntimeError("description unavailable")
+
+    monkeypatch.setattr(pipeline, "describe_prepared", fail_description)
+    generator = _generator(pipeline=pipeline)
+
+    result = generator.generate_sql("订单金额", auto_save_history=False)
+    replay = pipeline.process_prepared(
+        issued[0], "SELECT SUM(amount) FROM orders"
+    )
+
+    assert result["status"] == "error"
+    assert result["validation"]["issues"][0]["code"] == (
+        "CORRECTNESS_UNAVAILABLE"
+    )
+    assert replay.status == "error"
+    assert replay.executable is False
+
+
+@pytest.mark.asyncio
+async def test_async_generator_discards_prepared_request_on_generation_failure(
+    monkeypatch,
+):
+    """A non-candidate async result must release its unused prepared token."""
+    pipeline = _pipeline()
+    issued = []
+    prepare = pipeline.prepare_generation
+
+    def capture(question: str):
+        request = prepare(question)
+        issued.append(request)
+        return request
+
+    monkeypatch.setattr(pipeline, "prepare_generation", capture)
+    generator = _generator(pipeline=pipeline)
+    generator.sql_chain.generate_async.return_value = {
+        "status": "error",
+        "sql": None,
+        "error": "generation unavailable",
+    }
+
+    result = await generator.generate_sql_async(
+        "订单金额", auto_save_history=False
+    )
+
+    replay = pipeline.process_prepared(
+        issued[0], "SELECT SUM(amount) FROM orders"
+    )
+    assert result["status"] == "error"
+    assert replay.status == "error"
+    assert replay.executable is False
+
+
 def test_generator_delegates_one_governed_repair_to_task_7_api():
     """Catches generator-local repair loops or use of the legacy raw-error repair API."""
     generator = _generator(
@@ -416,8 +500,7 @@ def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:
     ("execute_overrides", "record_overrides"),
     [
         ({"session_id": "session-b"}, {}),
-        ({"sql": "SELECT amount FROM orders"}, {}),
-        ({"sql": "SELECT SUM(amount) FROM orders; SELECT 1"}, {}),
+        ({"sql": "SELECT SUM(amount) AS total FROM orders"}, {}),
         ({"user_query": "查询订单号"}, {}),
         ({"semantic_version": "9.9.9"}, {}),
         (
@@ -432,7 +515,6 @@ def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:
     ids=[
         "cross_session",
         "sql_mismatch",
-        "multi_statement_sql_mismatch",
         "question_mismatch",
         "semantic_version_mismatch",
         "rejected_history_with_legal_sql",
@@ -465,6 +547,8 @@ def test_governed_execute_rejects_unbound_history_without_mutating_it(
         "semantic_version": generated["semantic_version"],
     }
     arguments.update(execute_overrides)
+    if execute_overrides.get("semantic_version") == "9.9.9":
+        generator.correctness_pipeline.registry.snapshot = _snapshot("9.9.9")
     result = generator.execute_sql(**arguments)
 
     assert result["status"] == "error"
@@ -505,10 +589,73 @@ def test_governed_success_updates_and_promotes_only_the_bound_history():
     update = mysql.update_sql_execution.call_args.kwargs
     assert update["session_id"] == "session-a"
     assert update["generated_sql"] == generated["sql"]
+    assert update["expected_user_query"] == "订单金额"
     assert update["require_validation_success"] is True
     generator.knowledge_retriever.add_history_record.assert_called_once_with(
         mysql.get_history_detail.return_value
     )
+
+
+def test_history_question_changed_after_read_cannot_be_updated_or_promoted():
+    """The conditional write must fail if user_query changes after the read."""
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    )
+    generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    mysql.reset_mock()
+    mysql.get_history_detail.return_value = _successful_history(sql=generated["sql"])
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+    # Simulates a row whose user_query changed after get_history_detail().
+    mysql.update_sql_execution.return_value = False
+
+    result = generator.execute_sql(
+        generated["sql"],
+        history_id=generated["history_id"],
+        session_id="session-a",
+        allowed_tables=generated["allowed_tables"],
+        allowed_schemas=generated["allowed_schemas"],
+        user_query=generated["user_query"],
+        semantic_version=generated["semantic_version"],
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "执行记录状态更新失败",
+        "data": None,
+    }
+    update = mysql.update_sql_execution.call_args.kwargs
+    assert update["expected_user_query"] == "订单金额"
+    generator.knowledge_retriever.add_history_record.assert_not_called()
+
+
+def test_restarted_generator_fails_closed_for_old_governed_history_id():
+    """A process-local semantic binding cannot be inferred from legacy columns."""
+    mysql = Mock()
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    )
+    restarted = _generator(pipeline=_pipeline(), mysql_client=mysql)
+
+    result = restarted.execute_sql(
+        "SELECT SUM(amount) FROM orders",
+        history_id=17,
+        session_id="session-a",
+        allowed_tables=["orders"],
+        allowed_schemas=[],
+        user_query="订单金额",
+        semantic_version="1.0.0",
+    )
+
+    assert result["status"] == "error"
+    assert result["validation"]["issues"][0]["code"] == (
+        "HISTORY_CONTEXT_MISMATCH"
+    )
+    mysql.execute_query_limited.assert_not_called()
+    mysql.update_sql_execution.assert_not_called()
+    restarted.knowledge_retriever.add_history_record.assert_not_called()
 
 
 def test_disabled_governance_preserves_legacy_result_shape_and_chain_call():
@@ -586,6 +733,101 @@ def test_execute_reauthorizes_before_applying_row_and_timeout_constraints(monkey
         allowed_tables=("orders",),
         allowed_schemas=(),
     )
+
+
+def test_governed_execute_authorizes_before_history_read_and_database_execute(
+    monkeypatch,
+):
+    """No history or business database access may precede authorization."""
+    events: list[str] = []
+    pipeline = _pipeline()
+    authorize = pipeline.authorize_execution
+
+    def observed_authorize(**kwargs):
+        events.append("authorize")
+        return authorize(**kwargs)
+
+    monkeypatch.setattr(pipeline, "authorize_execution", observed_authorize)
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    mysql.reset_mock()
+
+    def read_history(_history_id: int):
+        events.append("history-read")
+        return _successful_history(sql=generated["sql"])
+
+    mysql.get_history_detail.side_effect = read_history
+    mysql.update_sql_execution.return_value = True
+    mysql.execute_query_limited.side_effect = lambda *_args, **_kwargs: (
+        events.append("execute") or ([{"total": 10}], False)
+    )
+
+    result = generator.execute_sql(
+        generated["sql"],
+        history_id=generated["history_id"],
+        session_id="session-a",
+        allowed_tables=generated["allowed_tables"],
+        allowed_schemas=generated["allowed_schemas"],
+        user_query=generated["user_query"],
+        semantic_version=generated["semantic_version"],
+    )
+
+    assert result["status"] == "success"
+    assert events[:3] == ["authorize", "history-read", "execute"]
+
+
+def test_failed_authorization_never_reads_or_updates_history(monkeypatch):
+    """A correctness denial must return before touching the history database."""
+    events: list[str] = []
+    pipeline = _pipeline()
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    mysql.reset_mock()
+
+    def deny(**_kwargs):
+        events.append("authorize")
+        return CorrectnessResult(
+            status="rejected",
+            sql=generated["sql"],
+            semantic_version=generated["semantic_version"],
+            validation=ValidationReport(
+                valid=False,
+                issues=(
+                    ValidationIssue(
+                        code="POLICY_DENIED",
+                        message="查询不符合语义策略",
+                    ),
+                ),
+            ),
+            repair_attempts=0,
+            executable=False,
+        )
+
+    monkeypatch.setattr(pipeline, "authorize_execution", deny)
+    mysql.get_history_detail.side_effect = lambda _history_id: (
+        events.append("history-read")
+        or _successful_history(sql=generated["sql"])
+    )
+
+    result = generator.execute_sql(
+        generated["sql"],
+        history_id=generated["history_id"],
+        session_id="session-a",
+        allowed_tables=generated["allowed_tables"],
+        allowed_schemas=generated["allowed_schemas"],
+        user_query=generated["user_query"],
+        semantic_version=generated["semantic_version"],
+    )
+
+    assert result["status"] == "error"
+    assert events == ["authorize"]
+    mysql.get_history_detail.assert_not_called()
+    mysql.update_sql_execution.assert_not_called()
+    mysql.execute_query_limited.assert_not_called()
 
 
 def test_failed_reauthorization_returns_structured_issues_without_database_access():

@@ -342,6 +342,7 @@ class MySQLClient:
                             execution_result: Optional[Any] = None,
                             session_id: Optional[str] = None,
                             generated_sql: Optional[str] = None,
+                            expected_user_query: Optional[str] = None,
                             require_validation_success: bool = False) -> bool:
         """
         更新 SQL 执行结果
@@ -360,6 +361,8 @@ class MySQLClient:
             predicates.append("session_id = :session_id")
         if generated_sql is not None:
             predicates.append("generated_sql = :generated_sql")
+        if expected_user_query is not None:
+            predicates.append("user_query = :expected_user_query")
         if require_validation_success:
             predicates.append("validation_status = 'success'")
         where_clause = " AND ".join(predicates)
@@ -382,6 +385,8 @@ class MySQLClient:
             params["session_id"] = session_id
         if generated_sql is not None:
             params["generated_sql"] = generated_sql
+        if expected_user_query is not None:
+            params["expected_user_query"] = expected_user_query
         result = self.execute_update(query, params)
         return result > 0
 

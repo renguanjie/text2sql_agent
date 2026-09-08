@@ -196,7 +196,8 @@ def test_saved_history_uses_validation_state_not_extraction_state():
     generator.knowledge_retriever.add_history_record.assert_not_called()
 
 
-def test_successful_execution_promotes_history_to_few_shot():
+def test_legacy_execution_without_session_skips_untrusted_history_mutation(caplog):
+    """Legacy SQL still executes, but an unbound history id is read-only metadata."""
     mysql = Mock()
     mysql.execute_query_limited.return_value = ([{"id": 1}], False)
     mysql.get_table_schema.return_value = []
@@ -208,18 +209,17 @@ def test_successful_execution_promotes_history_to_few_shot():
         "validation_status": "success",
         "execution_status": "success",
     }
-    mysql.update_sql_execution.return_value = True
     generator = _make_generator(mysql)
 
-    result = generator.execute_sql(
-        "SELECT 1", history_id=7, session_id="session-a"
-    )
+    with capture_loguru(caplog):
+        result = generator.execute_sql("SELECT 1", history_id=7)
 
     assert result["status"] == "success"
-    mysql.update_sql_execution.assert_called_once()
-    generator.knowledge_retriever.add_history_record.assert_called_once_with(
-        mysql.get_history_detail.return_value
-    )
+    mysql.get_history_detail.assert_not_called()
+    mysql.update_sql_execution.assert_not_called()
+    generator.knowledge_retriever.add_history_record.assert_not_called()
+    assert "history_update_skipped reason=missing_session" in caplog.text
+    assert "history_id=7" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -498,6 +498,13 @@ def test_generator_factory_loads_only_fully_successful_history_for_few_shot():
             "validation_status": "fail",
             "execution_status": "success",
         },
+        {
+            "id": 9,
+            "user_query": "tampered after guarded read",
+            "generated_sql": "SELECT SUM(amount) FROM orders",
+            "validation_status": "success",
+            "execution_status": "pending",
+        },
     ]
 
     generator = create_sql_generator(
@@ -537,6 +544,7 @@ def test_guarded_history_update_binds_session_sql_and_validation_status():
         execution_status="success",
         session_id="session-a",
         generated_sql="SELECT 1",
+        expected_user_query="original question",
         require_validation_success=True,
     )
 
@@ -545,9 +553,11 @@ def test_guarded_history_update_binds_session_sql_and_validation_status():
     assert updated is True
     assert "session_id = :session_id" in normalized_query
     assert "generated_sql = :generated_sql" in normalized_query
+    assert "user_query = :expected_user_query" in normalized_query
     assert "validation_status = 'success'" in normalized_query
     assert params["session_id"] == "session-a"
     assert params["generated_sql"] == "SELECT 1"
+    assert params["expected_user_query"] == "original question"
 
 
 def test_read_query_constraint_adds_limit_and_mysql_timeout_hint():

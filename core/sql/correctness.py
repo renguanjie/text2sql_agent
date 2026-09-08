@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Literal
 
 from ..semantic.context import SemanticContextBuilder
@@ -38,16 +39,17 @@ _REPAIR_FAILED = ValidationIssue(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class CorrectnessRequest:
-    """Opaque, immutable semantic state pinned for one generation request."""
+class _CorrectnessRequest:
+    """One-shot identity token; authoritative state stays in its pipeline."""
 
-    semantic_context: str
-    semantic_version: str
-    semantic_content_sha256: str
-    _owner: object = field(repr=False, compare=False)
-    _question: str = field(repr=False, compare=False)
-    _snapshot: SemanticSnapshot = field(repr=False, compare=False)
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedState:
+    question: str = field(repr=False)
+    snapshot: SemanticSnapshot = field(repr=False)
+    semantic_context: str | None = field(repr=False)
 
 
 class CorrectnessPipeline:
@@ -70,19 +72,38 @@ class CorrectnessPipeline:
         self.preflight = preflight
         self.max_repair_attempts = max_repair_attempts
         self.blocked_tables = blocked_tables
-        self._request_owner = object()
+        self._prepared_requests: dict[_CorrectnessRequest, _PreparedState] = {}
+        self._prepared_lock = Lock()
 
-    def prepare_generation(self, question: str) -> CorrectnessRequest:
+    def prepare_generation(self, question: str) -> _CorrectnessRequest:
         """Pin and render the immutable snapshot used by one generation request."""
         snapshot = self.registry.get_snapshot()
         context = self.context_builder.build(question, snapshot)
-        return CorrectnessRequest(
+        return self._issue_request(
+            question,
+            snapshot,
             semantic_context=context.rendered,
-            semantic_version=snapshot.model_version,
-            semantic_content_sha256=snapshot.content_sha256,
-            _owner=self._request_owner,
-            _question=question,
-            _snapshot=snapshot,
+        )
+
+    def discard_prepared(self, request: Any) -> bool:
+        """Idempotently release an abandoned prepared generation request."""
+        if not isinstance(request, _CorrectnessRequest):
+            return False
+        with self._prepared_lock:
+            return self._prepared_requests.pop(request, None) is not None
+
+    def describe_prepared(self, request: Any) -> tuple[str, str, str]:
+        """Return non-authoritative prompt metadata for a live issued token."""
+        if not isinstance(request, _CorrectnessRequest):
+            raise ValueError("prepared correctness request is invalid or expired")
+        with self._prepared_lock:
+            state = self._prepared_requests.get(request)
+        if state is None:
+            raise ValueError("prepared correctness request is invalid or expired")
+        return (
+            state.semantic_context or "",
+            state.snapshot.model_version,
+            state.snapshot.content_sha256,
         )
 
     def process(
@@ -106,17 +127,18 @@ class CorrectnessPipeline:
 
     def process_prepared(
         self,
-        request: CorrectnessRequest,
+        request: _CorrectnessRequest,
         candidate_sql: str,
         repair: Callable[[str, list[dict], str], dict] | None = None,
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
         """Validate and repair using only a request's pinned immutable snapshot."""
-        if not self._owns_request(request):
+        state = self._consume_request(request)
+        if state is None:
             return self._error_result(candidate_sql, None, 0)
         initial = self._initial_validation(
-            request,
+            state,
             candidate_sql,
             allowed_tables,
             allowed_schemas,
@@ -129,7 +151,7 @@ class CorrectnessPipeline:
         if repair is None or self.max_repair_attempts == 0:
             return self._result(candidate_sql, snapshot, validation, 0)
 
-        context = self._build_repair_context(request, candidate_sql, validation)
+        context = self._build_repair_context(state, candidate_sql, validation)
         if isinstance(context, CorrectnessResult):
             return context
 
@@ -145,7 +167,7 @@ class CorrectnessPipeline:
                 candidate_sql, snapshot, validation, _REPAIR_FAILED
             )
         return self._complete_repair(
-            request._question,
+            state.question,
             candidate_sql,
             repair_result,
             snapshot,
@@ -175,17 +197,18 @@ class CorrectnessPipeline:
 
     async def process_async_prepared(
         self,
-        request: CorrectnessRequest,
+        request: _CorrectnessRequest,
         candidate_sql: str,
         repair: Callable[[str, list[dict], str], Awaitable[dict]] | None = None,
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
         """Async counterpart of :meth:`process_prepared`."""
-        if not self._owns_request(request):
+        state = self._consume_request(request)
+        if state is None:
             return self._error_result(candidate_sql, None, 0)
         initial = self._initial_validation(
-            request,
+            state,
             candidate_sql,
             allowed_tables,
             allowed_schemas,
@@ -198,7 +221,7 @@ class CorrectnessPipeline:
         if repair is None or self.max_repair_attempts == 0:
             return self._result(candidate_sql, snapshot, validation, 0)
 
-        context = self._build_repair_context(request, candidate_sql, validation)
+        context = self._build_repair_context(state, candidate_sql, validation)
         if isinstance(context, CorrectnessResult):
             return context
 
@@ -214,7 +237,7 @@ class CorrectnessPipeline:
                 candidate_sql, snapshot, validation, _REPAIR_FAILED
             )
         return self._complete_repair(
-            request._question,
+            state.question,
             candidate_sql,
             repair_result,
             snapshot,
@@ -266,38 +289,52 @@ class CorrectnessPipeline:
 
     def _pin_request(
         self, question: str
-    ) -> CorrectnessRequest | CorrectnessResult:
+    ) -> _CorrectnessRequest | CorrectnessResult:
         try:
             snapshot = self.registry.get_snapshot()
         except Exception as exc:
             self._log_internal_failure("snapshot", exc)
             return self._error_result("", None, 0)
-        return CorrectnessRequest(
-            semantic_context="",
-            semantic_version=snapshot.model_version,
-            semantic_content_sha256=snapshot.content_sha256,
-            _owner=self._request_owner,
-            _question=question,
-            _snapshot=snapshot,
+        return self._issue_request(
+            question,
+            snapshot,
+            semantic_context=None,
         )
 
-    def _owns_request(self, request: Any) -> bool:
-        return (
-            isinstance(request, CorrectnessRequest)
-            and request._owner is self._request_owner
+    def _issue_request(
+        self,
+        question: str,
+        snapshot: SemanticSnapshot,
+        *,
+        semantic_context: str | None,
+    ) -> _CorrectnessRequest:
+        request = _CorrectnessRequest()
+        state = _PreparedState(
+            question=question,
+            snapshot=snapshot,
+            semantic_context=semantic_context,
         )
+        with self._prepared_lock:
+            self._prepared_requests[request] = state
+        return request
+
+    def _consume_request(self, request: Any) -> _PreparedState | None:
+        if not isinstance(request, _CorrectnessRequest):
+            return None
+        with self._prepared_lock:
+            return self._prepared_requests.pop(request, None)
 
     def _initial_validation(
         self,
-        request: CorrectnessRequest,
+        state: _PreparedState,
         candidate_sql: str,
         allowed_tables: tuple[str, ...],
         allowed_schemas: tuple[str, ...],
     ) -> tuple[SemanticSnapshot, ValidationReport] | CorrectnessResult:
-        snapshot = request._snapshot
+        snapshot = state.snapshot
         try:
             validation = self._validate_once(
-                request._question,
+                state.question,
                 candidate_sql,
                 snapshot,
                 run_preflight=True,
@@ -311,15 +348,15 @@ class CorrectnessPipeline:
 
     def _build_repair_context(
         self,
-        request: CorrectnessRequest,
+        state: _PreparedState,
         sql: str,
         validation: ValidationReport,
     ) -> str | CorrectnessResult:
-        snapshot = request._snapshot
-        if request.semantic_context:
-            return request.semantic_context
+        snapshot = state.snapshot
+        if state.semantic_context:
+            return state.semantic_context
         try:
-            return self.context_builder.build(request._question, snapshot).rendered
+            return self.context_builder.build(state.question, snapshot).rendered
         except Exception as exc:
             self._log_internal_failure("repair_context", exc)
             return self._repair_error(sql, snapshot, validation, _REPAIR_FAILED, 0)
@@ -569,4 +606,4 @@ class CorrectnessPipeline:
         log_safe_exception(stage, exc)
 
 
-__all__ = ["CorrectnessPipeline", "CorrectnessRequest"]
+__all__ = ["CorrectnessPipeline"]

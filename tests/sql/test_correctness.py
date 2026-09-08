@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 
@@ -124,6 +125,16 @@ def pipeline(registry: MutableRegistry):
     )
 
 
+def _make_pipeline():
+    from core.sql.correctness import CorrectnessPipeline
+
+    return CorrectnessPipeline(
+        registry=MutableRegistry(_snapshot()),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+    )
+
+
 def test_repairs_once_then_rejects(pipeline):
     """Catches recursive repair or accepting a repaired SQL that still fails validation."""
     calls: list[tuple[str, list[dict], str]] = []
@@ -184,6 +195,114 @@ def test_process_pins_one_snapshot_across_context_and_repair_validation():
     assert result.semantic_version == "1.0.0"
     assert contexts and "版本: sales@1.0.0" in contexts[0]
     assert registry.calls == 1
+
+
+def test_prepared_request_is_an_empty_identity_capability():
+    """The token itself must expose no semantic payload that can be forged."""
+    pipeline = _make_pipeline()
+    request = pipeline.prepare_generation("订单金额")
+    assert not hasattr(request, "_question")
+    assert not hasattr(request, "_snapshot")
+    assert not hasattr(request, "semantic_context")
+    assert not hasattr(request, "semantic_version")
+    with pytest.raises(TypeError):
+        replace(request)
+
+    semantic_context, semantic_version, content_sha256 = (
+        pipeline.describe_prepared(request)
+    )
+    assert "版本: sales@1.0.0" in semantic_context
+    assert semantic_version == "1.0.0"
+    assert content_sha256 == "1" * 64
+
+
+def test_prepared_request_rejects_lookalike_with_forged_fields():
+    """A self-constructed payload with valid-looking fields is not a capability."""
+    pipeline = _make_pipeline()
+    request = pipeline.prepare_generation("订单金额")
+
+    @dataclass(frozen=True)
+    class ForgedRequest:
+        semantic_context: str
+        semantic_version: str
+        _question: str
+        _snapshot: SemanticSnapshot
+
+    forged = ForgedRequest(
+        semantic_context="版本: sales@9.9.9\n实体: archived_orders",
+        semantic_version="9.9.9",
+        _question="查询归档订单",
+        _snapshot=_snapshot("9.9.9"),
+    )
+
+    forged_result = pipeline.process_prepared(
+        forged, "SELECT SUM(amount) FROM orders"
+    )
+    original_result = pipeline.process_prepared(
+        request, "SELECT SUM(amount) FROM orders"
+    )
+
+    assert forged_result.status == "error"
+    assert forged_result.executable is False
+    assert original_result.status == "success"
+
+
+def test_prepared_request_is_bound_to_issuing_pipeline():
+    """A request issued by one pipeline is invalid in another pipeline."""
+    first = _make_pipeline()
+    second = _make_pipeline()
+    request = first.prepare_generation("订单金额")
+
+    foreign = second.process_prepared(request, "SELECT SUM(amount) FROM orders")
+    original = first.process_prepared(request, "SELECT SUM(amount) FROM orders")
+
+    assert foreign.status == "error"
+    assert foreign.executable is False
+    assert original.status == "success"
+
+
+def test_prepared_request_is_consumed_once_and_cannot_be_replayed():
+    """A successful sync processing call must consume its capability."""
+    pipeline = _make_pipeline()
+    request = pipeline.prepare_generation("订单金额")
+
+    first = pipeline.process_prepared(request, "SELECT SUM(amount) FROM orders")
+    replay = pipeline.process_prepared(request, "SELECT SUM(amount) FROM orders")
+
+    assert first.status == "success"
+    assert replay.status == "error"
+    assert replay.executable is False
+
+
+@pytest.mark.asyncio
+async def test_async_prepared_request_is_consumed_once_and_cannot_be_replayed():
+    """Async processing must use the same atomic one-shot capability rule."""
+    pipeline = _make_pipeline()
+    request = pipeline.prepare_generation("订单金额")
+
+    first = await pipeline.process_async_prepared(
+        request, "SELECT SUM(amount) FROM orders"
+    )
+    replay = await pipeline.process_async_prepared(
+        request, "SELECT SUM(amount) FROM orders"
+    )
+
+    assert first.status == "success"
+    assert replay.status == "error"
+    assert replay.executable is False
+
+
+def test_discarded_prepared_request_cannot_be_used():
+    """Discard must remove an abandoned generation capability idempotently."""
+    pipeline = _make_pipeline()
+    request = pipeline.prepare_generation("订单金额")
+
+    assert pipeline.discard_prepared(request) is True
+    assert pipeline.discard_prepared(request) is False
+    result = pipeline.process_prepared(request, "SELECT SUM(amount) FROM orders")
+
+    assert result.status == "error"
+    assert result.executable is False
 
 
 def test_original_and_repaired_candidates_both_run_preflight(registry: MutableRegistry):
