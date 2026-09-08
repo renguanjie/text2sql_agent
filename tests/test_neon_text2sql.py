@@ -111,10 +111,6 @@ def load_knowledge_from_neo4j():
             }
             knowledge.append(table_info)
             
-            # 为检索器创建文档
-            col_names = ', '.join([f"{c['name']}({c['name_cn']})" for c in record['columns'][:10]])
-            doc = f"表 {record['table_name']} ({record['table_name_cn']}): 字段包括 {col_names}"
-            
     driver.close()
     return knowledge
 
@@ -162,9 +158,6 @@ def generate_sql_for_question(question: str) -> str:
     根据自然语言问题生成 SQL
     简化版本：基于规则生成
     """
-    # 关键词匹配
-    question_lower = question.lower()
-    
     # 简单查询模板
     if '所有客户' in question:
         return """SELECT customer_id, customer_name, phone, city, customer_level 
@@ -275,12 +268,12 @@ def test_text2sql():
         # 生成 SQL
         sql = generate_sql_for_question(test['question'])
         
-        print(f"\n✅ 生成 SQL:")
+        print("\n✅ 生成 SQL:")
         print(f"   {sql[:100]}{'...' if len(sql) > 100 else ''}")
         
         # 简单 SQL 验证
         is_valid = sql.strip().upper().startswith('SELECT') or sql.strip().upper().startswith('--')
-        print(f"🔍 验证结果:")
+        print("🔍 验证结果:")
         print(f"   格式有效：{'✅' if is_valid else '❌'}")
         
         # 尝试验证表是否存在

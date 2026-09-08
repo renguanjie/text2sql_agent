@@ -4,7 +4,6 @@ Text2SQL 智能体 - 综合功能测试套件
 """
 import pytest
 import os
-import json
 import time
 from datetime import datetime
 from pathlib import Path
@@ -78,7 +77,7 @@ class TestConfig:
         """测试 2: 配置值验证"""
         from config import (
             MYSQL_PORT, MYSQL_DATABASE,
-            NEO4J_URI, NEO4J_PASSWORD,
+            NEO4J_URI,
             RETRIEVAL_TOP_K, SQL_DIALECT
         )
         assert MYSQL_PORT == 3306
@@ -164,7 +163,7 @@ class TestSQLValidator:
         from core.sql.validator import SQLValidator
         validator = SQLValidator(dialect='mysql')
         result = validator.validate('SELECT * FROM users')
-        assert result['valid'] == True
+        assert result['valid']
         
     def test_12_validate_join(self):
         """测试 12: JOIN 语句校验"""
@@ -172,7 +171,7 @@ class TestSQLValidator:
         validator = SQLValidator(dialect='mysql')
         sql = 'SELECT u.id, o.amount FROM users u JOIN orders o ON u.id = o.user_id'
         result = validator.validate(sql)
-        assert result['valid'] == True
+        assert result['valid']
         
     def test_13_validate_subquery(self):
         """测试 13: 子查询校验"""
@@ -180,7 +179,7 @@ class TestSQLValidator:
         validator = SQLValidator(dialect='mysql')
         sql = 'SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)'
         result = validator.validate(sql)
-        assert result['valid'] == True
+        assert result['valid']
         
     def test_14_validate_aggregate(self):
         """测试 14: 聚合函数校验"""
@@ -188,7 +187,7 @@ class TestSQLValidator:
         validator = SQLValidator(dialect='mysql')
         sql = 'SELECT COUNT(*), SUM(amount) FROM orders GROUP BY user_id'
         result = validator.validate(sql)
-        assert result['valid'] == True
+        assert result['valid']
         
     def test_15_safety_check_safe_sql(self):
         """测试 15: 安全 SQL 检查 (安全) - 跳过"""
@@ -234,7 +233,7 @@ class TestMySQLClient:
         """测试 21: MySQL 连接"""
         from core.history.mysql_client import MySQLClient
         client = MySQLClient('localhost', 3306, 'root', 'root', 'text2sql_db')
-        assert client.connect() == True
+        assert client.connect()
         client.close()
         
     def test_22_mysql_get_statistics(self):
@@ -403,7 +402,7 @@ class TestIntegration:
         from core.sql.validator import SQLValidator
         validator = SQLValidator()
         result = validator.validate('SELECT * FROM users')
-        assert result['valid'] == True
+        assert result['valid']
 
 
 # ==================== 边界测试 ====================
@@ -424,7 +423,7 @@ class TestEdgeCases:
         validator = SQLValidator()
         sql = "SELECT * FROM users WHERE name = 'O''Brien'"
         result = validator.validate(sql)
-        assert result['valid'] == True
+        assert result['valid']
         
     def test_38_long_sql_query(self):
         """测试 38: 长 SQL 查询"""
@@ -492,7 +491,6 @@ def run_tests_and_generate_report():
     print()
     
     # 运行 pytest
-    test_file = __file__
     report_dir = Path.home() / 'Desktop'
     report_dir.mkdir(exist_ok=True)
     
@@ -649,7 +647,7 @@ def run_tests_and_generate_report():
     
     print()
     print("=" * 60)
-    print(f"测试完成！")
+    print("测试完成！")
     print(f"通过：{results['passed']}/{results['total']}")
     print(f"失败：{results['failed']}/{results['total']}")
     print(f"通过率：{results['passed']/results['total']*100:.1f}%")

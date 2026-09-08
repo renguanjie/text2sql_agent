@@ -2,7 +2,21 @@
 Text2SQL 智能体 - 离线测试脚本
 测试不依赖外部包的模块功能
 """
+import os
+import py_compile
+import re
 from pathlib import Path
+
+from config import (
+    LLM_MODEL,
+    LLM_PROVIDER,
+    MYSQL_DATABASE,
+    MYSQL_HOST,
+    MYSQL_PORT,
+    NEO4J_URI,
+    RETRIEVAL_TOP_K,
+    SQL_DIALECT,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,12 +27,6 @@ print("=" * 50)
 
 # ==================== 测试配置模块 ====================
 print("\n[1] 测试配置模块...")
-from config import (
-    MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
-    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-    LLM_PROVIDER, LLM_MODEL,
-    RETRIEVAL_TOP_K, SQL_DIALECT
-)
 print(f"  ✓ MySQL: {MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}")
 print(f"  ✓ Neo4j: {NEO4J_URI}")
 print(f"  ✓ LLM: {LLM_PROVIDER}/{LLM_MODEL}")
@@ -28,7 +36,6 @@ print(f"  ✓ SQL Dialect: {SQL_DIALECT}")
 # ==================== 测试文本预处理 ====================
 print("\n[2] 测试文本预处理...")
 # 直接导入源码测试
-import re
 
 class TextPreprocessor:
     def __init__(self):
@@ -49,7 +56,6 @@ print(f"  ✓ 分词测试：'Query users WHERE id = 1' -> {tokens}")
 
 # ==================== 测试 SQL 提取 ====================
 print("\n[3] 测试 SQL 提取...")
-import re
 
 def extract_sql(text: str) -> str:
     if not text:
@@ -95,9 +101,9 @@ def is_safe_query(sql: str) -> bool:
             return False
     return True
 
-assert is_safe_query("SELECT * FROM users") == True, "SELECT 被误判"
-assert is_safe_query("DELETE FROM users") == False, "DELETE 未被拦截"
-assert is_safe_query("DROP TABLE users") == False, "DROP 未被拦截"
+assert is_safe_query("SELECT * FROM users"), "SELECT 被误判"
+assert not is_safe_query("DELETE FROM users"), "DELETE 未被拦截"
+assert not is_safe_query("DROP TABLE users"), "DROP 未被拦截"
 print("  ✓ SELECT 查询允许")
 print("  ✓ DELETE 查询拦截")
 print("  ✓ DROP 查询拦截")
@@ -120,7 +126,6 @@ print("  ✓ 必要的占位符完整")
 
 # ==================== 测试模块结构 ====================
 print("\n[6] 测试项目结构...")
-import os
 
 root = PROJECT_ROOT
 
@@ -159,8 +164,6 @@ else:
 
 # ==================== 测试配置文件语法 ====================
 print("\n[7] 测试 Python 文件语法...")
-import py_compile
-import tempfile
 
 files_to_check = [
     'config.py',

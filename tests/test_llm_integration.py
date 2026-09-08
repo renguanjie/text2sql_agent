@@ -101,12 +101,12 @@ def test_llm_integration():
     # 初始化组件
     print("\n🔧 初始化组件...")
     neo4j_retriever = Neo4jKnowledgeRetriever(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
-    llm = QwenMaxLLM(api_key=LLM_API_KEY, model=LLM_MODEL)
+    QwenMaxLLM(api_key=LLM_API_KEY, model=LLM_MODEL)
     neon_engine = create_engine(NEON_URL)
 
-    print(f"   ✅ Neo4j 检索器初始化完成")
+    print("   ✅ Neo4j 检索器初始化完成")
     print(f"   ✅ Qwen-Max LLM 初始化完成 ({LLM_MODEL})")
-    print(f"   ✅ Neon PostgreSQL 连接成功")
+    print("   ✅ Neon PostgreSQL 连接成功")
 
     # 运行测试
     print("\n" + "=" * 80)
@@ -146,7 +146,7 @@ def test_llm_integration():
             sql = result.get('sql', '')
 
             if sql == "INSUFFICIENT_INFO":
-                print(f"⚠️ LLM 判断信息不足")
+                print("⚠️ LLM 判断信息不足")
                 results.append({
                     'query': test['query'],
                     'success': False,
@@ -154,7 +154,7 @@ def test_llm_integration():
                 })
                 continue
 
-            print(f"✅ SQL 生成成功")
+            print("✅ SQL 生成成功")
             print(f"   SQL: {sql[:100]}{'...' if len(sql) > 100 else ''}")
 
             # 3. 验证 SQL 内容（只检查关键词，不检查具体字段名）
@@ -187,7 +187,7 @@ def test_llm_integration():
                 
                 # 尝试修复：如果是字段不存在错误
                 if 'does not exist' in error_msg.lower() or 'undefined column' in error_msg.lower():
-                    print(f"   🔄 尝试修复...")
+                    print("   🔄 尝试修复...")
                     # 这里可以添加自动重试逻辑
                     results.append({
                         'query': test['query'],

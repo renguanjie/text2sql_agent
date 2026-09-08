@@ -22,7 +22,7 @@ class TestNeo4jClient:
         """测试连接失败（Neo4j 未启动时）"""
         from core.knowledge.neo4j_client import Neo4jClient
 
-        client = Neo4jClient("bolt://localhost:7687", "neo4j", "wrong_password")
+        Neo4jClient("bolt://localhost:7687", "neo4j", "wrong_password")
         # 不实际连接，只测试接口
 
 
@@ -131,7 +131,7 @@ class TestSQLValidator:
         validator = SQLValidator(dialect="mysql")
         result = validator.validate("")
 
-        assert result['valid'] == False
+        assert not result['valid']
         assert len(result['errors']) > 0
 
     def test_format_sql(self):
@@ -142,7 +142,7 @@ class TestSQLValidator:
         sql = "select * from users where id=1"
         result = validator.format(sql)
 
-        assert result['success'] == True or result['success'] == False
+        assert result['success'] in (True, False)
 
     def test_execution_validator_safe(self):
         """测试执行校验 - 安全 SQL"""
@@ -151,7 +151,7 @@ class TestSQLValidator:
         validator = SQLExecutionValidator(allow_select_only=True)
         result = validator.validate("SELECT * FROM users")
 
-        assert result['valid'] == True
+        assert result['valid']
 
     def test_execution_validator_unsafe(self):
         """测试执行校验 - 危险 SQL"""
@@ -160,7 +160,7 @@ class TestSQLValidator:
         validator = SQLExecutionValidator(allow_select_only=True)
         result = validator.validate("DELETE FROM users")
 
-        assert result['valid'] == False
+        assert not result['valid']
         assert len(result['errors']) > 0
 
 
@@ -218,7 +218,7 @@ class TestIntegration:
 
     def test_full_pipeline_mock(self):
         """测试完整流程（模拟）"""
-        from unittest.mock import Mock, MagicMock
+        from unittest.mock import Mock
 
         # 模拟 LLM
         mock_llm = Mock()
