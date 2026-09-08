@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 from pydantic import ValidationError
+from sqlglot.errors import ParseError
 
 from core.evaluation.golden import (
     CaseResult,
@@ -30,6 +31,7 @@ from core.semantic import (
     SemanticRelationship,
     SemanticSnapshot,
 )
+from core.semantic.validator import analyze_sql_structure
 
 
 @pytest.fixture
@@ -481,6 +483,68 @@ def test_nested_projected_keys_keep_repeated_cte_occurrences_distinct(evaluator)
     )
 
 
+@pytest.mark.parametrize(
+    "cte",
+    [
+        "base AS (SELECT * FROM example_orders)",
+        (
+            "raw AS (SELECT * FROM example_orders), "
+            "base AS (SELECT * FROM raw)"
+        ),
+    ],
+)
+def test_unmodified_cte_star_preserves_same_occurrence_time_lineage(evaluator, cte):
+    """Break caught: losing physical column lineage at a derived star boundary."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        f"WITH {cte} SELECT YEAR(a.created_at), MONTH(a.created_at), COUNT(*) "
+        "FROM base AS a GROUP BY YEAR(a.created_at), MONTH(a.created_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).passed
+
+
+def test_ambiguous_cte_star_sources_fail_closed_for_time_lineage(evaluator):
+    """Break caught: choosing one of multiple star sources for an ambiguous column."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT * FROM example_orders AS a "
+        "JOIN example_orders AS b ON b.id = a.id) "
+        "SELECT YEAR(created_at), MONTH(created_at), COUNT(*) FROM base "
+        "GROUP BY YEAR(created_at), MONTH(created_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        "a.* EXCEPT(month_key), b.* EXCEPT(year_key)",
+        "a.* REPLACE(year_key AS year_key), b.* REPLACE(month_key AS month_key)",
+        "a.* RENAME(month_key AS hidden_month), b.* RENAME(year_key AS hidden_year)",
+    ],
+)
+def test_star_modifiers_fail_closed_in_structural_time_analysis(
+    projection,
+):
+    """Break caught: treating filtered/replaced/renamed stars as ordinary stars."""
+    sql = (
+        "WITH base AS (SELECT id, YEAR(created_at) AS year_key, "
+        "MONTH(created_at) AS month_key FROM example_orders) "
+        f"SELECT {projection} FROM base AS a "
+        "JOIN base AS b ON b.id = a.id"
+    )
+
+    with pytest.raises((ValueError, ParseError)):
+        analyze_sql_structure(
+            sql,
+            semantic_indexes={"example_orders": {"id", "created_at"}},
+        )
+
+
 def test_calendar_component_hidden_in_case_is_not_a_direct_grain_key(evaluator):
     """Break caught: treating a temporal descendant inside CASE as a grouping component."""
     case = _case(expected_time_grain="month")
@@ -930,6 +994,12 @@ def test_model_parameter_parser_allows_only_non_sensitive_names():
         "model_revision=k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3",
         "model_revision=qwertyuiopasdfghjklzxcvbnmqwertyuiop",
         "model_revision=azbycxdwevfugthsirjqkplomn_23456789",
+        "model_revision=1.2.3-01",
+        "model_revision=1.2.3-alpha.01",
+        "model_revision=1.2.3+k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3",
+        "model_revision=1.2.3+AKIAIOSFODNN7EXAMPLE",
+        "model_revision=1.2.3+sk-proj-AbCdEf0123456789",
+        "model_revision=v1.2.3",
         "quantization=custom format",
         "quantization=Q4_K_M?password=private",
     ],
@@ -960,7 +1030,14 @@ def test_model_parameter_direct_construction_uses_the_same_safe_specs():
 
 @pytest.mark.parametrize(
     "revision",
-    ["main", "release-2026", "v1.2.3", "abcdef1234567890abcdef1234567890abcdef12"],
+    [
+        "main",
+        "release-2026",
+        "1.2.3",
+        "1.2.3-rc.1+cpu",
+        "1.2.3+build.01",
+        "abcdef1234567890abcdef1234567890abcdef12",
+    ],
 )
 def test_model_revision_accepts_only_narrow_nonsecret_identifiers(revision):
     assert parse_model_parameters([f"model_revision={revision}"]) == (
@@ -1596,7 +1673,7 @@ def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
             str(compiled),
         ]
     )
-    opaque_revision = "k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3"
+    opaque_revision = "1.2.3+k9m2q7v4x8c3n6p1r5t0w2z7a4b8d6f3"
     invalid_revision = main(
         [
             "--cases",

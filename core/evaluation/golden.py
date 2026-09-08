@@ -72,14 +72,19 @@ _MODEL_PARAMETER_ALLOWLIST = frozenset(
     }
 )
 _MODEL_REVISION_SEMVER = re.compile(
-    r"v?(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
-    r"(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
-    r"(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
+    r"(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\."
+    r"(?P<patch>0|[1-9]\d*)"
+    r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+(?P<build>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
 )
 _MODEL_REVISION_GIT_HASH = re.compile(r"(?:[0-9A-Fa-f]{7,40}|[0-9A-Fa-f]{64})")
 _MODEL_REVISION_SLUG = re.compile(
     r"[A-Za-z][A-Za-z0-9]*(?:[._-][A-Za-z0-9]+){0,3}"
 )
+_MODEL_REVISION_VERSION_LIKE = re.compile(r"[vV]\d+\.\d+\.\d+(?:[-+.]|$)")
+_MODEL_REVISION_MAX_LENGTH = 64
+_MODEL_REVISION_METADATA_MAX_LENGTH = 24
+_MODEL_REVISION_IDENTIFIER_MAX_LENGTH = 16
 _QUANTIZATIONS = frozenset(
     {
         "NONE",
@@ -126,11 +131,45 @@ _Scalar = StrictBool | StrictInt | StrictFloat | StrictStr
 
 
 def _is_safe_model_revision(value: str) -> bool:
-    if _CREDENTIAL_VALUE.search(value):
+    if (
+        len(value) > _MODEL_REVISION_MAX_LENGTH
+        or _SENSITIVE_PARAMETER_TEXT.search(value)
+        or _CREDENTIAL_VALUE.search(value)
+    ):
+        return False
+
+    semver_match = _MODEL_REVISION_SEMVER.fullmatch(value)
+    if semver_match is not None:
+        prerelease = semver_match.group("prerelease")
+        build = semver_match.group("build")
+        metadata = tuple(
+            identifier
+            for section in (prerelease, build)
+            if section is not None
+            for identifier in section.split(".")
+        )
+        metadata_text = ".".join(metadata)
+        if len(metadata_text) > _MODEL_REVISION_METADATA_MAX_LENGTH:
+            return False
+        if any(
+            len(identifier) > _MODEL_REVISION_IDENTIFIER_MAX_LENGTH
+            or _SENSITIVE_PARAMETER_TEXT.search(identifier)
+            or _CREDENTIAL_VALUE.search(identifier)
+            for identifier in metadata
+        ):
+            return False
+        if prerelease is not None and any(
+            len(identifier) > 1 and identifier.startswith("0")
+            for identifier in prerelease.split(".")
+            if identifier.isdigit()
+        ):
+            return False
+        return True
+
+    if _MODEL_REVISION_VERSION_LIKE.match(value):
         return False
     return bool(
-        _MODEL_REVISION_SEMVER.fullmatch(value)
-        or _MODEL_REVISION_GIT_HASH.fullmatch(value)
+        _MODEL_REVISION_GIT_HASH.fullmatch(value)
         or (len(value) <= 24 and _MODEL_REVISION_SLUG.fullmatch(value))
     )
 

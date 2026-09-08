@@ -207,6 +207,22 @@ def _projection_resolution(
     return _Resolution(frozenset(references), known)
 
 
+def _projection_star(
+    expression: exp.Expression,
+) -> tuple[exp.Star, str] | None:
+    while isinstance(expression, (exp.Alias, exp.Paren)):
+        expression = expression.this
+    if isinstance(expression, exp.Star):
+        return expression, ""
+    if isinstance(expression, exp.Column) and isinstance(expression.this, exp.Star):
+        return expression.this, _casefold(expression.table) if expression.table else ""
+    return None
+
+
+def _star_has_modifiers(star: exp.Star) -> bool:
+    return any(bool(value) for value in star.args.values())
+
+
 def _expand_star(
     expression: exp.Expression,
     info: _ScopeInfo,
@@ -1254,6 +1270,17 @@ def analyze_sql_structure(
     source_infos = analysis.active_scope_infos
     active_scope_ids = {id(info.scope) for info in source_infos}
 
+    for info in source_infos:
+        select = info.scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        for expression in select.expressions:
+            projection_star = _projection_star(expression)
+            if projection_star is not None and _star_has_modifiers(
+                projection_star[0]
+            ):
+                raise _UnsupportedSQL("star projection modifiers are unsupported")
+
     fields: set[str] = set()
     for info in source_infos:
         for column in info.scope.columns:
@@ -1314,18 +1341,35 @@ def analyze_sql_structure(
             node = node.this
         return node
 
-    def column_origin(
-        column: exp.Column,
+    def star_source_items(
         info: _ScopeInfo,
-        visited: frozenset[tuple[int, str]],
+    ) -> tuple[tuple[str, exp.Table | Scope | None], ...]:
+        select = info.scope.expression
+        if not isinstance(select, exp.Select):
+            return ()
+        sources: list[tuple[str, exp.Table | Scope | None]] = []
+        for expression in select.expressions:
+            projection_star = _projection_star(expression)
+            if projection_star is None:
+                continue
+            _, qualifier = projection_star
+            if qualifier:
+                sources.append((qualifier, info.sources.get(qualifier)))
+            else:
+                sources.extend(info.sources.items())
+        return tuple(sources)
+
+    def named_column_origin(
+        name: str,
+        qualifier: str,
+        info: _ScopeInfo,
+        visited: frozenset[tuple[int, str, str]],
         occurrence_path: tuple[tuple[int, str], ...] = (),
     ) -> tuple[tuple[tuple[int, str], ...], str] | None:
-        marker = (id(info.scope), _casefold(column.sql()))
+        marker = (id(info.scope), qualifier, name)
         if marker in visited:
             return None
         visited = visited | {marker}
-        name = _casefold(column.name)
-        qualifier = _casefold(column.table) if column.table else ""
 
         def from_source(
             source_name: str, source: exp.Table | Scope | None
@@ -1344,6 +1388,10 @@ def analyze_sql_structure(
                     return column_origin(
                         definition, source_info, visited, source_path
                     )
+                if definition is None and name in source_info.projections:
+                    return star_column_origin(
+                        name, source_info, visited, source_path
+                    )
             return None
 
         if qualifier:
@@ -1352,6 +1400,42 @@ def analyze_sql_structure(
             candidate
             for source_name, source in info.sources.items()
             if (candidate := from_source(source_name, source)) is not None
+        )
+        return candidates[0] if len(candidates) == 1 else None
+
+    def column_origin(
+        column: exp.Column,
+        info: _ScopeInfo,
+        visited: frozenset[tuple[int, str, str]],
+        occurrence_path: tuple[tuple[int, str], ...] = (),
+    ) -> tuple[tuple[tuple[int, str], ...], str] | None:
+        return named_column_origin(
+            _casefold(column.name),
+            _casefold(column.table) if column.table else "",
+            info,
+            visited,
+            occurrence_path,
+        )
+
+    def star_column_origin(
+        name: str,
+        info: _ScopeInfo,
+        visited: frozenset[tuple[int, str, str]],
+        occurrence_path: tuple[tuple[int, str], ...],
+    ) -> tuple[tuple[tuple[int, str], ...], str] | None:
+        candidates = tuple(
+            candidate
+            for source_name, _ in star_source_items(info)
+            if (
+                candidate := named_column_origin(
+                    name,
+                    source_name,
+                    info,
+                    visited,
+                    occurrence_path,
+                )
+            )
+            is not None
         )
         return candidates[0] if len(candidates) == 1 else None
 
