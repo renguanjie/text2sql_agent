@@ -2,7 +2,7 @@
 权值初始化与重平衡模块
 管理 Neo4j CONNECTS 关系的权重分配
 """
-from typing import List, Dict, Optional
+from typing import List, Dict
 from loguru import logger
 
 

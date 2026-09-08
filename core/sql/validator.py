@@ -2,11 +2,120 @@
 SQL 校验器模块
 使用 SQLFluff 进行 SQL 语法校验和格式化
 """
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import sqlfluff
 from sqlfluff.core import Linter
-from sqlfluff.core.errors import SQLLintError, SQLParseError
+from sqlfluff.core.errors import SQLParseError
 from loguru import logger
+
+
+SYSTEM_SCHEMAS = {"information_schema", "mysql", "performance_schema", "sys", "pg_catalog"}
+DEFAULT_BLOCKED_TABLES = {
+    "sql_generation_history", "user_feedback", "table_schema", "column_schema"
+}
+
+
+def validate_query_scope(sql: str, allowed_tables: Optional[List[str]] = None,
+                         allowed_schemas: Optional[List[str]] = None,
+                         blocked_tables: Optional[List[str]] = None,
+                         dialect: str = "mysql") -> Dict[str, Any]:
+    """使用 AST 校验查询引用的库表，正确忽略 CTE 别名。"""
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        statement = sqlglot.parse_one(sql, read=dialect)
+    except Exception as exc:
+        return {'valid': False, 'errors': [f'SQL 无法解析：{exc}'], 'tables': []}
+
+    cte_names = {cte.alias_or_name.lower() for cte in statement.find_all(exp.CTE)}
+    allowed_table_set = {
+        str(name).lower().split('.')[-1] for name in (allowed_tables or []) if name
+    }
+    allowed_schema_set = {str(name).lower() for name in (allowed_schemas or []) if name}
+    blocked_table_set = {
+        str(name).lower() for name in (
+            DEFAULT_BLOCKED_TABLES if blocked_tables is None else blocked_tables
+        ) if name
+    }
+    errors = []
+    tables = []
+
+    for table in statement.find_all(exp.Table):
+        table_name = table.name.lower()
+        schema_name = (table.db or table.catalog or "").lower()
+        if not table_name or (not schema_name and table_name in cte_names):
+            continue
+        qualified_name = f"{schema_name}.{table_name}" if schema_name else table_name
+        tables.append(qualified_name)
+        if table_name in blocked_table_set:
+            errors.append(f"禁止访问内部表：{qualified_name}")
+        if schema_name in SYSTEM_SCHEMAS:
+            errors.append(f"禁止访问系统 Schema：{schema_name}")
+        elif schema_name and allowed_schema_set and schema_name not in allowed_schema_set:
+            errors.append(f"Schema 不在允许范围内：{schema_name}")
+        if allowed_tables is not None and table_name not in allowed_table_set:
+            errors.append(f"表不在允许范围内：{qualified_name}")
+
+    return {'valid': not errors, 'errors': list(dict.fromkeys(errors)), 'tables': tables}
+
+
+def constrain_read_query(sql: str, max_rows: int, timeout_ms: int = 0,
+                         dialect: str = "mysql") -> str:
+    """通过 AST 强制外层行数限制，并为 MySQL 添加执行超时提示。"""
+    import sqlglot
+    from sqlglot import exp
+
+    statement = sqlglot.parse_one(sql, read=dialect)
+    if max_rows > 0:
+        statement = statement.limit(max_rows + 1)
+    if dialect == "mysql" and timeout_ms > 0 and isinstance(statement, exp.Select):
+        statement.set(
+            "hint",
+            exp.Hint(expressions=[exp.Var(this=f"MAX_EXECUTION_TIME({int(timeout_ms)})")]),
+        )
+    return statement.sql(dialect=dialect)
+
+
+def is_safe_read_query(sql: str, dialect: str = "mysql") -> bool:
+    """仅接受一条无锁、无副作用的 SELECT/集合查询。
+
+    解析器缺失或 SQL 无法解析时采用 fail-closed 策略，拒绝执行。
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        return False
+
+    try:
+        import sqlglot
+
+        statements = [statement for statement in sqlglot.parse(sql, read=dialect) if statement is not None]
+    except Exception as exc:
+        logger.warning(f"SQL 安全解析失败，拒绝执行：{exc}")
+        return False
+
+    if len(statements) != 1:
+        return False
+
+    statement = statements[0]
+    if type(statement).__name__ not in {"Select", "Union", "Intersect", "Except"}:
+        return False
+
+    forbidden_nodes = {
+        "Alter", "Command", "Commit", "Create", "Delete", "Drop", "Grant",
+        "Insert", "Into", "LoadData", "Lock", "Merge", "PropertyEQ", "Rollback", "Set",
+        "Transaction", "TruncateTable", "Update", "Use",
+    }
+    forbidden_functions = {
+        "BENCHMARK", "GET_LOCK", "LOAD_FILE", "PG_SLEEP", "RELEASE_LOCK", "SLEEP"
+    }
+    for item in statement.walk():
+        # sqlglot 旧版本返回 (node, parent, key)，新版本直接返回 node。
+        node = item[0] if isinstance(item, tuple) else item
+        if type(node).__name__ in forbidden_nodes:
+            return False
+        if type(node).__name__ == "Anonymous" and node.name.upper() in forbidden_functions:
+            return False
+    return True
 
 
 class SQLValidator:
@@ -248,7 +357,7 @@ class SQLExecutionValidator:
     """SQL 执行前校验器 - 业务规则校验"""
 
     def __init__(self, allowed_tables: Optional[List[str]] = None,
-                 allow_select_only: bool = True):
+                 allow_select_only: bool = True, dialect: str = "mysql"):
         """
         初始化执行校验器
 
@@ -258,6 +367,7 @@ class SQLExecutionValidator:
         """
         self.allowed_tables = allowed_tables
         self.allow_select_only = allow_select_only
+        self.dialect = dialect
 
     def validate(self, sql: str) -> Dict[str, Any]:
         """
@@ -269,6 +379,9 @@ class SQLExecutionValidator:
         Returns:
             Dict: 校验结果
         """
+        if not isinstance(sql, str) or not sql.strip():
+            return {'valid': False, 'errors': ['SQL 语句为空'], 'warnings': []}
+
         errors = []
         warnings = []
 
@@ -276,27 +389,19 @@ class SQLExecutionValidator:
 
         # 检查是否只允许 SELECT
         if self.allow_select_only:
-            if not sql_upper.startswith('SELECT') and not sql_upper.startswith('WITH'):
-                errors.append("只允许执行 SELECT 查询")
-
-        # 检查危险操作
-        dangerous_patterns = [
-            ('DROP', 'DROP 操作被禁止'),
-            ('TRUNCATE', 'TRUNCATE 操作被禁止'),
-            ('DELETE FROM', 'DELETE 操作被禁止'),
-            ('INSERT INTO', 'INSERT 操作被禁止'),
-            ('UPDATE ', 'UPDATE 操作被禁止'),
-            ('ALTER ', 'ALTER 操作被禁止'),
-            ('CREATE ', 'CREATE 操作被禁止'),
-        ]
-
-        for pattern, message in dangerous_patterns:
-            if pattern in sql_upper:
-                errors.append(message)
+            if not is_safe_read_query(sql, dialect=self.dialect):
+                errors.append("只允许执行单条、无副作用的 SELECT 查询")
+        else:
+            dangerous_patterns = (
+                'DROP', 'TRUNCATE', 'DELETE FROM', 'INSERT INTO',
+                'UPDATE ', 'ALTER ', 'CREATE ',
+            )
+            if any(pattern in sql_upper for pattern in dangerous_patterns):
+                errors.append("危险 SQL 操作被禁止")
 
         # 检查允许的表
         if self.allowed_tables:
-            found_tables = self._extract_tables(sql)
+            found_tables = validate_query_scope(sql, dialect=self.dialect)['tables']
             for table in found_tables:
                 if table.upper() not in [t.upper() for t in self.allowed_tables]:
                     errors.append(f"表 {table} 不在允许列表中")
@@ -312,18 +417,8 @@ class SQLExecutionValidator:
         }
 
     def _extract_tables(self, sql: str) -> List[str]:
-        """简单提取 SQL 中的表名"""
-        import re
-
-        # 简单的 FROM 子句提取
-        from_pattern = r'FROM\s+([a-zA-Z_][a-zA-Z0-9_]*)'
-        tables = re.findall(from_pattern, sql, re.IGNORECASE)
-
-        # JOIN 子句提取
-        join_pattern = r'JOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)'
-        tables.extend(re.findall(join_pattern, sql, re.IGNORECASE))
-
-        return tables
+        """使用 AST 提取真实表引用。"""
+        return validate_query_scope(sql, dialect=self.dialect)['tables']
 
 
 # 模块级 Linter 缓存，避免重复创建（按方言缓存）
@@ -357,7 +452,7 @@ def validate_sql(sql: str, dialect: str = "mysql",
     # 执行前校验
     exec_result = {'valid': True, 'errors': [], 'warnings': []}
     if execution_check:
-        exec_validator = SQLExecutionValidator(allow_select_only=True)
+        exec_validator = SQLExecutionValidator(allow_select_only=True, dialect=dialect)
         exec_result = exec_validator.validate(sql)
 
     # 合并结果

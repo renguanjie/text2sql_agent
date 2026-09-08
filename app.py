@@ -2,10 +2,10 @@
 Text2SQL 智能体 - Streamlit 主入口
 基于本地知识库的 SQL 智能生成应用
 """
+# ruff: noqa: E402
 import streamlit as st
 import sys
 import json
-import os
 from pathlib import Path
 
 # 添加项目根目录到路径
@@ -15,17 +15,24 @@ sys.path.insert(0, str(project_root))
 from config import (
     MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
     NEO4J_ENABLED, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE,
+    NEO4J_MAX_POOL_SIZE, NEO4J_CONNECTION_TIMEOUT,
     LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL,
     LLM_PROVIDERS, EMBEDDING_PROVIDERS,
-    RETRIEVAL_TOP_K, SQL_DIALECT,
+    RETRIEVAL_TOP_K, PROMPT_MAX_LENGTH, SQL_DIALECT, SQL_VALIDATION_ENABLED, SQL_MAX_LENGTH,
+    SQL_QUERY_MAX_ROWS, SQL_QUERY_TIMEOUT_MS, SQL_SCOPE_ENFORCEMENT, SQL_BLOCKED_TABLES,
     BM25_K1, BM25_B, BM25_WEIGHT, DENSE_WEIGHT,
     FAISS_ENABLED, FAISS_EMBEDDING_DIM, FAISS_INDEX_TYPE,
-    EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_API_KEY,
-    FEW_SHOT_ENABLED, FEW_SHOT_TOP_K,
-    MYSQL_POOL_SIZE, MYSQL_MAX_OVERFLOW, MYSQL_POOL_TIMEOUT
+    INDEX_CACHE_ENABLED, INDEX_CACHE_DIR,
+    EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_API_KEY, EMBEDDING_API_BASE,
+    FEW_SHOT_ENABLED, FEW_SHOT_TOP_K, FEW_SHOT_MIN_SIMILARITY,
+    MYSQL_POOL_SIZE, MYSQL_MAX_OVERFLOW, MYSQL_POOL_TIMEOUT,
+    HISTORY_AUTO_SAVE, HISTORY_MAX_RECORDS,
+    UPLOAD_MAX_BYTES, GRAPH_MAX_NODES, GRAPH_MAX_EDGES,
+    GRAPH_MAX_DEPTH, GRAPH_MAX_STRING_LENGTH,
 )
 from core.app_context import ApplicationContext
 from core.sql.validator import validate_sql
+from core.utils.upload_limits import UploadValidationError, read_uploaded_text
 from loguru import logger
 import uuid
 
@@ -270,19 +277,33 @@ def initialize_system():
         'mysql_pool_size': MYSQL_POOL_SIZE,
         'mysql_max_overflow': MYSQL_MAX_OVERFLOW,
         'mysql_pool_timeout': MYSQL_POOL_TIMEOUT,
+        'history_max_records': HISTORY_MAX_RECORDS,
         'neo4j_enabled': NEO4J_ENABLED, 'neo4j_uri': NEO4J_URI,
         'neo4j_user': NEO4J_USER, 'neo4j_password': NEO4J_PASSWORD,
         'neo4j_database': NEO4J_DATABASE,
+        'neo4j_max_pool_size': NEO4J_MAX_POOL_SIZE,
+        'neo4j_connection_timeout': NEO4J_CONNECTION_TIMEOUT,
+        'graph_max_nodes': GRAPH_MAX_NODES, 'graph_max_edges': GRAPH_MAX_EDGES,
+        'graph_max_depth': GRAPH_MAX_DEPTH,
+        'graph_max_string_length': GRAPH_MAX_STRING_LENGTH,
         'llm_provider': LLM_PROVIDER, 'llm_model': LLM_MODEL,
         'llm_api_key': LLM_API_KEY, 'llm_base_url': LLM_BASE_URL,
-        'retrieval_top_k': RETRIEVAL_TOP_K, 'sql_dialect': SQL_DIALECT,
+        'retrieval_top_k': RETRIEVAL_TOP_K, 'prompt_max_length': PROMPT_MAX_LENGTH,
+        'sql_dialect': SQL_DIALECT,
+        'sql_validation_enabled': SQL_VALIDATION_ENABLED, 'sql_max_length': SQL_MAX_LENGTH,
+        'sql_query_max_rows': SQL_QUERY_MAX_ROWS,
+        'sql_query_timeout_ms': SQL_QUERY_TIMEOUT_MS,
+        'sql_scope_enforcement': SQL_SCOPE_ENFORCEMENT,
+        'sql_blocked_tables': SQL_BLOCKED_TABLES,
         'bm25_k1': BM25_K1, 'bm25_b': BM25_B,
         'bm25_weight': BM25_WEIGHT, 'dense_weight': DENSE_WEIGHT,
         'faiss_enabled': FAISS_ENABLED, 'faiss_embedding_dim': FAISS_EMBEDDING_DIM,
         'faiss_index_type': FAISS_INDEX_TYPE,
+        'index_cache_enabled': INDEX_CACHE_ENABLED, 'index_cache_dir': INDEX_CACHE_DIR,
         'embedding_provider': EMBEDDING_PROVIDER, 'embedding_model': EMBEDDING_MODEL,
-        'embedding_api_key': EMBEDDING_API_KEY,
+        'embedding_api_key': EMBEDDING_API_KEY, 'embedding_api_base': EMBEDDING_API_BASE,
         'few_shot_enabled': FEW_SHOT_ENABLED, 'few_shot_top_k': FEW_SHOT_TOP_K,
+        'few_shot_min_similarity': FEW_SHOT_MIN_SIMILARITY,
     })
 
     if app_ctx.ensure_initialized():
@@ -300,28 +321,17 @@ def initialize_system():
 def _apply_llm_config(provider: str, model: str, api_key: str, base_url: str) -> bool:
     """应用 LLM 配置变更，热重载 LLM 相关组件"""
     try:
-        # 更新环境变量
-        os.environ["LLM_PROVIDER"] = provider
-        os.environ["LLM_MODEL"] = model
-        os.environ["LLM_API_KEY"] = api_key
-        os.environ["LLM_BASE_URL"] = base_url
-
         ctx = st.session_state.get("app_context")
         if not ctx:
             st.error("系统未初始化")
             return False
 
-        # 更新 context 配置
-        ctx.config.update({
-            "llm_provider": provider, "llm_model": model,
-            "llm_api_key": api_key, "llm_base_url": base_url,
-        })
-
-        # 仅重载 LLM 相关组件（保留数据库连接）
-        ctx._init_llm()
-        ctx._init_sql_chain()
-        ctx._init_sql_generator()
-        ctx._initialized = True
+        ctx.reload_llm(
+            llm_provider=provider,
+            llm_model=model,
+            llm_api_key=api_key,
+            llm_base_url=base_url,
+        )
 
         logger.info(f"LLM 配置已更新：{provider}/{model}")
         return True
@@ -333,10 +343,6 @@ def _apply_llm_config(provider: str, model: str, api_key: str, base_url: str) ->
 def _apply_embedding_config(provider: str, model: str, api_key: str) -> bool:
     """应用 Embedding 配置变更，热重载 Embedding 和检索器"""
     try:
-        os.environ["EMBEDDING_PROVIDER"] = provider
-        os.environ["EMBEDDING_MODEL"] = model
-        os.environ["EMBEDDING_API_KEY"] = api_key
-
         ctx = st.session_state.get("app_context")
         if not ctx:
             st.error("系统未初始化")
@@ -346,26 +352,12 @@ def _apply_embedding_config(provider: str, model: str, api_key: str) -> bool:
         from config import EMBEDDING_PROVIDERS as _EP
         dim = _EP.get(provider, {}).get("dimensions", 1536)
 
-        ctx.config.update({
-            "embedding_provider": provider, "embedding_model": model,
-            "embedding_api_key": api_key, "faiss_embedding_dim": dim,
-        })
-
-        # 重建 Embedding → Retriever → Generator 链路
-        ctx._init_embedding()
-        ctx._init_retriever()
-        ctx._init_sql_generator()
-        ctx._load_knowledge_base()
-
-        # 重建 Few-Shot 索引
-        if ctx.mysql_client:
-            try:
-                history_records = ctx.mysql_client.get_history_list(limit=100)
-                ctx.knowledge_retriever.build_few_shot_index(history_records)
-            except Exception:
-                pass
-
-        ctx._initialized = True
+        ctx.reload_embedding(
+            embedding_provider=provider,
+            embedding_model=model,
+            embedding_api_key=api_key,
+            faiss_embedding_dim=dim,
+        )
         logger.info(f"Embedding 配置已更新：{provider}/{model}")
         return True
     except Exception as e:
@@ -377,8 +369,6 @@ def _render_model_config_panel():
     """渲染模型配置 UI 面板（LLM + Embedding）"""
     st.markdown("### ️ 模型配置")
     st.caption("切换大语言模型或向量模型后点击保存，系统将自动重载相关组件。")
-
-    ctx = st.session_state.get("app_context")
 
     # 读取当前配置（优先从 session_state 覆盖值，否则从环境变量）
     current_llm_provider = st.session_state.get("_llm_provider", LLM_PROVIDER)
@@ -408,8 +398,8 @@ def _render_model_config_panel():
         provider_info = LLM_PROVIDERS[selected_provider]
 
         # 默认模型：如果用户手动填过就用用户的，否则用提供商推荐
-        if st.session_state.get("_llm_model"):
-            default_model = st.session_state["_llm_model"]
+        if selected_provider == current_llm_provider:
+            default_model = current_llm_model
         else:
             default_model = provider_info["default_model"]
 
@@ -489,8 +479,8 @@ def _render_model_config_panel():
         selected_emb_provider = emb_provider_keys[emb_provider_display.index(selected_emb_label)]
         emb_provider_info = EMBEDDING_PROVIDERS[selected_emb_provider]
 
-        if st.session_state.get("_emb_model"):
-            emb_default_model = st.session_state["_emb_model"]
+        if selected_emb_provider == current_emb_provider:
+            emb_default_model = current_emb_model
         else:
             emb_default_model = emb_provider_info["default_model"]
 
@@ -498,7 +488,7 @@ def _render_model_config_panel():
             "模型名称",
             value=emb_default_model,
             key="cfg_emb_model",
-            help=f"输入 Embedding 模型名称，如 text-embedding-v3、nomic-embed-text 等",
+            help="输入 Embedding 模型名称，如 text-embedding-v3、nomic-embed-text 等",
         )
 
         if emb_provider_info["needs_api_key"]:
@@ -620,8 +610,8 @@ with st.sidebar:
             """)
             if stats:
                 st.caption(f"节点：{stats[0].get('nodes', 0)} | 关系：{stats[0].get('relationships', 0)}")
-        except Exception as e:
-            st.caption(f"无法获取知识库统计")
+        except Exception:
+            st.caption("无法获取知识库统计")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -657,14 +647,14 @@ with st.sidebar:
 
         if uploaded_file is not None:
             try:
-                content = uploaded_file.getvalue().decode('utf-8')
+                content = read_uploaded_text(uploaded_file, UPLOAD_MAX_BYTES)
                 import_data = json.loads(content)
-            except UnicodeDecodeError:
-                import_data = None
-                st.error("JSON 文件编码异常，请使用 UTF-8 编码后重新上传。")
             except json.JSONDecodeError as e:
                 import_data = None
                 st.error(f"JSON 格式异常：第 {e.lineno} 行第 {e.colno} 列，{e.msg}")
+            except UploadValidationError as e:
+                import_data = None
+                st.error(str(e))
 
             if import_data is None:
                 st.warning("格式异常，是否下载模板后按模板调整？")
@@ -898,7 +888,8 @@ with tab1:
                     user_query=user_query,
                     session_id=st.session_state.session_id,
                     target_dialect=detected_dialect,
-                    target_database_id=detected_db_id
+                    target_database_id=detected_db_id,
+                    auto_save_history=HISTORY_AUTO_SAVE,
                 )
 
             # 检查是否检索到知识
@@ -931,7 +922,9 @@ with tab1:
                             st.markdown(f"- **{knowledge['name']}** (类型：{knowledge['node_type']}, 相似度：{knowledge['score']:.4f})")
 
                 # 显示校验结果
-                validation = validate_sql(result['sql'])
+                validation = result.get('validation') or validate_sql(
+                    result['sql'], dialect=detected_dialect
+                )
                 if validation['valid']:
                     st.success("✅ SQL 校验通过")
                 else:
@@ -979,11 +972,16 @@ with tab1:
     if execute_btn and st.session_state.last_sql and ctx and ctx.sql_generator:
         with st.spinner("⏳ 正在执行 SQL..."):
             exec_result = ctx.sql_generator.execute_sql(
-                sql=st.session_state.last_sql
+                sql=st.session_state.last_sql,
+                history_id=(st.session_state.last_result or {}).get('history_id'),
+                allowed_tables=(st.session_state.last_result or {}).get('allowed_tables'),
+                allowed_schemas=(st.session_state.last_result or {}).get('allowed_schemas'),
             )
 
         if exec_result.get('status') == 'success':
             st.success(f"✅ 执行成功，返回 {exec_result.get('row_count', 0)} 条记录")
+            if exec_result.get('truncated'):
+                st.warning(f"结果超过安全上限，仅显示前 {SQL_QUERY_MAX_ROWS} 条")
 
             # 显示结果
             data = exec_result.get('data', [])

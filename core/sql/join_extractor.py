@@ -7,11 +7,14 @@ from dataclasses import dataclass
 from loguru import logger
 
 try:
-    import sqlglot
     from sqlglot import exp, parse, ParseError
     SQLGLOT_AVAILABLE = True
 except ImportError:
     SQLGLOT_AVAILABLE = False
+    # 占位类型，确保模块可导入
+    exp = type("exp", (), {"Join": type, "From": type, "EQ": type, "And": type, "Column": type, "Identifier": type, "Table": type})
+    parse = None
+    ParseError = Exception
     logger.warning("sqlglot 未安装，JOIN 提取功能将不可用。安装：pip install sqlglot")
 
 

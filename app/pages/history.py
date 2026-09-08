@@ -2,6 +2,7 @@
 执行历史页面
 查看和管理 SQL 生成历史
 """
+# ruff: noqa: E402
 import streamlit as st
 import sys
 from pathlib import Path
@@ -23,11 +24,16 @@ st.set_page_config(
 st.title("📜 SQL 生成历史")
 
 # ==================== 数据库连接 ====================
-@st.cache_resource
 def get_mysql_client():
-    """获取 MySQL 客户端"""
+    """优先复用 app_context 中的 MySQL 客户端，避免创建独立连接"""
+    ctx = st.session_state.get("app_context")
+    if ctx and ctx.mysql_client and ctx.mysql_client.engine:
+        return ctx.mysql_client
+    # 降级：自建客户端（standalone 模式）
     client = MySQLClient(MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE)
-    client.connect()
+    if not client.connect():
+        st.error("无法连接 MySQL，请检查数据库配置和服务状态")
+        st.stop()
     return client
 
 
@@ -54,15 +60,15 @@ mysql_client = get_mysql_client()
 
 # 构建查询条件
 conditions = []
-params = []
+params = {}
 
 if session_filter:
-    conditions.append("session_id = %s")
-    params.append(session_filter)
+    conditions.append("session_id = :session_id")
+    params["session_id"] = session_filter
 
 if status_filter != "全部":
-    conditions.append("execution_status = %s")
-    params.append(status_filter)
+    conditions.append("execution_status = :execution_status")
+    params["execution_status"] = status_filter
 
 where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -77,12 +83,12 @@ SELECT id, session_id, user_query, generated_sql, validation_status,
 FROM sql_generation_history
 {where_clause}
 ORDER BY created_at DESC
-LIMIT %s OFFSET %s
+LIMIT :limit OFFSET :offset
 """
-params.extend([page_size, offset])
+query_params = {**params, "limit": page_size, "offset": offset}
 
 try:
-    history_list = mysql_client.execute_query(query, tuple(params))
+    history_list = mysql_client.execute_query(query, query_params, raise_on_error=True)
 except Exception as e:
     st.error(f"查询失败：{e}")
     history_list = []
@@ -92,9 +98,10 @@ count_query = f"""
 SELECT COUNT(*) as total FROM sql_generation_history {where_clause}
 """
 try:
-    total_result = mysql_client.execute_query(count_query, tuple(params[:len(params)-2]))
+    total_result = mysql_client.execute_query(count_query, params, raise_on_error=True)
     total = total_result[0].get('total', 0) if total_result else 0
-except:
+except Exception as e:
+    st.error(f"统计查询失败：{e}")
     total = 0
 
 # ==================== 统计卡片 ====================
@@ -200,15 +207,34 @@ st.subheader("快捷操作")
 col1, col2 = st.columns(2)
 
 with col1:
+    confirm_clear_all = st.checkbox("确认清空全部历史", key="confirm_clear_all")
     if st.button("🗑️ 清空所有历史", type="secondary"):
-        if st.confirm("确定要清空所有历史记录吗？此操作不可恢复。"):
-            mysql_client.execute_update("DELETE FROM sql_generation_history")
-            st.success("已清空所有历史")
-            st.rerun()
+        if confirm_clear_all:
+            try:
+                mysql_client.execute_update(
+                    "DELETE FROM sql_generation_history", raise_on_error=True
+                )
+            except Exception as e:
+                st.error(f"清空失败：{e}")
+            else:
+                st.success("已清空所有历史")
+                st.rerun()
+        else:
+            st.warning("请先勾选确认框")
 
 with col2:
+    confirm_clear_failed = st.checkbox("确认清空失败记录", key="confirm_clear_failed")
     if st.button("🗑️ 清空失败记录", type="secondary"):
-        if st.confirm("确定要清空所有失败记录吗？"):
-            mysql_client.execute_update("DELETE FROM sql_generation_history WHERE execution_status = 'fail'")
-            st.success("已清空失败记录")
-            st.rerun()
+        if confirm_clear_failed:
+            try:
+                mysql_client.execute_update(
+                    "DELETE FROM sql_generation_history WHERE execution_status = 'fail'",
+                    raise_on_error=True,
+                )
+            except Exception as e:
+                st.error(f"清空失败：{e}")
+            else:
+                st.success("已清空失败记录")
+                st.rerun()
+        else:
+            st.warning("请先勾选确认框")

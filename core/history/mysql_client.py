@@ -5,10 +5,11 @@ MySQL 数据库客户端
 from typing import Dict, List, Optional, Any
 from contextlib import contextmanager
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 from sqlalchemy.pool import QueuePool
 from loguru import logger
+from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
 import json
-from datetime import datetime
 import uuid
 
 
@@ -16,7 +17,8 @@ class MySQLClient:
     """MySQL 数据库客户端 - 使用 SQLAlchemy 连接池"""
 
     def __init__(self, host: str, port: int, user: str, password: str, database: str,
-                 pool_size: int = 10, max_overflow: int = 20, pool_timeout: int = 30):
+                 pool_size: int = 10, max_overflow: int = 20, pool_timeout: int = 30,
+                 history_max_records: int = 1000):
         """
         初始化 MySQL 客户端
 
@@ -38,6 +40,7 @@ class MySQLClient:
         self.pool_size = pool_size
         self.max_overflow = max_overflow
         self.pool_timeout = pool_timeout
+        self.history_max_records = history_max_records
         self.engine = None
 
     def connect(self) -> bool:
@@ -49,8 +52,16 @@ class MySQLClient:
         """
         try:
             # 创建 SQLAlchemy engine，使用 QueuePool 连接池
+            db_url = URL.create(
+                "mysql+mysqlconnector",
+                username=self.user,
+                password=self.password,
+                host=self.host,
+                port=self.port,
+                database=self.database,
+            )
             self.engine = create_engine(
-                f"mysql+mysqlconnector://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}",
+                db_url,
                 poolclass=QueuePool,
                 pool_size=self.pool_size,
                 max_overflow=self.max_overflow,
@@ -66,6 +77,9 @@ class MySQLClient:
                        f"pool_size={self.pool_size}, max_overflow={self.max_overflow}")
             return True
         except Exception as e:
+            if self.engine is not None:
+                self.engine.dispose()
+                self.engine = None
             logger.error(f"MySQL 连接池初始化失败：{e}")
             return False
 
@@ -73,6 +87,7 @@ class MySQLClient:
         """关闭连接池"""
         if self.engine:
             self.engine.dispose()
+            self.engine = None
             logger.info("MySQL 连接池已关闭")
 
     @contextmanager
@@ -91,13 +106,14 @@ class MySQLClient:
         try:
             yield conn
             conn.commit()
-        except Exception as e:
+        except Exception:
             conn.rollback()
-            raise e
+            raise
         finally:
             conn.close()
 
-    def execute_query(self, query: str, params: Optional[dict] = None) -> List[Dict]:
+    def execute_query(self, query: str, params: Optional[dict] = None,
+                      raise_on_error: bool = False) -> List[Dict]:
         """
         执行查询（使用连接池）
 
@@ -113,10 +129,25 @@ class MySQLClient:
                 result = conn.execute(text(query), params or {})
                 return [dict(row._mapping) for row in result]
         except Exception as e:
-            logger.error(f"MySQL 查询执行失败：{e}, query={query[:80]}...")
+            safe_error = truncate_log(mask_sensitive(str(e)), 160)
+            logger.error(f"MySQL 查询执行失败：{safe_error}, query={sanitize_sql(query)}")
+            if raise_on_error:
+                raise
             return []
 
-    def execute_update(self, query: str, params: Optional[dict] = None) -> int:
+    def execute_query_limited(self, query: str, max_rows: int,
+                              params: Optional[dict] = None) -> tuple[List[Dict], bool]:
+        """流式获取有限结果，避免将无界结果集一次性载入内存。"""
+        if max_rows <= 0:
+            raise ValueError("max_rows 必须大于 0")
+        with self.get_connection() as conn:
+            result = conn.execution_options(stream_results=True).execute(text(query), params or {})
+            rows = result.mappings().fetchmany(max_rows + 1)
+            truncated = len(rows) > max_rows
+            return [dict(row) for row in rows[:max_rows]], truncated
+
+    def execute_update(self, query: str, params: Optional[dict] = None,
+                       raise_on_error: bool = False) -> int:
         """
         执行更新操作（使用连接池）
 
@@ -132,7 +163,10 @@ class MySQLClient:
                 result = conn.execute(text(query), params or {})
                 return result.rowcount
         except Exception as e:
-            logger.error(f"MySQL 更新失败：{e}, query={query[:80]}...")
+            safe_error = truncate_log(mask_sensitive(str(e)), 160)
+            logger.error(f"MySQL 更新失败：{safe_error}, query={sanitize_sql(query)}")
+            if raise_on_error:
+                raise
             return 0
 
     def upsert_table_schema(self, table_name: str, table_comment: str = "",
@@ -257,13 +291,32 @@ class MySQLClient:
         try:
             with self.get_connection() as conn:
                 result = conn.execute(text(query), params)
-                conn.commit()
                 history_id = result.lastrowid
                 logger.info(f"保存 SQL 历史记录，ID={history_id}")
-                return history_id
+            self._prune_history()
+            return history_id
         except Exception as e:
             logger.error(f"保存 SQL 历史失败：{e}")
             return None
+
+    def _prune_history(self) -> None:
+        """保留最新的有限条历史，避免数据表无限增长。"""
+        if self.history_max_records <= 0:
+            return
+        self.execute_update(
+            """
+            DELETE h FROM sql_generation_history AS h
+            LEFT JOIN (
+                SELECT id FROM (
+                    SELECT id FROM sql_generation_history
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT :history_limit
+                ) AS recent_ids
+            ) AS keep_rows ON keep_rows.id = h.id
+            WHERE keep_rows.id IS NULL
+            """,
+            {"history_limit": self.history_max_records},
+        )
 
     def update_sql_execution(self, history_id: int, execution_status: str,
                             execution_error: Optional[str] = None,
@@ -291,7 +344,8 @@ class MySQLClient:
         params = {
             "execution_status": execution_status,
             "execution_error": execution_error,
-            "execution_result": json.dumps(execution_result, ensure_ascii=False, default=str) if execution_result else None,
+            "execution_result": json.dumps(execution_result, ensure_ascii=False, default=str)
+            if execution_result is not None else None,
             "history_id": history_id,
         }
         result = self.execute_update(query, params)
@@ -351,7 +405,7 @@ class MySQLClient:
         query = """
         SELECT id, user_query, generated_sql, validation_status, execution_status
         FROM sql_generation_history
-        WHERE execution_status = 'success' OR validation_status = 'success'
+        WHERE execution_status = 'success'
         ORDER BY created_at DESC
         LIMIT :limit
         """

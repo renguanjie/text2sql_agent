@@ -4,6 +4,7 @@
 """
 import os
 from pathlib import Path
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -102,7 +103,10 @@ MYSQL_MAX_OVERFLOW = int(os.getenv("MYSQL_MAX_OVERFLOW", "20"))  # 最大溢出�
 MYSQL_POOL_TIMEOUT = int(os.getenv("MYSQL_POOL_TIMEOUT", "30"))  # 获取连接超时时间（秒）
 
 # MySQL 连接 URL
-MYSQL_URI = f"mysql+mysqlconnector://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
+MYSQL_URI = (
+    f"mysql+mysqlconnector://{quote_plus(MYSQL_USER)}:{quote_plus(MYSQL_PASSWORD)}"
+    f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
+)
 
 # ==================== Neo4j 配置 ====================
 NEO4J_ENABLED = os.getenv("NEO4J_ENABLED", "false").lower() == "true"
@@ -125,6 +129,11 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")  # 可选，用于本地模型或�
 # 提示词模板配置
 PROMPT_MAX_LENGTH = int(os.getenv("PROMPT_MAX_LENGTH", 4000))
 RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", 5))
+UPLOAD_MAX_BYTES = int(os.getenv("UPLOAD_MAX_BYTES", str(5 * 1024 * 1024)))
+GRAPH_MAX_NODES = int(os.getenv("GRAPH_MAX_NODES", "10000"))
+GRAPH_MAX_EDGES = int(os.getenv("GRAPH_MAX_EDGES", "20000"))
+GRAPH_MAX_DEPTH = int(os.getenv("GRAPH_MAX_DEPTH", "20"))
+GRAPH_MAX_STRING_LENGTH = int(os.getenv("GRAPH_MAX_STRING_LENGTH", "10000"))
 
 # ==================== 检索配置 ====================
 # BM25 + FAISS 两路混合检索配置
@@ -139,6 +148,8 @@ DENSE_WEIGHT = float(os.getenv("DENSE_WEIGHT", 0.4))
 FAISS_ENABLED = os.getenv("FAISS_ENABLED", "true").lower() == "true"
 FAISS_EMBEDDING_DIM = int(os.getenv("FAISS_EMBEDDING_DIM", "1024"))  # bge-m3 dense 维度
 FAISS_INDEX_TYPE = os.getenv("FAISS_INDEX_TYPE", "flat")  # flat, ivf, hnsw
+INDEX_CACHE_ENABLED = os.getenv("INDEX_CACHE_ENABLED", "false").lower() == "true"
+INDEX_CACHE_DIR = os.getenv("INDEX_CACHE_DIR", str(PROJECT_ROOT / "data" / "index_cache"))
 
 # ==================== Embedding 配置 ====================
 # 通义千问 Embedding 模型配置
@@ -158,6 +169,15 @@ FEW_SHOT_MIN_SIMILARITY = float(os.getenv("FEW_SHOT_MIN_SIMILARITY", "0.5"))  # 
 SQL_DIALECT = os.getenv("SQL_DIALECT", "mysql")
 SQL_MAX_LENGTH = int(os.getenv("SQL_MAX_LENGTH", 2000))
 SQL_VALIDATION_ENABLED = os.getenv("SQL_VALIDATION_ENABLED", "true").lower() == "true"
+SQL_QUERY_MAX_ROWS = int(os.getenv("SQL_QUERY_MAX_ROWS", "500"))
+SQL_QUERY_TIMEOUT_MS = int(os.getenv("SQL_QUERY_TIMEOUT_MS", "10000"))
+SQL_SCOPE_ENFORCEMENT = os.getenv("SQL_SCOPE_ENFORCEMENT", "true").lower() == "true"
+SQL_BLOCKED_TABLES = [
+    value.strip() for value in os.getenv(
+        "SQL_BLOCKED_TABLES",
+        "sql_generation_history,user_feedback,table_schema,column_schema",
+    ).split(',') if value.strip()
+]
 
 # ==================== 日志配置 ====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -217,6 +237,14 @@ def validate_config():
         errors.append(f"FEW_SHOT_TOP_K 必须大于 0：{FEW_SHOT_TOP_K}")
     if not (0 <= FEW_SHOT_MIN_SIMILARITY <= 1):
         errors.append(f"FEW_SHOT_MIN_SIMILARITY 应在 0-1 范围内：{FEW_SHOT_MIN_SIMILARITY}")
+    if SQL_QUERY_MAX_ROWS <= 0:
+        errors.append(f"SQL_QUERY_MAX_ROWS 必须大于 0：{SQL_QUERY_MAX_ROWS}")
+    if SQL_QUERY_TIMEOUT_MS <= 0:
+        errors.append(f"SQL_QUERY_TIMEOUT_MS 必须大于 0：{SQL_QUERY_TIMEOUT_MS}")
+    if PROMPT_MAX_LENGTH < 1000:
+        errors.append(f"PROMPT_MAX_LENGTH 不应小于 1000：{PROMPT_MAX_LENGTH}")
+    if UPLOAD_MAX_BYTES <= 0 or GRAPH_MAX_NODES <= 0 or GRAPH_MAX_EDGES <= 0:
+        errors.append("上传大小、图节点数和图关系数限制必须大于 0")
 
     # 验证 BM25 参数
     if BM25_K1 <= 0:

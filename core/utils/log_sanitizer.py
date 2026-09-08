@@ -2,7 +2,7 @@
 日志脱敏工具模块
 提供统一的日志脱敏函数，防止敏感信息泄露
 """
-from typing import Optional
+import hashlib
 
 
 def truncate_log(text: str, max_length: int = 100, suffix: str = "...") -> str:
@@ -43,8 +43,21 @@ def sanitize_sql(sql: str, max_length: int = 80) -> str:
     """
     if not sql:
         return sql
-    # 移除多余的空白字符
-    sanitized = ' '.join(sql.split())
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        statement = sqlglot.parse_one(sql)
+        statement = statement.transform(
+            lambda node: exp.Placeholder() if isinstance(node, exp.Literal) else node
+        )
+        sanitized = statement.sql()
+    except Exception:
+        import re
+
+        sanitized = re.sub(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"", "?", sql)
+        sanitized = re.sub(r"\b\d+(?:\.\d+)?\b", "?", sanitized)
+    sanitized = ' '.join(sanitized.split())
     # 截断
     return truncate_log(sanitized, max_length)
 
@@ -66,6 +79,11 @@ def sanitize_query(query: str, max_length: int = 60) -> str:
     sanitized = ' '.join(query.split())
     # 截断
     return truncate_log(sanitized, max_length)
+
+
+def text_fingerprint(text: str) -> str:
+    """返回不可逆短摘要，用于关联日志而不记录原始用户内容。"""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
 
 
 def mask_sensitive(text: str, pattern: str = r'(password|api_key|token|secret)\s*[=:]\s*\S+',

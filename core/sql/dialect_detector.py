@@ -90,7 +90,7 @@ class SQLDialectDetector:
                     # 返回第一个匹配的数据库类型
                     matching_db = next((d for d in self.database_cache if d["db_type"] == db_type), None)
                     if matching_db:
-                        return db_type, matching_db["id"]
+                        return db_type, matching_db["database_id"]
                     return db_type, None
 
         # 3. 检查表名模式

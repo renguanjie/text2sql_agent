@@ -2,6 +2,7 @@
 知识图谱构建页面
 支持从 DDL 文件或活体数据库构建知识图谱
 """
+# ruff: noqa: E402
 import streamlit as st
 from pathlib import Path
 import sys
@@ -14,8 +15,9 @@ sys.path.insert(0, str(project_root))
 
 from core.graph_builder import GraphBuilderPipeline
 from config import (
-    LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
+    LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL, UPLOAD_MAX_BYTES
 )
+from core.utils.upload_limits import UploadValidationError, read_uploaded_text
 
 
 def render_graph_builder():
@@ -99,16 +101,16 @@ def render_graph_builder():
                 else:
                     is_json = False
 
-                # 保存上传的文件（使用唯一临时文件，避免并发覆盖）
-                suffix = ".json" if is_json else ".sql"
-                temp_file = tempfile.NamedTemporaryFile(
-                    mode='w', suffix=suffix, delete=False, encoding='utf-8'
-                )
-                temp_path = Path(temp_file.name)
-                temp_file.write(uploaded_file.getvalue().decode('utf-8'))
-                temp_file.close()
-
+                temp_path = None
                 try:
+                    content = read_uploaded_text(uploaded_file, UPLOAD_MAX_BYTES)
+                    suffix = ".json" if is_json else ".sql"
+                    temp_file = tempfile.NamedTemporaryFile(
+                        mode='w', suffix=suffix, delete=False, encoding='utf-8'
+                    )
+                    temp_path = Path(temp_file.name)
+                    temp_file.write(content)
+                    temp_file.close()
                     with st.spinner("正在构建知识图谱..."):
                         progress_bar = st.progress(0)
                         status_text = st.empty()
@@ -125,15 +127,15 @@ def render_graph_builder():
                         status_text.text("阶段 1/4: 抽取元数据...")
                         progress_bar.progress(25)
                         if is_json:
-                            result = pipeline.extract_from_json(json_path=str(temp_path))
+                            pipeline.extract_from_json(json_path=str(temp_path))
                         else:
-                            result = pipeline.extract_from_files(
+                            pipeline.extract_from_files(
                                 ddl_path=str(temp_path),
                                 database_name=db_name,
                                 db_type=db_type
                             )
 
-                        status_text.text(f"阶段 2/4: AI 语义增强...")
+                        status_text.text("阶段 2/4: AI 语义增强...")
                         progress_bar.progress(50)
                         if enable_ai and LLM_API_KEY:
                             pipeline.enrich(enable_concepts=True, enable_relations=True)
@@ -188,10 +190,12 @@ def render_graph_builder():
                         然后才能使用新的知识库进行 SQL 查询。
                         """)
 
+                except UploadValidationError as e:
+                    st.error(f"文件校验失败：{e}")
                 except Exception as e:
                     st.error(f"构建失败：{e}")
                 finally:
-                    if temp_path.exists():
+                    if temp_path is not None and temp_path.exists():
                         temp_path.unlink()
 
     # ==================== Tab 2: 活体数据库构建 ====================
@@ -202,12 +206,12 @@ def render_graph_builder():
         ⚠️ **注意事项**
         - 需要提供数据库连接 URI
         - 将读取 INFORMATION_SCHEMA 获取元数据
-        - 支持 MySQL、Oracle、SparkSQL
+        - 当前活体抽取支持 MySQL；其他方言可通过 DDL/JSON 文件导入
         """)
 
         col1, col2 = st.columns(2)
         with col1:
-            db_type = st.selectbox("数据库类型", ["mysql", "postgresql", "oracle"], index=0)
+            db_type = st.selectbox("数据库类型", ["mysql"], index=0)
             schema_name = st.text_input("Schema/数据库名", value="")
         with col2:
             db_host = st.text_input("主机", value="localhost")
@@ -245,7 +249,7 @@ def render_graph_builder():
 
                         status_text.text("阶段 1/4: 连接数据库...")
                         progress_bar.progress(25)
-                        result = pipeline.extract_from_db(
+                        pipeline.extract_from_db(
                             db_uri=db_uri,
                             db_type=db_type,
                             schema=schema_name

@@ -3,9 +3,8 @@ Neon PostgreSQL + Neo4j 知识库集成模块
 实现基于 Neo4j 知识库的动态提示词构建和 LLM SQL 生成
 """
 from neo4j import GraphDatabase
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Tuple
 from loguru import logger
-import json
 
 
 class Neo4jKnowledgeRetriever:
@@ -152,7 +151,7 @@ class Neo4jKnowledgeRetriever:
             lines.append(f"\n### 表：{table['name']}")
             lines.append(f"中文名称：{table['name_cn']}")
             lines.append(f"说明：{table.get('comment', '')}")
-            lines.append(f"\n字段列表 (必须使用以下 exact 字段名):")
+            lines.append("\n字段列表 (必须使用以下 exact 字段名):")
             lines.append("| 字段名 | 中文名 | 类型 | 可空 |")
             lines.append("|--------|--------|------|------|")
 
@@ -161,7 +160,7 @@ class Neo4jKnowledgeRetriever:
                 lines.append(f"| `{col['name']}` | {col['name_cn']} | {col['type']} | {nullable} |")
 
             if include_relations and table['relations']:
-                lines.append(f"\n关联关系 (JOIN 时使用以下条件):")
+                lines.append("\n关联关系 (JOIN 时使用以下条件):")
                 for rel in table['relations']:
                     lines.append(f"- `{table['name']}` → `{rel['target_table']}` (关联字段：{rel['on_column']})")
 

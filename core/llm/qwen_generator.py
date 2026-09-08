@@ -3,7 +3,6 @@
 使用 Neo4j 知识库动态构建提示词
 """
 import requests
-import json
 from typing import Dict, Any, Optional
 from loguru import logger
 
@@ -192,7 +191,7 @@ def generate_sql_with_qwen(user_query: str, schema_prompt: str,
 
         # 如果需要重试且有错误
         if retry_on_error and result.get('error'):
-            logger.info(f"尝试修复 SQL...")
+            logger.info("尝试修复 SQL...")
             fix_prompt = f"""原始查询：{user_query}
 
 生成的 SQL 有错误：{result['error']}
@@ -214,7 +213,7 @@ Schema:
                 if fixed_sql and fixed_sql != "INSUFFICIENT_INFO":
                     result['sql'] = fixed_sql
                     result['was_fixed'] = True
-                    logger.info(f"SQL 修复成功")
+                    logger.info("SQL 修复成功")
 
     return result
 
@@ -259,7 +258,7 @@ def test_qwen_generation():
         )
 
         if result['success']:
-            print(f"✅ 生成成功")
+            print("✅ 生成成功")
             print(f"   SQL: {result.get('sql', 'N/A')[:100]}...")
             print(f"   Tokens: {result.get('usage', {})}")
         else:

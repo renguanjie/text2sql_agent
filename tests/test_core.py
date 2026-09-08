@@ -2,6 +2,7 @@
 Text2SQL 智能体测试模块
 """
 import pytest
+import numpy as np
 
 
 class TestNeo4jClient:
@@ -89,6 +90,25 @@ class TestBM25Retriever:
 
         assert len(results) <= 2
         assert results[0][0]['content'] is not None
+
+
+class TestEmbeddingFactory:
+    """Embedding 工厂测试"""
+
+    def test_batch_fallback_matches_provider_dimension(self):
+        """外部 Embedding 不可用降级时，批量结果仍保持 provider 维度。"""
+        from core.embedding_factory import EmbeddingFactory
+
+        factory = EmbeddingFactory(provider="dashscope", model="text-embedding-v1", api_key="")
+        factory._get_dashscope_embeddings_batch = lambda texts: np.array([
+            np.ones(384, dtype=np.float32) for _ in texts
+        ])
+
+        embeddings = factory.get_embeddings_batch(["用户表", "订单表"])
+
+        assert embeddings.shape == (2, 1536)
+        assert np.allclose(embeddings[:, :384], 1.0)
+        assert np.allclose(embeddings[:, 384:], 0.0)
 
 
 class TestSQLValidator:

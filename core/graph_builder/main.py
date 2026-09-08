@@ -28,13 +28,17 @@ class GraphBuilderPipeline:
     def extract_from_db(self, db_uri: str, db_type: str = "mysql",
                         schema: Optional[str] = None) -> SchemaExtractResult:
         extractor = LiveDBExtractor(db_uri=db_uri, db_type=db_type, schema=schema)
-        self.result = extractor.extract()
-        extractor.close()
+        try:
+            self.result = extractor.extract()
+        finally:
+            extractor.close()
         return self.result
 
     def extract_from_files(self, ddl_path: Optional[str] = None,
                            database_name: str = "default",
                            db_type: str = "mysql") -> SchemaExtractResult:
+        if not ddl_path:
+            raise ValueError("必须提供 DDL 文件路径")
         extractor = OfflineExtractor(
             ddl_path=ddl_path,
             database_name=database_name,
@@ -42,11 +46,17 @@ class GraphBuilderPipeline:
             neo4j_client=self.neo4j_client
         )
         self.result = extractor.extract()
+        if not self.result.tables:
+            raise ValueError("DDL 文件中未解析到任何表")
         return self.result
 
     def extract_from_json(self, json_path: Optional[str] = None) -> SchemaExtractResult:
+        if not json_path:
+            raise ValueError("必须提供 JSON 文件路径")
         extractor = OfflineJSONExtractor(json_path=json_path)
         self.result = extractor.extract()
+        if not self.result.tables:
+            raise ValueError("JSON 文件中未解析到任何表")
         return self.result
 
     def enrich(self, enable_concepts: bool = True, enable_relations: bool = True):
@@ -81,10 +91,24 @@ class GraphBuilderPipeline:
         client = neo4j_client or self.neo4j_client
         if not client:
             raise ValueError("必须提供 Neo4j 客户端")
+        if not getattr(client, 'driver', None):
+            raise ConnectionError("Neo4j 客户端未连接，无法装载知识图谱")
 
         logger.info("开始装载到 Neo4j...")
         loader = Neo4jGraphBuilder(client)
         stats = loader.build(self.result)
+        expected_counts = {
+            'databases': len(self.result.databases),
+            'tables': len(self.result.tables),
+            'columns': sum(len(table.columns) for table in self.result.tables),
+            'relationships': len(self.result.relationships),
+        }
+        failed_entities = [
+            name for name, expected in expected_counts.items()
+            if expected > 0 and stats.get(name, 0) == 0
+        ]
+        if failed_entities:
+            raise RuntimeError(f"Neo4j 装载失败：{', '.join(failed_entities)} 未写入")
         if self.result.concepts:
             loader.link_concepts_to_tables(self.result.concepts)
         return {**stats, **loader.get_graph_stats()}
@@ -99,8 +123,10 @@ class GraphBuilderPipeline:
         logger.info("阶段 1: 数据抽取 (Extractor)")
         if source_type == "live_db":
             self.extract_from_db(**source_config)
-        else:
+        elif source_type == "offline":
             self.extract_from_files(**source_config)
+        else:
+            raise ValueError(f"不支持的数据源类型：{source_type}")
         logger.info(f"抽取完成 - 表：{len(self.result.tables)}")
 
         if enable_enrichment:

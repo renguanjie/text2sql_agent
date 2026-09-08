@@ -5,12 +5,11 @@ SQL 字段验证器
 """
 import os
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect
 from typing import Dict, List, Set, Tuple, Optional, Any
 from loguru import logger
 
 try:
-    import sqlglot
     from sqlglot import exp, parse, ParseError
     from sqlglot.expressions import (
         Select, Table, Column, Identifier,
@@ -19,6 +18,11 @@ try:
     SQLGLOT_AVAILABLE = True
 except ImportError:
     SQLGLOT_AVAILABLE = False
+    # 占位类型，确保模块可导入（方法内会检查 SQLGLOT_AVAILABLE）
+    exp = None
+    parse = None
+    ParseError = Exception
+    Select = Table = Column = Identifier = Join = From = CTE = Subquery = Alias = type
     logger.warning("sqlglot 未安装，AST 解析功能将不可用。安装：pip install sqlglot")
 
 
@@ -541,10 +545,10 @@ def test_validator():
         is_valid, errors = validator.validate_sql(test['sql'])
 
         if is_valid == test['expected']:
-            print(f"✅ 通过")
+            print("✅ 通过")
             passed += 1
         else:
-            print(f"❌ 失败")
+            print("❌ 失败")
             print(f"   期望：{'有效' if test['expected'] else '无效'}")
             print(f"   实际：{'有效' if is_valid else '无效'}")
             if errors:

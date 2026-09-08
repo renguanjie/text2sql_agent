@@ -5,7 +5,6 @@ Neon PostgreSQL 表结构同步到 Neo4j 知识库
 import json
 import os
 from neo4j import GraphDatabase
-from sqlalchemy import create_engine, inspect, text
 
 # ==================== 配置 ====================
 
@@ -134,7 +133,6 @@ COLUMN_TRANSLATIONS = {
     'loan_id': '贷款 ID',
     'loan_type': '贷款类型',
     'loan_amount': '贷款金额',
-    'loan_balance': '贷款余额',
     'interest_rate': '利率',
     'term_months': '期限 (月)',
     'repayment_method': '还款方式',
@@ -445,7 +443,7 @@ def sync_schema_to_neo4j():
         rel_count = session.run("MATCH ()-[r]->() RETURN count(r) as count").single()['count']
     
     print(f"\n{'=' * 60}")
-    print(f"✅ 同步完成!")
+    print("✅ 同步完成!")
     print(f"   表：{table_count} 个")
     print(f"   字段：{column_count} 个")
     print(f"   关系：{rel_count} 个")

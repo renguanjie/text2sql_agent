@@ -4,13 +4,20 @@ SQL 生成器模块
 支持多数据库方言动态检测
 """
 from typing import Dict, List, Optional, Any, Tuple
-import asyncio
 from loguru import logger
+import uuid
 
 from ..retrieval.bm25_tfidf import KnowledgeRetriever
 from ..chain.sql_chain import SQLGenerationChain, QueryRewriteChain
 from ..history.mysql_client import MySQLClient
 from .dialect_detector import SQLDialectDetector
+from ..utils.log_sanitizer import sanitize_sql, text_fingerprint
+from .validator import (
+    constrain_read_query,
+    is_safe_read_query,
+    validate_query_scope,
+    validate_sql,
+)
 
 
 class SQLGenerator:
@@ -28,18 +35,24 @@ class SQLGenerator:
         self.config = config or {}
         self.neo4j_client = neo4j_client
 
-        self.rewrite_chain = QueryRewriteChain(llm) if self.config.get('enable_rewrite', False) else None
+        self.rewrite_chain = QueryRewriteChain(
+            llm, prompt_max_length=self.config.get('prompt_max_length', 4000)
+        ) if self.config.get('enable_rewrite', False) else None
         self.dialect_detector = SQLDialectDetector(neo4j_client) if neo4j_client else None
         logger.info(f"SQL 生成器初始化完成，方言检测器：{'已启用' if self.dialect_detector else '未启用'}")
 
     # ==================== 核心共享逻辑 ====================
 
-    async def _prepare_query(self, user_query: str, use_async: bool = False) -> str:
-        """查询改写（可选）"""
+    def _prepare_query_sync(self, user_query: str) -> str:
+        """查询改写（同步版本，避免 asyncio.run 事件循环冲突）"""
         if self.rewrite_chain:
-            if use_async:
-                return await self.rewrite_chain.rewrite_async(user_query)
             return self.rewrite_chain.rewrite(user_query)
+        return user_query
+
+    async def _prepare_query_async(self, user_query: str) -> str:
+        """异步改写查询。"""
+        if self.rewrite_chain:
+            return await self.rewrite_chain.rewrite_async(user_query)
         return user_query
 
     def _detect_dialect_and_db(self, user_query: str,
@@ -58,7 +71,10 @@ class SQLGenerator:
             logger.info(f"切换方言：{self.sql_chain.dialect} -> {dialect}")
             self.sql_chain.dialect = dialect
             from ..chain.prompts import SQLPromptTemplates
-            self.sql_chain.prompt_templates = SQLPromptTemplates(dialect=dialect)
+            self.sql_chain.prompt_templates = SQLPromptTemplates(
+                dialect=dialect,
+                max_length=getattr(self.sql_chain, 'prompt_max_length', 4000),
+            )
 
     def _get_few_shot_examples(self, query: str) -> str:
         """获取 Few-Shot 示例"""
@@ -78,28 +94,139 @@ class SQLGenerator:
 
     def _save_history_and_few_shot(self, user_query: str, result: Dict,
                                      retrieval_query: str, session_id: Optional[str]):
-        """保存历史记录并更新 Few-Shot 索引"""
+        """保存待执行历史；仅执行成功的记录才会进入 Few-Shot。"""
         if not self.mysql_client or not result.get('sql'):
             return
+        validation = result.get('validation')
+        if validation:
+            validation_status = 'success' if validation.get('valid') else 'fail'
+            validation_error = '; '.join(validation.get('errors', [])) or None
+        else:
+            validation_status = 'pending'
+            validation_error = result.get('error')
         history_id = self.mysql_client.save_sql_history(
             user_query=user_query,
             generated_sql=result['sql'],
             session_id=session_id,
             matched_knowledge=result.get('matched_knowledge'),
             retrieval_query=retrieval_query,
-            validation_status=result.get('status', 'pending'),
-            validation_error=result.get('error')
+            validation_status=validation_status,
+            validation_error=validation_error,
         )
-        if history_id and result.get('status') == 'success':
-            self.knowledge_retriever.add_history_record({
-                'id': history_id,
-                'user_query': user_query,
-                'generated_sql': result['sql'],
-                'execution_status': 'success',
-                'validation_status': 'success'
-            })
+        if history_id:
+            result['history_id'] = history_id
+
+    def _promote_history_to_few_shot(self, history_id: int) -> None:
+        """将真实执行成功的历史记录加入 Few-Shot 索引。"""
+        history = self.mysql_client.get_history_detail(history_id)
+        if history and history.get('execution_status') == 'success':
+            self.knowledge_retriever.add_history_record(history)
+
+    def _validate_generation_result(self, result: Dict, dialect: str,
+                                    allowed_tables: Optional[List[str]] = None,
+                                    allowed_schemas: Optional[List[str]] = None) -> Dict:
+        """为提取成功的 SQL 附加真实校验结果，供历史与 UI 复用。"""
+        if result.get('status') != 'success' or not result.get('sql'):
+            return result
+        if not self.config.get('sql_validation_enabled', True):
+            return result
+
+        sql = result['sql']
+        max_length = self.config.get('sql_max_length', 2000)
+        if max_length and len(sql) > max_length:
+            result['validation'] = {
+                'valid': False,
+                'syntax_valid': False,
+                'execution_valid': False,
+                'errors': [f'SQL 长度超过限制（{max_length} 字符）'],
+                'warnings': [],
+                'formatted_sql': sql,
+            }
+        else:
+            result['validation'] = validate_sql(sql, dialect=dialect)
+            if result['validation'].get('valid') and self.config.get(
+                'sql_scope_enforcement', True
+            ):
+                scope = validate_query_scope(
+                    sql,
+                    allowed_tables=allowed_tables,
+                    allowed_schemas=allowed_schemas,
+                    blocked_tables=self.config.get('sql_blocked_tables'),
+                    dialect=dialect,
+                )
+                if not scope['valid']:
+                    result['validation']['valid'] = False
+                    result['validation']['execution_valid'] = False
+                    result['validation']['errors'].extend(scope['errors'])
+        return result
+
+    def _attach_execution_scope(self, result: Dict, ctx: Dict[str, Any]) -> None:
+        """将本次生成使用的 Schema 边界附在结果上，供执行阶段复核。"""
+        tables = {
+            table.get('table_name') or table.get('name')
+            for table in ctx['schema_info'].get('tables', [])
+        }
+        result['allowed_tables'] = sorted(name for name in tables if name)
+        database = getattr(self.mysql_client, 'database', None) if self.mysql_client else None
+        result['allowed_schemas'] = [database] if database else []
+        result['target_database_id'] = ctx.get('detected_database_id')
 
     # ==================== 公共方法 ====================
+
+    def _build_pipeline_context(self, final_query: str, detected_dialect: str,
+                                detected_database_id: Optional[int],
+                                use_few_shot: bool) -> Dict[str, Any]:
+        """在查询改写完成后组装检索、Schema 与方言上下文。"""
+        knowledge_results = self._retrieve_knowledge(final_query, detected_database_id)
+        few_shot_examples = self._get_few_shot_examples(final_query) if use_few_shot else ""
+        schema_info = self._get_schema_info(database_id=detected_database_id)
+        self._switch_dialect_if_needed(detected_dialect)
+        return {
+            'final_query': final_query,
+            'detected_dialect': detected_dialect,
+            'detected_database_id': detected_database_id,
+            'knowledge_results': knowledge_results,
+            'few_shot_examples': few_shot_examples,
+            'schema_info': schema_info,
+        }
+
+    def _prepare_pipeline(self, user_query: str, target_dialect: Optional[str],
+                          target_database_id: Optional[int],
+                          use_few_shot: bool) -> Dict[str, Any]:
+        """同步准备生成上下文。"""
+        use_few_shot = use_few_shot and self.config.get('few_shot_enabled', True)
+        detected_dialect, detected_database_id = self._detect_dialect_and_db(
+            user_query, target_dialect, target_database_id
+        )
+        logger.info(f"方言检测结果：dialect={detected_dialect}, database_id={detected_database_id}")
+        final_query = self._prepare_query_sync(user_query)
+        if self.rewrite_chain:
+            logger.info(
+                f"查询改写完成：query_id={text_fingerprint(user_query)}, "
+                f"input_chars={len(user_query)}, output_chars={len(final_query)}"
+            )
+        return self._build_pipeline_context(
+            final_query, detected_dialect, detected_database_id, use_few_shot
+        )
+
+    async def _prepare_pipeline_async(self, user_query: str, target_dialect: Optional[str],
+                                      target_database_id: Optional[int],
+                                      use_few_shot: bool) -> Dict[str, Any]:
+        """异步准备生成上下文，避免阻塞异步 LLM 查询改写。"""
+        use_few_shot = use_few_shot and self.config.get('few_shot_enabled', True)
+        detected_dialect, detected_database_id = self._detect_dialect_and_db(
+            user_query, target_dialect, target_database_id
+        )
+        logger.info(f"方言检测结果：dialect={detected_dialect}, database_id={detected_database_id}")
+        final_query = await self._prepare_query_async(user_query)
+        if self.rewrite_chain:
+            logger.info(
+                f"异步查询改写完成：query_id={text_fingerprint(user_query)}, "
+                f"input_chars={len(user_query)}, output_chars={len(final_query)}"
+            )
+        return self._build_pipeline_context(
+            final_query, detected_dialect, detected_database_id, use_few_shot
+        )
 
     def generate_sql(self, user_query: str, session_id: Optional[str] = None,
                     auto_save_history: bool = True,
@@ -107,42 +234,31 @@ class SQLGenerator:
                     target_dialect: Optional[str] = None,
                     target_database_id: Optional[int] = None) -> Dict[str, Any]:
         """生成 SQL 的主入口（同步）"""
-        logger.info(f"开始生成 SQL, query={user_query}")
-
-        # 1. 检测方言和目标数据库
-        detected_dialect, detected_database_id = self._detect_dialect_and_db(
-            user_query, target_dialect, target_database_id
+        logger.info(
+            f"开始生成 SQL：query_id={text_fingerprint(user_query)}, chars={len(user_query)}"
         )
-        logger.info(f"方言检测结果：dialect={detected_dialect}, database_id={detected_database_id}")
 
-        # 2. 查询改写
-        final_query = asyncio.run(self._prepare_query(user_query, use_async=False))
-        if self.rewrite_chain:
-            logger.info(f"查询改写：{user_query} -> {final_query}")
-
-        # 3. 检索知识库
-        knowledge_results = self._retrieve_knowledge(final_query, detected_database_id)
-
-        # 4. Few-Shot 示例
-        few_shot_examples = self._get_few_shot_examples(final_query) if use_few_shot else ""
-
-        # 5. 获取 Schema 信息
-        schema_info = self._get_schema_info(database_id=detected_database_id)
-
-        # 6. 方言切换
-        self._switch_dialect_if_needed(detected_dialect)
+        ctx = self._prepare_pipeline(user_query, target_dialect, target_database_id, use_few_shot)
 
         # 7. 生成 SQL
         result = self.sql_chain.generate(
-            user_query=final_query,
-            schema_info=schema_info,
-            knowledge_results=knowledge_results,
+            user_query=ctx['final_query'],
+            schema_info=ctx['schema_info'],
+            knowledge_results=ctx['knowledge_results'],
             session_id=session_id,
-            few_shot_examples=few_shot_examples
+            few_shot_examples=ctx['few_shot_examples']
+        )
+        self._attach_execution_scope(result, ctx)
+        self._validate_generation_result(
+            result,
+            ctx['detected_dialect'],
+            result['allowed_tables'],
+            result['allowed_schemas'],
         )
 
         # 8. 保存历史
-        self._save_history_and_few_shot(user_query, result, final_query, session_id)
+        if auto_save_history:
+            self._save_history_and_few_shot(user_query, result, ctx['final_query'], session_id)
 
         return result
 
@@ -152,48 +268,39 @@ class SQLGenerator:
                                  target_dialect: Optional[str] = None,
                                  target_database_id: Optional[int] = None) -> Dict[str, Any]:
         """生成 SQL 的异步入口"""
-        logger.info(f"开始异步生成 SQL, query={user_query}")
-
-        # 1. 检测方言和目标数据库
-        detected_dialect, detected_database_id = self._detect_dialect_and_db(
-            user_query, target_dialect, target_database_id
+        logger.info(
+            f"开始异步生成 SQL：query_id={text_fingerprint(user_query)}, chars={len(user_query)}"
         )
-        logger.info(f"方言检测结果：dialect={detected_dialect}, database_id={detected_database_id}")
 
-        # 2. 查询改写（异步）
-        final_query = await self._prepare_query(user_query, use_async=True)
-        if self.rewrite_chain:
-            logger.info(f"查询改写：{user_query} -> {final_query}")
-
-        # 3. 检索知识库
-        knowledge_results = self._retrieve_knowledge(final_query, detected_database_id)
-
-        # 4. Few-Shot 示例
-        few_shot_examples = self._get_few_shot_examples(final_query) if use_few_shot else ""
-
-        # 5. 获取 Schema 信息
-        schema_info = self._get_schema_info(database_id=detected_database_id)
-
-        # 6. 方言切换
-        self._switch_dialect_if_needed(detected_dialect)
+        ctx = await self._prepare_pipeline_async(
+            user_query, target_dialect, target_database_id, use_few_shot
+        )
 
         # 7. 异步生成 SQL
         result = await self.sql_chain.generate_async(
-            user_query=final_query,
-            schema_info=schema_info,
-            knowledge_results=knowledge_results,
+            user_query=ctx['final_query'],
+            schema_info=ctx['schema_info'],
+            knowledge_results=ctx['knowledge_results'],
             session_id=session_id,
-            few_shot_examples=few_shot_examples
+            few_shot_examples=ctx['few_shot_examples']
+        )
+        self._attach_execution_scope(result, ctx)
+        self._validate_generation_result(
+            result,
+            ctx['detected_dialect'],
+            result['allowed_tables'],
+            result['allowed_schemas'],
         )
 
         # 8. 保存历史
-        self._save_history_and_few_shot(user_query, result, final_query, session_id)
+        if auto_save_history:
+            self._save_history_and_few_shot(user_query, result, ctx['final_query'], session_id)
 
         return result
 
     def _get_schema_info(self, database_id: Optional[int] = None) -> Dict:
         """获取 Schema 信息"""
-        if self.neo4j_client:
+        if self.neo4j_client and getattr(self.neo4j_client, 'driver', None):
             return self._get_schema_from_neo4j(database_id)
         if self.mysql_client:
             return self._get_schema_from_mysql(database_id)
@@ -308,89 +415,100 @@ class SQLGenerator:
 
     # ==================== 其他公共方法 ====================
 
-    def execute_sql(self, sql: str, history_id: Optional[int] = None) -> Dict[str, Any]:
+    def execute_sql(self, sql: str, history_id: Optional[int] = None,
+                    allowed_tables: Optional[List[str]] = None,
+                    allowed_schemas: Optional[List[str]] = None) -> Dict[str, Any]:
         """执行 SQL"""
         if not self.mysql_client:
             return {'status': 'error', 'error': 'MySQL 客户端未连接', 'data': None}
 
-        logger.info(f"执行 SQL: {sql[:60].replace(chr(10), ' ')}...")
+        logger.info(f"执行 SQL 摘要：{sanitize_sql(sql)}")
 
         try:
-            if not self._is_safe_query(sql):
-                return {'status': 'error', 'error': '只允许执行 SELECT 查询', 'data': None}
+            safety_error = self._get_query_safety_error(sql, allowed_tables, allowed_schemas)
+            if safety_error:
+                if history_id:
+                    self.mysql_client.update_sql_execution(
+                        history_id=history_id,
+                        execution_status='fail',
+                        execution_error=safety_error,
+                    )
+                return {'status': 'error', 'error': safety_error, 'data': None}
 
-            results = self.mysql_client.execute_query(sql)
+            max_rows = int(self.config.get('sql_query_max_rows', 500))
+            constrained_sql = constrain_read_query(
+                sql,
+                max_rows=max_rows,
+                timeout_ms=int(self.config.get('sql_query_timeout_ms', 10000)),
+                dialect=self.sql_chain.dialect,
+            )
+            results, truncated = self.mysql_client.execute_query_limited(
+                constrained_sql, max_rows=max_rows
+            )
 
             if history_id and self.mysql_client:
                 self.mysql_client.update_sql_execution(
                     history_id=history_id,
                     execution_status='success',
-                    execution_result={'row_count': len(results), 'data_preview': results[:5]}
+                    execution_result={
+                        'row_count': len(results),
+                        'data_preview': results[:5],
+                        'truncated': truncated,
+                    }
                 )
+                self._promote_history_to_few_shot(history_id)
 
             return {
                 'status': 'success', 'error': None,
-                'data': results, 'row_count': len(results)
+                'data': results, 'row_count': len(results), 'truncated': truncated
             }
         except Exception as e:
-            logger.error(f"SQL 执行失败：{e}")
+            error_id = uuid.uuid4().hex[:12]
+            logger.opt(exception=e).error(f"SQL 执行失败，error_id={error_id}")
+            public_error = f"查询执行失败，请联系管理员并提供错误编号 {error_id}"
             if history_id and self.mysql_client:
                 self.mysql_client.update_sql_execution(
-                    history_id=history_id, execution_status='fail', execution_error=str(e)
+                    history_id=history_id,
+                    execution_status='fail',
+                    execution_error=public_error,
                 )
-            return {'status': 'fail', 'error': str(e), 'data': None}
+            return {'status': 'fail', 'error': public_error, 'data': None}
 
     def _is_safe_query(self, sql: str) -> bool:
-        """检查 SQL 是否安全（只允许 SELECT / WITH ... SELECT）
+        """检查 SQL 是否为单条、无副作用的只读查询。"""
+        max_length = self.config.get('sql_max_length', 2000)
+        if max_length and len(sql) > max_length:
+            return False
+        return is_safe_read_query(sql, dialect=self.sql_chain.dialect)
 
-        优先使用 sqlglot AST 解析顶层语句类型，避免字符串匹配的绕过风险。
-        解析失败时回退到关键字检查。
-        """
-        # 尝试用 sqlglot AST 解析
-        try:
-            import sqlglot
-            parsed = sqlglot.parse(sql)
-            if not parsed:
-                return False
-            for statement in parsed:
-                if statement is None:
-                    continue
-                stmt_type = type(statement).__name__
-                # 仅允许 SELECT、UNION（查询组合）、With（CTE 包裹的查询）
-                if stmt_type not in ('Select', 'Union', 'With'):
-                    return False
-                # 对于 With 语句，检查其主体是否也是 SELECT
-                if stmt_type == 'With':
-                    body = statement.args.get('this')
-                    if body and type(body).__name__ not in ('Select', 'Union'):
-                        return False
-            return True
-        except ImportError:
-            logger.warning("sqlglot 未安装，SQL 安全校验回退到关键字模式")
-        except Exception as e:
-            logger.warning(f"sqlglot 解析失败，回退到关键字模式: {e}")
-
-        # 回退：增强版关键字检查（去注释 + 多语句拆分）
-        import re
-        sql_upper = sql.strip().upper()
-        sql_no_comments = re.sub(r'--.*$', '', sql_upper, flags=re.MULTILINE)
-        sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
-        for stmt in sql_no_comments.split(';'):
-            stmt = stmt.strip()
-            if not stmt:
-                continue
-            unsafe_keywords = [
-                'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE',
-                'ALTER', 'TRUNCATE', 'EXEC', 'EXECUTE', 'GRANT', 'REVOKE',
-                'MERGE', 'REPLACE',
+    def _get_query_safety_error(self, sql: str,
+                                allowed_tables: Optional[List[str]],
+                                allowed_schemas: Optional[List[str]]) -> Optional[str]:
+        if not self._is_safe_query(sql):
+            return '仅允许执行符合长度限制的单条只读 SELECT 查询'
+        if not self.config.get('sql_scope_enforcement', True):
+            return None
+        if allowed_tables is None:
+            schema_rows = self.mysql_client.get_table_schema()
+            allowed_tables = [
+                row.get('table_name') for row in schema_rows if row.get('table_name')
             ]
-            for keyword in unsafe_keywords:
-                if stmt.startswith(keyword) or f' {keyword} ' in f' {stmt} ':
-                    return False
-        return True
+        if allowed_schemas is None:
+            database = getattr(self.mysql_client, 'database', None)
+            allowed_schemas = [database] if database else []
+        scope = validate_query_scope(
+            sql,
+            allowed_tables=allowed_tables,
+            allowed_schemas=allowed_schemas,
+            blocked_tables=self.config.get('sql_blocked_tables'),
+            dialect=self.sql_chain.dialect,
+        )
+        return '；'.join(scope['errors']) if not scope['valid'] else None
 
     def fix_and_retry(self, history_id: int, error: str) -> Dict[str, Any]:
         """修复 SQL 并重试"""
+        if not self.mysql_client:
+            return {'status': 'error', 'error': 'MySQL 客户端未连接'}
         history = self.mysql_client.get_history_detail(history_id)
         if not history:
             return {'status': 'error', 'error': '历史记录不存在'}
@@ -403,8 +521,10 @@ class SQLGenerator:
             return fix_result
 
         self.mysql_client.execute_update(
-            "UPDATE sql_generation_history SET generated_sql = %s, validation_status = 'pending' WHERE id = %s",
-            (fix_result['sql'], history_id)
+            """UPDATE sql_generation_history
+               SET generated_sql = :generated_sql, validation_status = 'pending'
+               WHERE id = :history_id""",
+            {"generated_sql": fix_result['sql'], "history_id": history_id},
         )
         return self.execute_sql(fix_result['sql'], history_id)
 
@@ -454,7 +574,8 @@ def create_sql_generator(llm, neo4j_client, mysql_client, config: Optional[Dict]
     sql_chain = SQLGenerationChain(
         llm=llm,
         dialect=config.get('sql_dialect', 'mysql'),
-        retrieval_top_k=config.get('retrieval_top_k', 5)
+        retrieval_top_k=config.get('retrieval_top_k', 5),
+        prompt_max_length=config.get('prompt_max_length', 4000),
     )
 
     # 4. 创建 SQL 生成器

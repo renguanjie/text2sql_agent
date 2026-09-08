@@ -3,6 +3,7 @@
 """
 import sys
 import os
+import json
 from pathlib import Path
 
 import pytest
@@ -14,10 +15,11 @@ from loguru import logger
 from config import NEO4J_ENABLED, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
 from core.knowledge.neo4j_client import get_neo4j_client
 from core.graph_builder import run_pipeline, GraphBuilderPipeline
+from core.graph_builder.extractors.offline_json_extractor import OfflineJSONExtractor
 
 # 配置日志
 logger.remove()
-logger.add(sys.stdout, level="INFO", format="%(message)s")
+logger.add(sys.stdout, level="INFO", format="{message}")
 
 
 def test_offline_extractor():
@@ -64,7 +66,7 @@ def test_offline_extractor():
             database_name="bank_db"
         )
 
-        print(f"\n抽取完成！")
+        print("\n抽取完成！")
         print(f"   数据库：{len(result.databases)}")
         print(f"   表：{len(result.tables)}")
         print(f"   字段：{sum(len(t.columns) for t in result.tables)}")
@@ -88,6 +90,65 @@ def test_offline_extractor():
     finally:
         if ddl_path.exists():
             ddl_path.unlink()
+
+
+def test_offline_json_extractor_preserves_multi_database_metadata(tmp_path):
+    """JSON 导入应保留多数据库、字段别名和关系扩展属性。"""
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps({
+        "databases": [
+            {"database_id": 10, "name": "sales", "db_type": "mysql"},
+            {"id": 20, "name": "finance", "db_type": "mysql"}
+        ],
+        "tables": [
+            {
+                "name": "orders",
+                "database": "sales",
+                "columns": [
+                    {"name": "id", "type": "BIGINT", "is_partition": True}
+                ],
+                "properties": {"owner": "bi"}
+            },
+            {
+                "name": "invoice",
+                "database_id": 20,
+                "columns": [
+                    {"name": "order_id", "data_type": "BIGINT"}
+                ]
+            }
+        ],
+        "relationships": [
+            {
+                "from_table": "invoice",
+                "from_column": "order_id",
+                "to_table": "orders",
+                "to_column": "id",
+                "relationship_type": "foreign_key",
+                "weight": 0.7,
+                "occurrence_count": 3,
+                "source": "import"
+            }
+        ],
+        "concepts": [
+            {"name": "订单", "related_tables": ["orders"]}
+        ]
+    }, ensure_ascii=False), encoding="utf-8")
+
+    result = OfflineJSONExtractor(json_path=str(graph_path)).extract()
+
+    assert [db.id for db in result.databases] == [10, 20]
+    assert result.tables[0].database_id == 10
+    assert result.tables[1].database == "finance"
+    assert result.tables[0].columns[0].data_type == "BIGINT"
+    assert result.tables[0].columns[0].is_partition is True
+    assert result.relationships[0].weight == 0.7
+    assert result.relationships[0].occurrence_count == 3
+    assert result.relationships[0].source == "import"
+    assert result.relationships[0].from_database == "finance"
+    assert result.relationships[0].from_database_id == 20
+    assert result.relationships[0].to_database == "sales"
+    assert result.relationships[0].to_database_id == 10
+    assert result.concepts[0].mapped_tables == ["orders"]
 
 
 def test_full_pipeline_with_neo4j():

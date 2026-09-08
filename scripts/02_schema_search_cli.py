@@ -17,7 +17,7 @@ Schema Agent CLI - AI Agent 专属的 Schema 检索工具
     # 指定数据库
     python scripts/02_schema_search_cli.py "查询用户订单信息" --database-id 2
 """
-import os
+# ruff: noqa: E402
 import sys
 import argparse
 import json

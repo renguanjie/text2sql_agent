@@ -184,6 +184,7 @@ chmod +x scripts/start_server.sh
 - 将 `requirements.txt` 依赖安装到项目内的 `python_deps/` 目录。
 - 根据 `requirements.txt` 哈希判断依赖是否变化，未变化时跳过安装。
 - 通过 `python -m streamlit run app.py` 启动服务，默认监听 `0.0.0.0:8501`。
+- 默认每次从 MySQL/Neo4j 重建知识库检索索引，避免图谱覆盖导入后仍命中旧缓存。
 
 常用部署参数可以写入 `.env`，也可以临时通过环境变量覆盖：
 
@@ -296,6 +297,13 @@ NEON_DB_URL=postgresql://... LLM_API_KEY=... pytest tests/test_llm_integration.p
 | BM25_B | BM25 b 参数 | 0.75 |
 | BM25_WEIGHT | BM25 权重 | 0.6 |
 | DENSE_WEIGHT | FAISS 权重 | 0.4 |
+| FAISS_ENABLED | 是否启用 FAISS 向量检索 | true |
+| FAISS_EMBEDDING_DIM | FAISS 向量维度，需要与 Embedding 模型一致 | 1024 |
+| FAISS_INDEX_TYPE | FAISS 索引类型 | flat |
+| INDEX_CACHE_ENABLED | 是否启用知识库索引磁盘缓存 | false |
+| INDEX_CACHE_DIR | 知识库索引缓存目录 | data/index_cache |
+
+> 图谱导入、覆盖数据库或切换 Embedding 模型后，建议保持 `INDEX_CACHE_ENABLED=false`，让系统从最新数据源重建索引。只有在生产图谱稳定、启动速度优先时再开启缓存。
 
 ### LLM 配置示例
 
@@ -510,7 +518,7 @@ SQL 校验 (SQLFluff)
 数据源:
 ├── DDL 文件 (.sql)
 ├── JSON 文件 (.json)
-└── 活体数据库 (MySQL/Oracle/Spark)
+└── 活体数据库 (当前支持 MySQL；其他方言使用 DDL/JSON 导入)
 
 输出:
 └── Neo4j 知识图谱
@@ -713,7 +721,7 @@ python scripts/01_export_graph_to_md.py
 - ✅ 新增 GraphBuilder Pipeline 模块
 - ✅ 支持从 DDL 文件抽取元数据
 - ✅ 支持从 JSON 文件抽取元数据
-- ✅ 支持从活体数据库抽取元数据
+- ✅ 支持从 MySQL 活体数据库抽取元数据
 - ✅ AI 语义增强：LLM 自动推断表关系
 - ✅ AI 语义增强：LLM 生成业务概念标签
 - ✅ SQL 预编译：生成 JOIN SQL 模板

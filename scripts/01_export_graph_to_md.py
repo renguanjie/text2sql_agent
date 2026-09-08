@@ -8,7 +8,7 @@
 输出:
     data/schemas/schema_export_YYYYMMDD_HHMMSS.md
 """
-import os
+# ruff: noqa: E402
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -195,7 +195,7 @@ def generate_markdown_content(
         safe_db_name = db_name.replace(' ', '-').lower()
         db_id = db.get('database_id', 'N/A')
 
-        md_lines.append(f"---")
+        md_lines.append("---")
         md_lines.append("")
         md_lines.append(f"## {db_name}")
         md_lines.append("")

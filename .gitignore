@@ -1,2 +1,31 @@
 # 项目排除路径
+/.venv/
 /venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment
+.env
+.env.*
+!env.example
+env/
+python_deps/*
+!python_deps/.gitkeep
+.pip_cache/
+
+# IDE / OS
+.DS_Store
+.idea/
+
+# Runtime artifacts
+logs/*.log
+logs/*.log.*
+data/index_cache/
+llm_test_report.json
+tests/llm_test_report.json

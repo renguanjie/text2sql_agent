@@ -2,6 +2,7 @@
 Text2SQL 智能体 - Neon PostgreSQL 版本
 基于阿里云 Qwen-Max + Neo4j 知识库的 SQL 智能生成
 """
+# ruff: noqa: E402
 import streamlit as st
 import sys
 import os
@@ -14,13 +15,11 @@ sys.path.insert(0, str(project_root))
 from config import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
     LLM_API_KEY, LLM_MODEL, LLM_BASE_URL,
-    SQL_DIALECT, RETRIEVAL_TOP_K
+    RETRIEVAL_TOP_K
 )
 from core.knowledge.neon_knowledge import Neo4jKnowledgeRetriever, build_dynamic_prompt
 from core.llm.qwen_generator import QwenMaxLLM, generate_sql_with_qwen
-from core.sql.validator import SQLValidator
 from sqlalchemy import create_engine, text
-import json
 
 # ==================== 页面配置 ====================
 st.set_page_config(

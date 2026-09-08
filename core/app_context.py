@@ -2,7 +2,7 @@
 应用上下文 - 统一管理所有组件的生命周期
 替代原有的全局单例模式
 """
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 from loguru import logger
 
 
@@ -76,6 +76,7 @@ class ApplicationContext:
             self._init_sql_chain()
             self._init_sql_generator()
             self._load_knowledge_base()
+            self._load_few_shot_history()
 
             self._initialized = True
             logger.info("系统初始化完成")
@@ -83,6 +84,8 @@ class ApplicationContext:
 
         except Exception as e:
             logger.error(f"系统初始化失败：{e}")
+            self.shutdown()
+            self._initialized = False
             return False
 
     def _init_llm(self):
@@ -104,8 +107,12 @@ class ApplicationContext:
             user=self.config.get('neo4j_user', 'neo4j'),
             password=self.config.get('neo4j_password', 'neo4j@123'),
             database=self.config.get('neo4j_database', 'neo4j'),
-            max_connection_pool_size=50,
-            connection_timeout=30
+            max_connection_pool_size=self.config.get('neo4j_max_pool_size', 50),
+            connection_timeout=self.config.get('neo4j_connection_timeout', 30),
+            graph_max_nodes=self.config.get('graph_max_nodes', 10000),
+            graph_max_edges=self.config.get('graph_max_edges', 20000),
+            graph_max_depth=self.config.get('graph_max_depth', 20),
+            graph_max_string_length=self.config.get('graph_max_string_length', 10000),
         )
         neo4j_enabled = self.config.get('neo4j_enabled', False)
         if neo4j_enabled:
@@ -125,7 +132,8 @@ class ApplicationContext:
             database=self.config.get('mysql_database', 'text2sql_db'),
             pool_size=self.config.get('mysql_pool_size', 10),
             max_overflow=self.config.get('mysql_max_overflow', 20),
-            pool_timeout=self.config.get('mysql_pool_timeout', 30)
+            pool_timeout=self.config.get('mysql_pool_timeout', 30),
+            history_max_records=self.config.get('history_max_records', 1000),
         )
         if not self._mysql_client.connect():
             logger.warning("MySQL 连接失败，历史记录功能可能不可用")
@@ -136,7 +144,8 @@ class ApplicationContext:
         self._embedding_factory = EmbeddingFactory(
             provider=self.config.get('embedding_provider', 'dashscope'),
             model=self.config.get('embedding_model', 'text-embedding-v1'),
-            api_key=self.config.get('embedding_api_key', '')
+            api_key=self.config.get('embedding_api_key', ''),
+            api_base=self.config.get('embedding_api_base', '')
         )
         logger.info(f"Embedding 工厂初始化：{self.config.get('embedding_provider')}/{self.config.get('embedding_model')}")
 
@@ -144,18 +153,40 @@ class ApplicationContext:
         """初始化知识检索器"""
         from core.retrieval.bm25_tfidf import KnowledgeRetriever
         self._knowledge_retriever = KnowledgeRetriever(
-            config={
-                'bm25_k1': self.config.get('bm25_k1', 1.5),
-                'bm25_b': self.config.get('bm25_b', 0.75),
-                'bm25_weight': self.config.get('bm25_weight', 0.6),
-                'dense_weight': self.config.get('dense_weight', 0.4),
-                'embedding_dim': self.config.get('faiss_embedding_dim', 1536),
-                'index_type': self.config.get('faiss_index_type', 'flat') if self.config.get('faiss_enabled', True) else None,
-                'few_shot_enabled': self.config.get('few_shot_enabled', True),
-                'few_shot_top_k': self.config.get('few_shot_top_k', 3)
-            },
+            config=self._retriever_config(self.config),
             embedding_factory=self._embedding_factory
         )
+
+    @staticmethod
+    def _retriever_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'bm25_k1': config.get('bm25_k1', 1.5),
+            'bm25_b': config.get('bm25_b', 0.75),
+            'bm25_weight': config.get('bm25_weight', 0.6),
+            'dense_weight': config.get('dense_weight', 0.4),
+            'embedding_dim': config.get('faiss_embedding_dim', 1536),
+            'index_type': config.get('faiss_index_type', 'flat')
+            if config.get('faiss_enabled', True) else None,
+            'few_shot_enabled': config.get('few_shot_enabled', True),
+            'few_shot_top_k': config.get('few_shot_top_k', 3),
+            'few_shot_min_similarity': config.get('few_shot_min_similarity', 0.5),
+        }
+
+    @staticmethod
+    def _generator_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'enable_rewrite': False,
+            'few_shot_enabled': config.get('few_shot_enabled', True),
+            'few_shot_top_k': config.get('few_shot_top_k', 3),
+            'sql_dialect': config.get('sql_dialect', 'mysql'),
+            'sql_validation_enabled': config.get('sql_validation_enabled', True),
+            'sql_max_length': config.get('sql_max_length', 2000),
+            'sql_query_max_rows': config.get('sql_query_max_rows', 500),
+            'sql_query_timeout_ms': config.get('sql_query_timeout_ms', 10000),
+            'sql_scope_enforcement': config.get('sql_scope_enforcement', True),
+            'sql_blocked_tables': config.get('sql_blocked_tables'),
+            'prompt_max_length': config.get('prompt_max_length', 4000),
+        }
 
     def _init_sql_chain(self):
         """初始化 SQL 生成链"""
@@ -163,7 +194,8 @@ class ApplicationContext:
         self._sql_chain = SQLGenerationChain(
             llm=self._llm,
             dialect=self.config.get('sql_dialect', 'mysql'),
-            retrieval_top_k=self.config.get('retrieval_top_k', 5)
+            retrieval_top_k=self.config.get('retrieval_top_k', 5),
+            prompt_max_length=self.config.get('prompt_max_length', 4000),
         )
 
     def _init_sql_generator(self):
@@ -174,22 +206,153 @@ class ApplicationContext:
             knowledge_retriever=self._knowledge_retriever,
             sql_chain=self._sql_chain,
             mysql_client=self._mysql_client,
-            config={
-                'enable_rewrite': False,
-                'few_shot_enabled': self.config.get('few_shot_enabled', True),
-                'few_shot_top_k': self.config.get('few_shot_top_k', 3)
-            },
-            neo4j_client=self._neo4j_client
+            config=self._generator_config(self.config),
+            neo4j_client=(
+                self._neo4j_client
+                if self._neo4j_client and self._neo4j_client.driver else None
+            )
         )
 
+    def reload_llm(self, **updates: Any) -> None:
+        """为当前会话事务式重载 LLM 链路。"""
+        from core.chain.sql_chain import SQLGenerationChain
+        from core.llm_factory import create_llm
+        from core.sql.generator import SQLGenerator
+
+        candidate_config = {**self.config, **updates}
+        candidate_llm = create_llm(
+            provider=candidate_config.get('llm_provider', 'openai'),
+            model=candidate_config.get('llm_model', 'gpt-4'),
+            api_key=candidate_config.get('llm_api_key', ''),
+            base_url=candidate_config.get('llm_base_url', ''),
+        )
+        candidate_chain = SQLGenerationChain(
+            llm=candidate_llm,
+            dialect=candidate_config.get('sql_dialect', 'mysql'),
+            retrieval_top_k=candidate_config.get('retrieval_top_k', 5),
+            prompt_max_length=candidate_config.get('prompt_max_length', 4000),
+        )
+        candidate_generator = SQLGenerator(
+            llm=candidate_llm,
+            knowledge_retriever=self._knowledge_retriever,
+            sql_chain=candidate_chain,
+            mysql_client=self._mysql_client,
+            config=self._generator_config(candidate_config),
+            neo4j_client=self._neo4j_client if getattr(self._neo4j_client, 'driver', None) else None,
+        )
+        self.config = candidate_config
+        self._llm = candidate_llm
+        self._sql_chain = candidate_chain
+        self._sql_generator = candidate_generator
+        self._initialized = True
+
+    def reload_embedding(self, **updates: Any) -> None:
+        """为当前会话构建新检索链路，成功后一次性替换旧组件。"""
+        from core.embedding_factory import EmbeddingFactory
+        from core.retrieval.bm25_tfidf import KnowledgeRetriever
+        from core.sql.generator import SQLGenerator
+
+        candidate_config = {**self.config, **updates}
+        candidate_embedding = EmbeddingFactory(
+            provider=candidate_config.get('embedding_provider', 'dashscope'),
+            model=candidate_config.get('embedding_model', 'text-embedding-v1'),
+            api_key=candidate_config.get('embedding_api_key', ''),
+            api_base=candidate_config.get('embedding_api_base', ''),
+        )
+        try:
+            candidate_retriever = KnowledgeRetriever(
+                config=self._retriever_config(candidate_config),
+                embedding_factory=candidate_embedding,
+            )
+            self._populate_retriever(candidate_retriever, candidate_config)
+            candidate_generator = SQLGenerator(
+                llm=self._llm,
+                knowledge_retriever=candidate_retriever,
+                sql_chain=self._sql_chain,
+                mysql_client=self._mysql_client,
+                config=self._generator_config(candidate_config),
+                neo4j_client=(
+                    self._neo4j_client if getattr(self._neo4j_client, 'driver', None) else None
+                ),
+            )
+        except Exception:
+            try:
+                candidate_embedding.clear_cache()
+            except Exception as cleanup_error:
+                logger.warning(f"候选 Embedding 缓存清理失败：{cleanup_error}")
+            raise
+
+        old_embedding = self._embedding_factory
+        self.config = candidate_config
+        self._embedding_factory = candidate_embedding
+        self._knowledge_retriever = candidate_retriever
+        self._sql_generator = candidate_generator
+        self._initialized = True
+        if old_embedding:
+            try:
+                old_embedding.clear_cache()
+            except Exception as cleanup_error:
+                logger.warning(f"旧 Embedding 缓存清理失败：{cleanup_error}")
+
+    def _populate_retriever(self, retriever, config: Dict[str, Any]) -> None:
+        """把当前知识与执行成功历史加载到候选检索器。"""
+        documents = []
+        metadata_list = []
+        if config.get('neo4j_enabled', False) and getattr(self._neo4j_client, 'driver', None):
+            metadata = self._neo4j_client.get_schema_metadata()
+            for table in metadata.get('tables', []):
+                name = table.get('name', '')
+                doc = f"{name} {table.get('description', '')}".strip()
+                if doc:
+                    documents.append(doc)
+                    metadata_list.append({
+                        'node_type': 'table', 'name': name,
+                        'description': table.get('description', ''),
+                    })
+        elif self._mysql_client and self._mysql_client.engine:
+            for table in self._mysql_client.get_table_schema():
+                name = table.get('table_name', '')
+                doc = f"{name} {table.get('table_comment', '')}".strip()
+                if doc:
+                    documents.append(doc)
+                    metadata_list.append({
+                        'node_type': 'table', 'name': name,
+                        'description': table.get('table_comment', ''),
+                    })
+        if documents:
+            retriever.retriever.index_documents(documents, metadata_list)
+        if (
+            config.get('few_shot_enabled', True)
+            and self._mysql_client
+            and self._mysql_client.engine
+        ):
+            records = self._mysql_client.get_successful_history_for_few_shot(limit=100)
+            retriever.build_few_shot_index(records)
+
     def _load_knowledge_base(self):
-        """加载知识库到检索器"""
+        """加载知识库到检索器；磁盘索引缓存需显式开启以避免读到旧图谱。"""
+        index_cache_enabled = self.config.get('index_cache_enabled', False)
+        index_dir = self.config.get('index_cache_dir', 'data/index_cache')
+        if index_cache_enabled:
+            try:
+                if self._knowledge_retriever.load_index(index_dir):
+                    logger.info(f"知识库索引从缓存加载成功：{index_dir}")
+                    return
+            except Exception as e:
+                logger.warning(f"知识库索引缓存加载失败，将从数据源重建：{e}")
+
+        # 缓存未命中，从数据源重建
         try:
             neo4j_enabled = self.config.get('neo4j_enabled', False)
             if neo4j_enabled and self._neo4j_client and self._neo4j_client.driver:
                 self._load_knowledge_from_neo4j()
             else:
                 self._load_knowledge_from_mysql()
+            if index_cache_enabled:
+                try:
+                    self._knowledge_retriever.save_index(index_dir)
+                except Exception as e:
+                    logger.warning(f"知识库索引缓存保存失败：{e}")
         except Exception as e:
             logger.warning(f"知识库加载失败：{e}")
 
@@ -229,6 +392,18 @@ class ApplicationContext:
             self._knowledge_retriever.retriever.index_documents(documents, metadata_list)
             logger.info(f"知识库索引完成：{len(documents)} 个文档 (MySQL)")
 
+    def _load_few_shot_history(self):
+        """从已验证或执行成功的历史记录构建 Few-Shot 索引。"""
+        if not self.config.get('few_shot_enabled', True):
+            return
+        if not self._mysql_client or not self._mysql_client.engine:
+            return
+        try:
+            records = self._mysql_client.get_successful_history_for_few_shot(limit=100)
+            self._knowledge_retriever.build_few_shot_index(records)
+        except Exception as e:
+            logger.warning(f"Few-Shot 索引加载失败：{e}")
+
     def reset(self):
         """重置所有组件状态，先关闭现有连接以避免泄漏"""
         # 先关闭现有连接
@@ -245,11 +420,17 @@ class ApplicationContext:
         logger.info("应用上下文已重置")
 
     def shutdown(self):
-        """关闭所有连接"""
+        """关闭所有连接，释放缓存资源"""
         if self._neo4j_client:
             self._neo4j_client.close()
         if self._mysql_client:
             self._mysql_client.close()
+        # 释放 Embedding 缓存
+        if self._embedding_factory:
+            try:
+                self._embedding_factory.clear_cache()
+            except Exception as e:
+                logger.warning(f"Embedding 缓存释放失败：{e}")
         logger.info("应用上下文已关闭")
 
 
@@ -266,12 +447,19 @@ def create_app_context_from_env() -> ApplicationContext:
         'mysql_pool_size': config.MYSQL_POOL_SIZE,
         'mysql_max_overflow': config.MYSQL_MAX_OVERFLOW,
         'mysql_pool_timeout': config.MYSQL_POOL_TIMEOUT,
+        'history_max_records': config.HISTORY_MAX_RECORDS,
         # Neo4j
         'neo4j_enabled': config.NEO4J_ENABLED,
         'neo4j_uri': config.NEO4J_URI,
         'neo4j_user': config.NEO4J_USER,
         'neo4j_password': config.NEO4J_PASSWORD,
         'neo4j_database': config.NEO4J_DATABASE,
+        'neo4j_max_pool_size': config.NEO4J_MAX_POOL_SIZE,
+        'neo4j_connection_timeout': config.NEO4J_CONNECTION_TIMEOUT,
+        'graph_max_nodes': config.GRAPH_MAX_NODES,
+        'graph_max_edges': config.GRAPH_MAX_EDGES,
+        'graph_max_depth': config.GRAPH_MAX_DEPTH,
+        'graph_max_string_length': config.GRAPH_MAX_STRING_LENGTH,
         # LLM
         'llm_provider': config.LLM_PROVIDER,
         'llm_model': config.LLM_MODEL,
@@ -279,6 +467,7 @@ def create_app_context_from_env() -> ApplicationContext:
         'llm_base_url': config.LLM_BASE_URL,
         # Retrieval
         'retrieval_top_k': config.RETRIEVAL_TOP_K,
+        'prompt_max_length': config.PROMPT_MAX_LENGTH,
         'bm25_k1': config.BM25_K1,
         'bm25_b': config.BM25_B,
         'bm25_weight': config.BM25_WEIGHT,
@@ -287,6 +476,8 @@ def create_app_context_from_env() -> ApplicationContext:
         'faiss_enabled': config.FAISS_ENABLED,
         'faiss_embedding_dim': config.FAISS_EMBEDDING_DIM,
         'faiss_index_type': config.FAISS_INDEX_TYPE,
+        'index_cache_enabled': config.INDEX_CACHE_ENABLED,
+        'index_cache_dir': config.INDEX_CACHE_DIR,
         # Embedding
         'embedding_provider': config.EMBEDDING_PROVIDER,
         'embedding_model': config.EMBEDDING_MODEL,
@@ -295,6 +486,13 @@ def create_app_context_from_env() -> ApplicationContext:
         # Few-Shot
         'few_shot_enabled': config.FEW_SHOT_ENABLED,
         'few_shot_top_k': config.FEW_SHOT_TOP_K,
+        'few_shot_min_similarity': config.FEW_SHOT_MIN_SIMILARITY,
         # SQL
         'sql_dialect': config.SQL_DIALECT,
+        'sql_validation_enabled': config.SQL_VALIDATION_ENABLED,
+        'sql_max_length': config.SQL_MAX_LENGTH,
+        'sql_query_max_rows': config.SQL_QUERY_MAX_ROWS,
+        'sql_query_timeout_ms': config.SQL_QUERY_TIMEOUT_MS,
+        'sql_scope_enforcement': config.SQL_SCOPE_ENFORCEMENT,
+        'sql_blocked_tables': config.SQL_BLOCKED_TABLES,
     })
