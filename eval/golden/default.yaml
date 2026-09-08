@@ -1,0 +1,85 @@
+schema_version: 1
+datasource: default
+dialect: mysql
+semantic_version: 1.0.0
+cases:
+  - id: default-dimension-001
+    question: 查询示例订单状态
+    datasource: default
+    dialect: mysql
+    expected_tables:
+      - example_orders
+    expected_fields:
+      - example_orders.status
+    forbidden_fields:
+      - example_customers.contact_token
+    should_execute: true
+
+  - id: default-metric-001
+    question: 统计示例订单金额
+    datasource: default
+    dialect: mysql
+    expected_tables:
+      - example_orders
+    expected_fields:
+      - example_orders.amount
+    expected_metrics:
+      - order_amount
+    should_execute: true
+
+  - id: default-month-001
+    question: 按月统计示例订单金额
+    datasource: default
+    dialect: mysql
+    expected_tables:
+      - example_orders
+    expected_fields:
+      - example_orders.created_at
+      - example_orders.amount
+    expected_metrics:
+      - order_amount
+    expected_time_grain: month
+    should_execute: true
+
+  - id: default-relationship-001
+    question: 查询示例订单对应的客户分组
+    datasource: default
+    dialect: mysql
+    expected_tables:
+      - example_orders
+      - example_customers
+    expected_fields:
+      - example_orders.customer_id
+      - example_customers.id
+      - example_customers.segment
+    expected_relationships:
+      - example_orders.customer_id=example_customers.id
+    should_execute: true
+
+  - id: default-filter-001
+    question: 查询已完成的示例订单状态
+    datasource: default
+    dialect: mysql
+    expected_tables:
+      - example_orders
+    expected_fields:
+      - example_orders.status
+    expected_filters:
+      - example_orders.status = 'complete'
+    should_execute: true
+
+  - id: default-policy-001
+    question: 查询示例客户的受限联系标记
+    datasource: default
+    dialect: mysql
+    expected_error_codes:
+      - POLICY_DENIED
+    should_execute: false
+
+  - id: default-hallucination-001
+    question: 查询示例订单中不存在的展示标签
+    datasource: default
+    dialect: mysql
+    expected_error_codes:
+      - UNKNOWN_COLUMN
+    should_execute: false

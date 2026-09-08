@@ -16,11 +16,46 @@ entities:
         data_type: datetime
         role: time
         sensitivity: public
+      - name: customer_id
+        name_cn: 示例客户编号
+        data_type: bigint
+        role: identifier
+        sensitivity: public
       - name: amount
         name_cn: 金额
         data_type: decimal
         role: measure
         sensitivity: public
+      - name: status
+        name_cn: 状态
+        data_type: varchar
+        role: dimension
+        sensitivity: public
+  - name: example_customers
+    name_cn: 示例客户
+    fields:
+      - name: id
+        name_cn: 客户编号
+        data_type: bigint
+        role: identifier
+        sensitivity: public
+      - name: segment
+        name_cn: 客户分组
+        data_type: varchar
+        role: dimension
+        sensitivity: public
+      - name: contact_token
+        name_cn: 联系标记
+        data_type: varchar
+        role: dimension
+        sensitivity: restricted
+        directly_queryable: false
+relationships:
+  - name: example_order_customer
+    from_entity: example_orders
+    from_field: customer_id
+    to_entity: example_customers
+    to_field: id
 metrics:
   - name: order_amount
     name_cn: 订单金额
@@ -28,3 +63,6 @@ metrics:
     allowed_dimensions:
       - example_orders.created_at
     default_time_field: example_orders.created_at
+policies:
+  denied_fields:
+    - example_customers.contact_token

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping
@@ -31,6 +32,18 @@ class SQLScope:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "aliases", MappingProxyType(dict(self.aliases)))
+
+
+@dataclass(frozen=True)
+class SQLStructure:
+    """Public structural facts used by offline evaluators and other read-only tools."""
+
+    scope: SQLScope
+    tables: frozenset[str]
+    fields: frozenset[str]
+    relationships: tuple[tuple[str, str], ...]
+    filters: tuple[str, ...]
+    time_grains: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -967,6 +980,219 @@ def _lineage_for_analysis(
     )
 
 
+def _signature_text(signature: Any) -> str:
+    return json.dumps(signature, ensure_ascii=False, separators=(",", ":"))
+
+
+def _filter_signature_text(
+    expression: exp.Expression,
+    info: _ScopeInfo | None,
+    infos: Mapping[int, _ScopeInfo],
+    semantic_indexes: Mapping[str, frozenset[str]],
+    source_tables: frozenset[str] | None = None,
+) -> str:
+    if isinstance(expression, exp.EQ):
+        operands = (
+            _expression_signature(
+                expression.this, info, infos, semantic_indexes, source_tables
+            ),
+            _expression_signature(
+                expression.expression, info, infos, semantic_indexes, source_tables
+            ),
+        )
+        return _signature_text(
+            ("eq", tuple(sorted(operands, key=_signature_text)))
+        )
+    return _signature_text(
+        _expression_signature(
+            expression, info, infos, semantic_indexes, source_tables
+        )
+    )
+
+
+def normalize_filter_expression(
+    expression: str,
+    dialect: str = "mysql",
+    semantic_indexes: Mapping[str, Iterable[str] | Mapping[str, Any]] | None = None,
+) -> tuple[str, ...]:
+    """Return stable structural signatures for a required conjunctive predicate."""
+    tree = parse_one(expression, read=dialect)
+    atoms = _conjunctive_atoms(tree)
+    if atoms is None:
+        raise ValueError("filter must be a deterministic conjunction")
+    indexes = _semantic_field_index(semantic_indexes)
+    for column in tree.find_all(exp.Column):
+        name = _casefold(column.name)
+        qualifier = _casefold(column.table) if column.table else ""
+        if qualifier:
+            if qualifier not in indexes or name not in indexes[qualifier]:
+                raise ValueError("filter references an unknown field")
+            continue
+        candidates = [table for table, fields in indexes.items() if name in fields]
+        if len(candidates) != 1:
+            raise ValueError("filter field is unknown or ambiguous")
+    source_tables = frozenset(indexes)
+    return tuple(
+        sorted(
+            _filter_signature_text(
+                atom,
+                None,
+                {},
+                indexes,
+                source_tables,
+            )
+            for atom in atoms
+        )
+    )
+
+
+def _time_grain_for_node(node: exp.Expression) -> str | None:
+    key = node.key.casefold()
+    if key == "datetrunc":
+        unit = node.args.get("unit")
+        value = str(getattr(unit, "this", unit) or "").casefold()
+        return value if value in {"day", "week", "month", "quarter", "year"} else None
+    if key == "timetostr":
+        format_expression = node.args.get("format")
+        format_text = str(getattr(format_expression, "this", "") or "")
+        tokens = set(re.findall(r"%[A-Za-z]", format_text))
+        if tokens & {"%v", "%V", "%u", "%U"} and tokens & {"%x", "%X", "%Y", "%y"}:
+            return "week"
+        if tokens & {"%d", "%e", "%j"} and tokens & {"%Y", "%y"}:
+            if "%j" in tokens or tokens & {"%m", "%c"}:
+                return "day"
+        if tokens & {"%m", "%c"} and tokens & {"%Y", "%y"}:
+            return "month"
+        if tokens and tokens <= {"%Y", "%y"}:
+            return "year"
+        return None
+    if key in {"day", "month", "quarter", "week", "year"}:
+        return key
+    if key == "tsordstodate":
+        return "day"
+    if isinstance(node, exp.Anonymous):
+        name = node.name.casefold()
+        if name in {"day", "date", "month", "quarter", "week", "year"}:
+            return "day" if name == "date" else name
+        if name == "date_trunc":
+            expressions = node.expressions
+            if expressions:
+                value = str(getattr(expressions[0], "this", expressions[0])).casefold()
+                if value in {"day", "week", "month", "quarter", "year"}:
+                    return value
+    return None
+
+
+def analyze_sql_structure(
+    sql: str,
+    dialect: str = "mysql",
+    semantic_indexes: Mapping[str, Iterable[str] | Mapping[str, Any]] | None = None,
+) -> SQLStructure:
+    """Extract active, alias-aware AST facts without executing SQL or opening a database."""
+    analysis = _analyze_sql(sql, dialect, semantic_indexes)
+    indexes = _semantic_field_index(semantic_indexes)
+    infos = {id(info.scope): info for info in analysis.scope_infos}
+    source_lineage_ids: set[int] = set()
+
+    def include_source_lineage(info: _ScopeInfo) -> None:
+        marker = id(info.scope)
+        if marker in source_lineage_ids:
+            return
+        source_lineage_ids.add(marker)
+        for source in _unique_sources(info):
+            if isinstance(source, Scope):
+                include_source_lineage(infos[id(source)])
+
+    for root in analysis.root_output_infos:
+        include_source_lineage(root)
+    source_infos = tuple(
+        info for info in analysis.scope_infos if id(info.scope) in source_lineage_ids
+    )
+
+    fields: set[str] = set()
+    for info in source_infos:
+        for column in info.scope.columns:
+            resolved = _resolve_column(column, info, infos, indexes)
+            if resolved.known:
+                fields.update(f"{table}.{name}" for table, name in resolved.references)
+        select = info.scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        for expression in select.expressions:
+            unaliased = expression.this if isinstance(expression, exp.Alias) else expression
+            if isinstance(unaliased, exp.Star) or (
+                isinstance(unaliased, exp.Column) and unaliased.name == "*"
+            ):
+                for resolution in _expand_star(unaliased, info, infos, indexes).values():
+                    fields.update(
+                        f"{table}.{name}" for table, name in resolution.references
+                    )
+
+    relationships: set[tuple[str, str]] = set()
+    for fact in analysis.join_facts:
+        if id(fact.info.scope) not in source_lineage_ids:
+            continue
+        for left, left_field, right, right_field in fact.pairs:
+            endpoints = tuple(sorted((f"{left}.{left_field}", f"{right}.{right_field}")))
+            relationships.add(endpoints)
+
+    filter_signatures: set[str] = set()
+    for info in source_infos:
+        select = info.scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        for clause_name in ("where", "having"):
+            clause = select.args.get(clause_name)
+            if not isinstance(clause, exp.Expression) or clause.this is None:
+                continue
+            atoms = _conjunctive_atoms(clause.this)
+            if atoms is None:
+                continue
+            for atom in atoms:
+                filter_signatures.add(
+                    _filter_signature_text(atom, info, infos, indexes)
+                )
+
+    time_grains: set[tuple[str, str]] = set()
+
+    def collect_time_grains(node: exp.Expression, info: _ScopeInfo) -> None:
+        grain = _time_grain_for_node(node)
+        if grain is not None:
+            references: set[str] = set()
+            for column in _immediate_columns(node, info.scope.expression):
+                resolved = _resolve_column(column, info, infos, indexes)
+                if resolved.known:
+                    references.update(
+                        f"{table}.{name}" for table, name in resolved.references
+                    )
+            time_grains.update((reference, grain) for reference in references)
+            return
+        for child in _expression_children(node):
+            collect_time_grains(child, info)
+
+    for info in source_infos:
+        select = info.scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        expressions = list(select.expressions)
+        group = select.args.get("group")
+        if isinstance(group, exp.Group):
+            expressions.extend(group.expressions)
+        for expression in expressions:
+            collect_time_grains(expression, info)
+
+    return SQLStructure(
+        scope=analysis.scope,
+        tables=frozenset(
+            table for info in source_infos for table in info.physical_tables
+        ),
+        fields=frozenset(fields),
+        relationships=tuple(sorted(relationships)),
+        filters=tuple(sorted(filter_signatures)),
+        time_grains=tuple(sorted(time_grains)),
+    )
+
+
 def _metric_terms(metric: SemanticMetric) -> tuple[str, ...]:
     return (metric.name, metric.name_cn, *metric.synonyms)
 
@@ -1317,4 +1543,11 @@ class SemanticSQLValidator:
         )
 
 
-__all__ = ["SQLScope", "SemanticSQLValidator", "parse_sql_scope"]
+__all__ = [
+    "SQLScope",
+    "SQLStructure",
+    "SemanticSQLValidator",
+    "analyze_sql_structure",
+    "normalize_filter_expression",
+    "parse_sql_scope",
+]
