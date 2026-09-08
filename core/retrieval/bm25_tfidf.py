@@ -576,7 +576,8 @@ class KnowledgeRetriever:
         # 筛选成功的记录
         successful_records = [
             r for r in history_records
-            if r.get('execution_status') == 'success'
+            if r.get('validation_status') == 'success'
+            and r.get('execution_status') == 'success'
         ]
 
         if len(successful_records) < 1:
@@ -663,7 +664,10 @@ class KnowledgeRetriever:
             return
 
         # 只添加成功的记录
-        if record.get('execution_status') != 'success':
+        if (
+            record.get('validation_status') != 'success'
+            or record.get('execution_status') != 'success'
+        ):
             return
 
         record_id = record.get('id')

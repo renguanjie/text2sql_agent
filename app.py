@@ -38,6 +38,7 @@ from core.app_context import ApplicationContext
 from core.sql.validator import validate_sql
 from core.utils.correctness_ui import (
     execution_is_disabled,
+    public_failure_messages,
     structured_validation_messages,
 )
 from core.utils.upload_limits import UploadValidationError, read_uploaded_text
@@ -978,9 +979,12 @@ with tab1:
 
                 st.rerun()
             else:
-                error_msg = result.get('error', '未知错误')
+                structured = structured_validation_messages(result)
+                error_msg = public_failure_messages(result)[0]
                 # 检查是否是连接错误
-                if 'Connection' in error_msg or 'connection' in error_msg.lower():
+                if not structured and (
+                    'Connection' in error_msg or 'connection' in error_msg.lower()
+                ):
                     st.error("""
                     ⚠️ **LLM 服务连接失败**
 
@@ -993,8 +997,11 @@ with tab1:
                     - 检查 `.env` 文件中的 API Key 配置是否正确
                     - 稍后重试
                     """)
-                else:
+                elif not structured:
                     st.error(f"生成失败：{error_msg}")
+                else:
+                    for message in structured:
+                        st.error(f"生成失败：{message}")
 
     # 显示当前 SQL
     if st.session_state.last_sql:
@@ -1024,6 +1031,7 @@ with tab1:
                 semantic_version=(st.session_state.last_result or {}).get(
                     'semantic_version'
                 ),
+                session_id=st.session_state.session_id,
             )
 
         if exec_result.get('status') == 'success':
@@ -1036,12 +1044,8 @@ with tab1:
             if data:
                 st.dataframe(data, use_container_width=True, height=300)
         else:
-            structured = structured_validation_messages(exec_result)
-            if structured:
-                for message in structured:
-                    st.error(f"❌ 执行失败：{message}")
-            else:
-                st.error(f"❌ 执行失败：{exec_result.get('error', '未知错误')}")
+            for message in public_failure_messages(exec_result):
+                st.error(f"❌ 执行失败：{message}")
 
     # 无输入提示
     if generate_btn and not user_query:

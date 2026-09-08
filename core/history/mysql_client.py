@@ -339,7 +339,10 @@ class MySQLClient:
 
     def update_sql_execution(self, history_id: int, execution_status: str,
                             execution_error: Optional[str] = None,
-                            execution_result: Optional[Any] = None) -> bool:
+                            execution_result: Optional[Any] = None,
+                            session_id: Optional[str] = None,
+                            generated_sql: Optional[str] = None,
+                            require_validation_success: bool = False) -> bool:
         """
         更新 SQL 执行结果
 
@@ -352,13 +355,21 @@ class MySQLClient:
         Returns:
             bool: 是否成功
         """
-        query = """
+        predicates = ["id = :history_id"]
+        if session_id is not None:
+            predicates.append("session_id = :session_id")
+        if generated_sql is not None:
+            predicates.append("generated_sql = :generated_sql")
+        if require_validation_success:
+            predicates.append("validation_status = 'success'")
+        where_clause = " AND ".join(predicates)
+        query = f"""
         UPDATE sql_generation_history
         SET execution_status = :execution_status,
             execution_error = :execution_error,
             execution_result = :execution_result,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = :history_id
+        WHERE {where_clause}
         """
         params = {
             "execution_status": execution_status,
@@ -367,6 +378,10 @@ class MySQLClient:
             if execution_result is not None else None,
             "history_id": history_id,
         }
+        if session_id is not None:
+            params["session_id"] = session_id
+        if generated_sql is not None:
+            params["generated_sql"] = generated_sql
         result = self.execute_update(query, params)
         return result > 0
 
@@ -424,7 +439,8 @@ class MySQLClient:
         query = """
         SELECT id, user_query, generated_sql, validation_status, execution_status
         FROM sql_generation_history
-        WHERE execution_status = 'success'
+        WHERE validation_status = 'success'
+          AND execution_status = 'success'
         ORDER BY created_at DESC
         LIMIT :limit
         """

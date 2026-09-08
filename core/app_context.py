@@ -238,6 +238,14 @@ class ApplicationContext:
 
     def _build_governance_components(self, config: Dict[str, Any]):
         """Compile and validate a complete candidate pair before publication."""
+        if (
+            config.get('sql_explain_enabled', False)
+            and not config.get('semantic_governance_enabled', False)
+        ):
+            raise ApplicationConfigurationError(
+                "SQL_EXPLAIN_ENABLED=true 要求 "
+                "SEMANTIC_GOVERNANCE_ENABLED=true"
+            )
         if not config.get('semantic_governance_enabled', False):
             return None, None
 

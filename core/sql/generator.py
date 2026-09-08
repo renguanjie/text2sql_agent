@@ -3,6 +3,8 @@ SQL 生成器模块
 整合检索、链式处理，提供统一的 SQL 生成接口（支持异步）
 支持多数据库方言动态检测
 """
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 from loguru import logger
 
@@ -17,6 +19,15 @@ from .validator import (
     validate_query_scope,
     validate_sql,
 )
+
+
+@dataclass(frozen=True)
+class _GovernedHistoryBinding:
+    session_id: str | None
+    generated_sql: str
+    user_query: str
+    semantic_version: str | None
+    validation_succeeded: bool
 
 
 class SQLGenerator:
@@ -35,6 +46,7 @@ class SQLGenerator:
         self.config = config or {}
         self.neo4j_client = neo4j_client
         self.correctness_pipeline = correctness_pipeline
+        self._governed_history_bindings: dict[int, _GovernedHistoryBinding] = {}
 
         self.rewrite_chain = QueryRewriteChain(
             llm, prompt_max_length=self.config.get('prompt_max_length', 4000)
@@ -124,12 +136,125 @@ class SQLGenerator:
         )
         if history_id:
             result['history_id'] = history_id
+            if self.correctness_pipeline is not None:
+                self._governed_history_bindings[history_id] = (
+                    _GovernedHistoryBinding(
+                        session_id=session_id,
+                        generated_sql=result['sql'],
+                        user_query=user_query,
+                        semantic_version=result.get('semantic_version'),
+                        validation_succeeded=(
+                            validation_status == 'success'
+                            and result.get('executable') is True
+                        ),
+                    )
+                )
 
-    def _promote_history_to_few_shot(self, history_id: int) -> None:
+    def _promote_history_to_few_shot(
+        self,
+        history_id: int,
+        *,
+        session_id: str,
+        sql: str,
+        user_query: str | None,
+        semantic_version: str | None,
+    ) -> None:
         """将真实执行成功的历史记录加入 Few-Shot 索引。"""
-        history = self.mysql_client.get_history_detail(history_id)
-        if history and history.get('execution_status') == 'success':
+        history, error = self._bound_history(
+            history_id,
+            session_id=session_id,
+            sql=sql,
+            user_query=user_query,
+            semantic_version=semantic_version,
+        )
+        if (
+            error is None
+            and history
+            and history.get('validation_status') == 'success'
+            and history.get('execution_status') == 'success'
+        ):
             self.knowledge_retriever.add_history_record(history)
+
+    def _bound_history(
+        self,
+        history_id: int,
+        *,
+        session_id: str | None,
+        sql: str,
+        user_query: str | None,
+        semantic_version: str | None,
+    ) -> tuple[Mapping[str, Any] | None, str | None]:
+        """Resolve a history row only when all execution identity fields match."""
+        if not session_id:
+            return None, '执行历史与当前会话或 SQL 不匹配'
+        history = self.mysql_client.get_history_detail(history_id)
+        if not isinstance(history, Mapping):
+            return None, '执行历史与当前会话或 SQL 不匹配'
+        if history.get('session_id') != session_id:
+            return None, '执行历史与当前会话或 SQL 不匹配'
+        if history.get('validation_status') != 'success':
+            return None, '执行历史未通过校验'
+        stored_sql = history.get('generated_sql')
+        if not isinstance(stored_sql, str) or not self._same_sql(stored_sql, sql):
+            return None, '执行历史与当前会话或 SQL 不匹配'
+
+        if self.correctness_pipeline is not None:
+            binding = self._governed_history_bindings.get(history_id)
+            if (
+                binding is None
+                or not binding.validation_succeeded
+                or binding.session_id != session_id
+                or not self._same_sql(binding.generated_sql, sql)
+                or binding.user_query != user_query
+                or binding.semantic_version != semantic_version
+                or history.get('user_query') != user_query
+            ):
+                return None, '执行历史与当前治理上下文不匹配'
+        return history, None
+
+    def _same_sql(self, left: str, right: str) -> bool:
+        try:
+            import sqlglot
+
+            dialect = self.sql_chain.dialect
+            return (
+                sqlglot.parse_one(left, read=dialect).sql(dialect=dialect)
+                == sqlglot.parse_one(right, read=dialect).sql(dialect=dialect)
+            )
+        except Exception:
+            return False
+
+    def _history_context_error(
+        self, message: str, *, sql: str, semantic_version: str | None
+    ) -> Dict[str, Any]:
+        if self.correctness_pipeline is not None:
+            return self._governed_error_payload(
+                code='HISTORY_CONTEXT_MISMATCH',
+                message=message,
+                semantic_version=semantic_version,
+                sql=sql,
+                stage='safety',
+            ) | {'data': None}
+        return {'status': 'error', 'error': message, 'data': None}
+
+    def _update_bound_history(
+        self,
+        history_id: int,
+        history: Mapping[str, Any],
+        *,
+        execution_status: str,
+        execution_error: str | None = None,
+        execution_result: Any = None,
+    ) -> bool:
+        return self.mysql_client.update_sql_execution(
+            history_id=history_id,
+            execution_status=execution_status,
+            execution_error=execution_error,
+            execution_result=execution_result,
+            session_id=history['session_id'],
+            generated_sql=history['generated_sql'],
+            require_validation_success=True,
+        )
 
     def _validate_generation_result(self, result: Dict, dialect: str,
                                     allowed_tables: Optional[List[str]] = None,
@@ -182,19 +307,15 @@ class SQLGenerator:
 
     def _prepare_governed_context(
         self, user_query: str
-    ) -> tuple[str, str | None, Dict[str, Any] | None]:
-        """Build generation context from this generator's immutable registry pair."""
+    ) -> tuple[Any | None, Dict[str, Any] | None]:
+        """Pin the immutable correctness request before invoking the LLM."""
         if self.correctness_pipeline is None:
-            return "", None, None
+            return None, None
         try:
-            snapshot = self.correctness_pipeline.registry.get_snapshot()
-            semantic_context = self.correctness_pipeline.context_builder.build(
-                user_query, snapshot
-            )
-            return semantic_context.rendered, snapshot.model_version, None
+            return self.correctness_pipeline.prepare_generation(user_query), None
         except Exception as exc:
             log_safe_exception("governed_generation_context", exc)
-            return "", None, self._governed_error_payload(
+            return None, self._governed_error_payload(
                 code="CORRECTNESS_UNAVAILABLE",
                 message="SQL 正确性校验暂时不可用",
                 semantic_version=None,
@@ -232,7 +353,7 @@ class SQLGenerator:
     def _merge_correctness_result(
         result: Dict[str, Any], correctness, user_query: str
     ) -> None:
-        result.update({
+        public = {
             'sql': correctness.sql,
             'status': correctness.status,
             'semantic_version': correctness.semantic_version,
@@ -240,38 +361,26 @@ class SQLGenerator:
             'repair_attempts': correctness.repair_attempts,
             'executable': correctness.executable,
             'user_query': user_query,
-        })
-
-    @staticmethod
-    def _reject_mixed_semantic_version(
-        result: Dict[str, Any], expected_version: str, actual_version: str | None
-    ) -> None:
-        result.update({
-            'status': 'rejected',
-            'semantic_version': actual_version,
-            'validation': {
-                'valid': False,
-                'issues': [{
-                    'code': 'SEMANTIC_VERSION_MISMATCH',
-                    'message': 'SQL 生成版本与校验语义版本不一致',
-                    'objects': [],
-                    'stage': 'semantic',
-                }],
-            },
-            'executable': False,
-        })
+        }
+        if correctness.status == 'error':
+            public['error'] = (
+                correctness.validation.issues[0].message
+                if correctness.validation.issues
+                else 'SQL 正确性校验暂时不可用'
+            )
+        result.update(public)
 
     def _govern_candidate_sync(
         self,
         result: Dict[str, Any],
         user_query: str,
-        semantic_version: str,
+        request: Any,
     ) -> None:
         if result.get('status') != 'success' or not result.get('sql'):
             failure = self._governed_error_payload(
                 code='GENERATION_FAILED',
                 message='未生成可供正确性校验的 SQL',
-                semantic_version=semantic_version,
+                semantic_version=request.semantic_version,
                 sql=result.get('sql'),
                 stage='syntax',
             )
@@ -279,30 +388,26 @@ class SQLGenerator:
             result.update(failure)
             result['user_query'] = user_query
             return
-        correctness = self.correctness_pipeline.process(
-            question=user_query,
+        correctness = self.correctness_pipeline.process_prepared(
+            request=request,
             candidate_sql=result['sql'],
             repair=self.sql_chain.fix_sql_governed,
             allowed_tables=tuple(result.get('allowed_tables') or ()),
             allowed_schemas=tuple(result.get('allowed_schemas') or ()),
         )
         self._merge_correctness_result(result, correctness, user_query)
-        if correctness.semantic_version != semantic_version:
-            self._reject_mixed_semantic_version(
-                result, semantic_version, correctness.semantic_version
-            )
 
     async def _govern_candidate_async(
         self,
         result: Dict[str, Any],
         user_query: str,
-        semantic_version: str,
+        request: Any,
     ) -> None:
         if result.get('status') != 'success' or not result.get('sql'):
             failure = self._governed_error_payload(
                 code='GENERATION_FAILED',
                 message='未生成可供正确性校验的 SQL',
-                semantic_version=semantic_version,
+                semantic_version=request.semantic_version,
                 sql=result.get('sql'),
                 stage='syntax',
             )
@@ -310,18 +415,14 @@ class SQLGenerator:
             result.update(failure)
             result['user_query'] = user_query
             return
-        correctness = await self.correctness_pipeline.process_async(
-            question=user_query,
+        correctness = await self.correctness_pipeline.process_async_prepared(
+            request=request,
             candidate_sql=result['sql'],
             repair=self.sql_chain.fix_sql_governed_async,
             allowed_tables=tuple(result.get('allowed_tables') or ()),
             allowed_schemas=tuple(result.get('allowed_schemas') or ()),
         )
         self._merge_correctness_result(result, correctness, user_query)
-        if correctness.semantic_version != semantic_version:
-            self._reject_mixed_semantic_version(
-                result, semantic_version, correctness.semantic_version
-            )
 
     # ==================== 公共方法 ====================
 
@@ -392,9 +493,7 @@ class SQLGenerator:
 
         ctx = self._prepare_pipeline(user_query, target_dialect, target_database_id, use_few_shot)
 
-        semantic_context, semantic_version, governance_error = (
-            self._prepare_governed_context(user_query)
-        )
+        correctness_request, governance_error = self._prepare_governed_context(user_query)
         if governance_error is not None:
             governance_error['user_query'] = user_query
             return governance_error
@@ -408,11 +507,11 @@ class SQLGenerator:
             few_shot_examples=ctx['few_shot_examples']
         )
         if self.correctness_pipeline is not None:
-            generation_kwargs['semantic_context'] = semantic_context
+            generation_kwargs['semantic_context'] = correctness_request.semantic_context
         result = self.sql_chain.generate(**generation_kwargs)
         self._attach_execution_scope(result, ctx)
         if self.correctness_pipeline is not None:
-            self._govern_candidate_sync(result, user_query, semantic_version or '')
+            self._govern_candidate_sync(result, user_query, correctness_request)
         else:
             self._validate_generation_result(
                 result,
@@ -441,9 +540,7 @@ class SQLGenerator:
             user_query, target_dialect, target_database_id, use_few_shot
         )
 
-        semantic_context, semantic_version, governance_error = (
-            self._prepare_governed_context(user_query)
-        )
+        correctness_request, governance_error = self._prepare_governed_context(user_query)
         if governance_error is not None:
             governance_error['user_query'] = user_query
             return governance_error
@@ -457,12 +554,12 @@ class SQLGenerator:
             few_shot_examples=ctx['few_shot_examples']
         )
         if self.correctness_pipeline is not None:
-            generation_kwargs['semantic_context'] = semantic_context
+            generation_kwargs['semantic_context'] = correctness_request.semantic_context
         result = await self.sql_chain.generate_async(**generation_kwargs)
         self._attach_execution_scope(result, ctx)
         if self.correctness_pipeline is not None:
             await self._govern_candidate_async(
-                result, user_query, semantic_version or ''
+                result, user_query, correctness_request
             )
         else:
             self._validate_generation_result(
@@ -599,7 +696,8 @@ class SQLGenerator:
                     allowed_tables: Optional[List[str]] = None,
                     allowed_schemas: Optional[List[str]] = None,
                     user_query: Optional[str] = None,
-                    semantic_version: Optional[str] = None) -> Dict[str, Any]:
+                    semantic_version: Optional[str] = None,
+                    session_id: Optional[str] = None) -> Dict[str, Any]:
         """执行 SQL"""
         if self.correctness_pipeline is not None:
             if not user_query or not semantic_version:
@@ -609,6 +707,27 @@ class SQLGenerator:
                     semantic_version=semantic_version,
                     sql=sql,
                 ) | {'data': None}
+
+        if not self.mysql_client:
+            return {'status': 'error', 'error': 'MySQL 客户端未连接', 'data': None}
+
+        history: Mapping[str, Any] | None = None
+        if history_id is not None:
+            history, history_error = self._bound_history(
+                history_id,
+                session_id=session_id,
+                sql=sql,
+                user_query=user_query,
+                semantic_version=semantic_version,
+            )
+            if history_error is not None:
+                return self._history_context_error(
+                    history_error,
+                    sql=sql,
+                    semantic_version=semantic_version,
+                )
+
+        if self.correctness_pipeline is not None:
             authorization = self.correctness_pipeline.authorize_execution(
                 question=user_query,
                 sql=sql,
@@ -631,25 +750,24 @@ class SQLGenerator:
                     'repair_attempts': authorization.repair_attempts,
                     'executable': False,
                 }
-                if history_id and self.mysql_client:
-                    self.mysql_client.update_sql_execution(
-                        history_id=history_id,
+                if history_id is not None and history is not None:
+                    self._update_bound_history(
+                        history_id,
+                        history,
                         execution_status='fail',
                         execution_error=public['error'],
                     )
                 return public
-
-        if not self.mysql_client:
-            return {'status': 'error', 'error': 'MySQL 客户端未连接', 'data': None}
 
         logger.info("准备执行 SQL：sql_id={}", text_fingerprint(sql))
 
         try:
             safety_error = self._get_query_safety_error(sql, allowed_tables, allowed_schemas)
             if safety_error:
-                if history_id:
-                    self.mysql_client.update_sql_execution(
-                        history_id=history_id,
+                if history_id is not None and history is not None:
+                    self._update_bound_history(
+                        history_id,
+                        history,
                         execution_status='fail',
                         execution_error=safety_error,
                     )
@@ -666,9 +784,10 @@ class SQLGenerator:
                 constrained_sql, max_rows=max_rows
             )
 
-            if history_id and self.mysql_client:
-                self.mysql_client.update_sql_execution(
-                    history_id=history_id,
+            if history_id is not None and history is not None:
+                updated = self._update_bound_history(
+                    history_id,
+                    history,
                     execution_status='success',
                     execution_result={
                         'row_count': len(results),
@@ -676,7 +795,19 @@ class SQLGenerator:
                         'truncated': truncated,
                     }
                 )
-                self._promote_history_to_few_shot(history_id)
+                if not updated:
+                    return {
+                        'status': 'error',
+                        'error': '执行记录状态更新失败',
+                        'data': None,
+                    }
+                self._promote_history_to_few_shot(
+                    history_id,
+                    session_id=session_id,
+                    sql=sql,
+                    user_query=user_query,
+                    semantic_version=semantic_version,
+                )
 
             return {
                 'status': 'success', 'error': None,
@@ -685,9 +816,10 @@ class SQLGenerator:
         except Exception as exc:
             error_id = log_safe_exception("sql_execute", exc, sql=sql)
             public_error = f"查询执行失败，请联系管理员并提供错误编号 {error_id}"
-            if history_id and self.mysql_client:
-                self.mysql_client.update_sql_execution(
-                    history_id=history_id,
+            if history_id is not None and history is not None:
+                self._update_bound_history(
+                    history_id,
+                    history,
                     execution_status='fail',
                     execution_error=public_error,
                 )

@@ -38,6 +38,22 @@ class StaticRegistry:
         return self.snapshot
 
 
+class ChangingRegistry:
+    def __init__(self, first: SemanticSnapshot, later: SemanticSnapshot):
+        self.first = first
+        self.later = later
+        self.calls = 0
+
+    def get_snapshot(self) -> SemanticSnapshot:
+        self.calls += 1
+        return self.first if self.calls == 1 else self.later
+
+
+class ExplodingSemanticValidator:
+    def validate(self, *_args, **_kwargs):
+        raise RuntimeError("password=secret SELECT private FROM hidden")
+
+
 def _snapshot(version: str = "1.0.0") -> SemanticSnapshot:
     return SemanticSnapshot(
         schema_version=1,
@@ -92,6 +108,27 @@ def _pipeline(*, max_repair_attempts: int = 1) -> CorrectnessPipeline:
         context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
         semantic_validator=SemanticSQLValidator(),
         max_repair_attempts=max_repair_attempts,
+    )
+
+
+def _changing_pipeline() -> tuple[CorrectnessPipeline, ChangingRegistry]:
+    first = _snapshot()
+    later = first.model_copy(
+        update={
+            "entities": (
+                first.entities[0].model_copy(update={"name": "archived_orders"}),
+            ),
+            "content_sha256": "2" * 64,
+        }
+    )
+    registry = ChangingRegistry(first, later)
+    return (
+        CorrectnessPipeline(
+            registry=registry,
+            context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+            semantic_validator=SemanticSQLValidator(),
+        ),
+        registry,
     )
 
 
@@ -250,6 +287,84 @@ async def test_async_generator_uses_the_shared_correctness_pipeline_and_result_a
     assert "版本: sales@1.0.0" in semantic_context
 
 
+def test_sync_generation_pins_one_snapshot_when_same_version_content_changes():
+    """Generation context and validation must use one immutable snapshot object."""
+    pipeline, registry = _changing_pipeline()
+    generator = _generator(
+        pipeline=pipeline, candidate_sql="SELECT COUNT(*) FROM orders"
+    )
+
+    result = generator.generate_sql("订单金额", auto_save_history=False)
+
+    assert result["status"] == "success"
+    assert result["executable"] is True
+    assert result["repair_attempts"] == 1
+    assert registry.calls == 1
+    semantic_context = generator.sql_chain.generate.call_args.kwargs[
+        "semantic_context"
+    ]
+    assert "orders" in semantic_context
+    assert "archived_orders" not in semantic_context
+    repair_context = generator.sql_chain.fix_sql_governed.call_args.args[2]
+    assert repair_context == semantic_context
+
+
+@pytest.mark.asyncio
+async def test_async_generation_pins_one_snapshot_when_same_version_content_changes():
+    """Async generation must share the exact snapshot pinned before its LLM call."""
+    pipeline, registry = _changing_pipeline()
+    generator = _generator(
+        pipeline=pipeline, candidate_sql="SELECT COUNT(*) FROM orders"
+    )
+
+    result = await generator.generate_sql_async(
+        "订单金额", auto_save_history=False
+    )
+
+    assert result["status"] == "success"
+    assert result["executable"] is True
+    assert result["repair_attempts"] == 1
+    assert registry.calls == 1
+    semantic_context = generator.sql_chain.generate_async.call_args.kwargs[
+        "semantic_context"
+    ]
+    assert "orders" in semantic_context
+    assert "archived_orders" not in semantic_context
+    repair_context = generator.sql_chain.fix_sql_governed_async.call_args.args[2]
+    assert repair_context == semantic_context
+
+
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.asyncio
+async def test_generator_correctness_error_has_stable_top_level_fallback(use_async: bool):
+    """Both adapters must expose a non-null safe error for legacy UI fallbacks."""
+    pipeline = CorrectnessPipeline(
+        registry=StaticRegistry(_snapshot()),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=ExplodingSemanticValidator(),
+    )
+    generator = _generator(pipeline=pipeline)
+
+    if use_async:
+        result = await generator.generate_sql_async(
+            "订单金额", auto_save_history=False
+        )
+    else:
+        result = generator.generate_sql("订单金额", auto_save_history=False)
+
+    assert result["status"] == "error"
+    assert result["error"] == "SQL 正确性校验暂时不可用"
+    assert result["validation"]["issues"] == [
+        {
+            "code": "CORRECTNESS_UNAVAILABLE",
+            "message": "SQL 正确性校验暂时不可用",
+            "objects": [],
+            "stage": "semantic",
+        }
+    ]
+    assert "secret" not in str(result)
+
+
 def test_generator_delegates_one_governed_repair_to_task_7_api():
     """Catches generator-local repair loops or use of the legacy raw-error repair API."""
     generator = _generator(
@@ -284,6 +399,116 @@ def test_governed_history_is_saved_after_rejection_with_only_structured_codes():
     assert saved["validation_status"] == "fail"
     assert saved["validation_error"] == "METRIC_MISMATCH"
     generator.knowledge_retriever.add_history_record.assert_not_called()
+
+
+def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:
+    return {
+        "id": 17,
+        "session_id": session_id,
+        "user_query": "订单金额",
+        "generated_sql": sql,
+        "validation_status": "success",
+        "execution_status": "success",
+    }
+
+
+@pytest.mark.parametrize(
+    ("execute_overrides", "record_overrides"),
+    [
+        ({"session_id": "session-b"}, {}),
+        ({"sql": "SELECT amount FROM orders"}, {}),
+        ({"sql": "SELECT SUM(amount) FROM orders; SELECT 1"}, {}),
+        ({"user_query": "查询订单号"}, {}),
+        ({"semantic_version": "9.9.9"}, {}),
+        (
+            {"sql": "SELECT SUM(amount) FROM orders"},
+            {
+                "generated_sql": "SELECT COUNT(*) FROM orders",
+                "validation_status": "fail",
+                "execution_status": "pending",
+            },
+        ),
+    ],
+    ids=[
+        "cross_session",
+        "sql_mismatch",
+        "multi_statement_sql_mismatch",
+        "question_mismatch",
+        "semantic_version_mismatch",
+        "rejected_history_with_legal_sql",
+    ],
+)
+def test_governed_execute_rejects_unbound_history_without_mutating_it(
+    execute_overrides: dict, record_overrides: dict
+):
+    """A global history id cannot authorize or promote another request's SQL."""
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    ) | record_overrides
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+    generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    mysql.reset_mock()
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    ) | record_overrides
+
+    arguments = {
+        "sql": generated["sql"],
+        "history_id": generated["history_id"],
+        "session_id": "session-a",
+        "allowed_tables": generated["allowed_tables"],
+        "allowed_schemas": generated["allowed_schemas"],
+        "user_query": generated["user_query"],
+        "semantic_version": generated["semantic_version"],
+    }
+    arguments.update(execute_overrides)
+    result = generator.execute_sql(**arguments)
+
+    assert result["status"] == "error"
+    assert result["executable"] is False
+    assert result["validation"]["issues"][0]["code"] == (
+        "HISTORY_CONTEXT_MISMATCH"
+    )
+    mysql.execute_query_limited.assert_not_called()
+    mysql.update_sql_execution.assert_not_called()
+    generator.knowledge_retriever.add_history_record.assert_not_called()
+
+
+def test_governed_success_updates_and_promotes_only_the_bound_history():
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    )
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+    generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    mysql.reset_mock()
+    mysql.get_history_detail.return_value = _successful_history(sql=generated["sql"])
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+    mysql.update_sql_execution.return_value = True
+
+    result = generator.execute_sql(
+        generated["sql"],
+        history_id=generated["history_id"],
+        session_id="session-a",
+        allowed_tables=generated["allowed_tables"],
+        allowed_schemas=generated["allowed_schemas"],
+        user_query=generated["user_query"],
+        semantic_version=generated["semantic_version"],
+    )
+
+    assert result["status"] == "success"
+    update = mysql.update_sql_execution.call_args.kwargs
+    assert update["session_id"] == "session-a"
+    assert update["generated_sql"] == generated["sql"]
+    assert update["require_validation_success"] is True
+    generator.knowledge_retriever.add_history_record.assert_called_once_with(
+        mysql.get_history_detail.return_value
+    )
 
 
 def test_disabled_governance_preserves_legacy_result_shape_and_chain_call():
@@ -418,6 +643,35 @@ def test_invalid_governance_environment_fails_import(updates: dict, variable: st
 
     assert result.returncode != 0
     assert variable in result.stdout + result.stderr
+
+
+def test_explain_enabled_without_governance_fails_environment_validation():
+    """EXPLAIN is a correctness stage and must never be silently ignored."""
+    result = _import_config(
+        SEMANTIC_GOVERNANCE_ENABLED="false",
+        SQL_EXPLAIN_ENABLED="true",
+        LLM_API_KEY="do-not-leak-this-secret",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "SQL_EXPLAIN_ENABLED" in output
+    assert "SEMANTIC_GOVERNANCE_ENABLED" in output
+    assert "do-not-leak-this-secret" not in output
+
+
+def test_validate_config_exception_names_the_invalid_explain_dependency(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "SQL_EXPLAIN_ENABLED", True)
+    monkeypatch.setattr(config, "SEMANTIC_GOVERNANCE_ENABLED", False)
+
+    with pytest.raises(ValueError) as error:
+        config.validate_config()
+
+    message = str(error.value)
+    assert "SQL_EXPLAIN_ENABLED" in message
+    assert "SEMANTIC_GOVERNANCE_ENABLED" in message
 
 
 def test_governance_configuration_defaults_are_exact():
@@ -561,6 +815,33 @@ def test_failed_governance_reload_keeps_old_registry_generator_and_config(
     assert context.sql_generator is old_generator
 
 
+def test_reload_rejects_explain_without_governance_and_keeps_live_components():
+    from core.app_context import ApplicationContext, ApplicationConfigurationError
+
+    context = ApplicationContext({"semantic_governance_enabled": False})
+    old_registry = object()
+    old_pipeline = object()
+    old_generator = object()
+    context._semantic_registry = old_registry
+    context._correctness_pipeline = old_pipeline
+    context._sql_generator = old_generator
+
+    with pytest.raises(ApplicationConfigurationError) as error:
+        context.reload_governance(
+            sql_explain_enabled=True,
+            llm_api_key="do-not-leak-this-secret",
+        )
+
+    message = str(error.value)
+    assert "SQL_EXPLAIN_ENABLED" in message
+    assert "SEMANTIC_GOVERNANCE_ENABLED" in message
+    assert "do-not-leak-this-secret" not in message
+    assert context.config == {"semantic_governance_enabled": False}
+    assert context.semantic_registry is old_registry
+    assert context.correctness_pipeline is old_pipeline
+    assert context.sql_generator is old_generator
+
+
 def test_initial_governance_failure_exposes_only_stable_configuration_error(
     tmp_path: Path, monkeypatch, caplog
 ):
@@ -598,6 +879,7 @@ def test_ui_helpers_disable_rejected_sql_and_ignore_unstructured_error_details()
     """Catches UI execution enablement or rendering of raw database error strings."""
     from core.utils.correctness_ui import (
         execution_is_disabled,
+        public_failure_messages,
         structured_validation_messages,
     )
 
@@ -621,6 +903,30 @@ def test_ui_helpers_disable_rejected_sql_and_ignore_unstructured_error_details()
     assert execution_is_disabled({"sql": "SELECT 1"}) is False
     assert structured_validation_messages(result) == [
         "[POLICY_DENIED] 字段不允许直接查询"
+    ]
+    assert public_failure_messages(result) == [
+        "[POLICY_DENIED] 字段不允许直接查询"
+    ]
+    assert public_failure_messages({"error": None}) == ["未知错误"]
+
+
+def test_ui_failure_messages_render_correctness_unavailable_without_raw_error():
+    from core.utils.correctness_ui import public_failure_messages
+
+    result = {
+        "error": "password=secret SELECT private FROM hidden",
+        "validation": {
+            "issues": [
+                {
+                    "code": "CORRECTNESS_UNAVAILABLE",
+                    "message": "SQL 正确性校验暂时不可用",
+                }
+            ]
+        },
+    }
+
+    assert public_failure_messages(result) == [
+        "[CORRECTNESS_UNAVAILABLE] SQL 正确性校验暂时不可用"
     ]
 
 

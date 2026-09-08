@@ -33,4 +33,17 @@ def structured_validation_messages(result: Mapping[str, Any] | None) -> list[str
     return messages
 
 
-__all__ = ["execution_is_disabled", "structured_validation_messages"]
+def public_failure_messages(result: Mapping[str, Any] | None) -> list[str]:
+    """Prefer stable structured issues and provide a non-null legacy fallback."""
+    structured = structured_validation_messages(result)
+    if structured:
+        return structured
+    error = result.get("error") if isinstance(result, Mapping) else None
+    return [error if isinstance(error, str) and error else "未知错误"]
+
+
+__all__ = [
+    "execution_is_disabled",
+    "public_failure_messages",
+    "structured_validation_messages",
+]

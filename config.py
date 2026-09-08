@@ -213,6 +213,7 @@ HISTORY_AUTO_SAVE = os.getenv("HISTORY_AUTO_SAVE", "true").lower() == "true"
 def validate_config():
     """验证配置参数的有效性，在模块加载时执行"""
     errors = []
+    explain_dependency_error = None
 
     # 验证检索权重总和
     if abs(BM25_WEIGHT + DENSE_WEIGHT - 1.0) > 0.01:
@@ -280,6 +281,12 @@ def validate_config():
             "SQL_EXPLAIN_MAX_ESTIMATED_ROWS 不能为负："
             f"{SQL_EXPLAIN_MAX_ESTIMATED_ROWS}"
         )
+    if SQL_EXPLAIN_ENABLED and not SEMANTIC_GOVERNANCE_ENABLED:
+        explain_dependency_error = (
+            "SQL_EXPLAIN_ENABLED=true 要求 "
+            "SEMANTIC_GOVERNANCE_ENABLED=true"
+        )
+        errors.append(explain_dependency_error)
     if PROMPT_MAX_LENGTH < 1000:
         errors.append(f"PROMPT_MAX_LENGTH 不应小于 1000：{PROMPT_MAX_LENGTH}")
     if UPLOAD_MAX_BYTES <= 0 or GRAPH_MAX_NODES <= 0 or GRAPH_MAX_EDGES <= 0:
@@ -296,6 +303,8 @@ def validate_config():
         logger.error("配置验证失败：")
         for error in errors:
             logger.error(f"  - {error}")
+        if explain_dependency_error is not None:
+            raise ValueError(f"配置验证失败：{explain_dependency_error}")
         raise ValueError(f"配置验证失败，共 {len(errors)} 个错误")
 
 

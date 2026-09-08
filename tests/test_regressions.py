@@ -202,13 +202,18 @@ def test_successful_execution_promotes_history_to_few_shot():
     mysql.get_table_schema.return_value = []
     mysql.get_history_detail.return_value = {
         "id": 7,
+        "session_id": "session-a",
         "user_query": "query",
         "generated_sql": "SELECT 1",
+        "validation_status": "success",
         "execution_status": "success",
     }
+    mysql.update_sql_execution.return_value = True
     generator = _make_generator(mysql)
 
-    result = generator.execute_sql("SELECT 1", history_id=7)
+    result = generator.execute_sql(
+        "SELECT 1", history_id=7, session_id="session-a"
+    )
 
     assert result["status"] == "success"
     mysql.update_sql_execution.assert_called_once()
@@ -471,8 +476,8 @@ def test_sql_parse_exception_result_and_log_do_not_leak(monkeypatch, caplog):
     assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
 
 
-def test_generator_factory_loads_only_execution_success_history_for_few_shot():
-    """Catches rejected or merely generated history entering Few-Shot at startup."""
+def test_generator_factory_loads_only_fully_successful_history_for_few_shot():
+    """Catches validation-failed history entering Few-Shot after execution."""
     from core.sql.generator import create_sql_generator
 
     neo4j = Mock()
@@ -485,7 +490,14 @@ def test_generator_factory_loads_only_execution_success_history_for_few_shot():
             "generated_sql": "SELECT SUM(amount) FROM orders",
             "validation_status": "success",
             "execution_status": "success",
-        }
+        },
+        {
+            "id": 8,
+            "user_query": "错误示例",
+            "generated_sql": "SELECT COUNT(*) FROM orders",
+            "validation_status": "fail",
+            "execution_status": "success",
+        },
     ]
 
     generator = create_sql_generator(
@@ -494,9 +506,48 @@ def test_generator_factory_loads_only_execution_success_history_for_few_shot():
 
     mysql.get_successful_history_for_few_shot.assert_called_once_with(limit=100)
     mysql.get_history_list.assert_not_called()
-    assert generator.knowledge_retriever.history_records == (
-        mysql.get_successful_history_for_few_shot.return_value
+    assert [record["id"] for record in generator.knowledge_retriever.history_records] == [7]
+
+
+def test_mysql_few_shot_query_requires_validation_and_execution_success():
+    """Startup candidates must have passed validation as well as execution."""
+    from core.history.mysql_client import MySQLClient
+
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    client.execute_query = Mock(return_value=[])
+
+    client.get_successful_history_for_few_shot(limit=12)
+
+    query, params = client.execute_query.call_args.args
+    normalized_query = " ".join(query.split()).lower()
+    assert "validation_status = 'success'" in normalized_query
+    assert "execution_status = 'success'" in normalized_query
+    assert params == {"limit": 12}
+
+
+def test_guarded_history_update_binds_session_sql_and_validation_status():
+    """The storage mutation itself must retain the verified history predicates."""
+    from core.history.mysql_client import MySQLClient
+
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    client.execute_update = Mock(return_value=1)
+
+    updated = client.update_sql_execution(
+        history_id=7,
+        execution_status="success",
+        session_id="session-a",
+        generated_sql="SELECT 1",
+        require_validation_success=True,
     )
+
+    query, params = client.execute_update.call_args.args
+    normalized_query = " ".join(query.split()).lower()
+    assert updated is True
+    assert "session_id = :session_id" in normalized_query
+    assert "generated_sql = :generated_sql" in normalized_query
+    assert "validation_status = 'success'" in normalized_query
+    assert params["session_id"] == "session-a"
+    assert params["generated_sql"] == "SELECT 1"
 
 
 def test_read_query_constraint_adds_limit_and_mysql_timeout_hint():
