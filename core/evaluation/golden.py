@@ -57,6 +57,7 @@ _ASSERTION_CODES = frozenset(
     }
 )
 _REPORT_ERROR_CODES = PUBLIC_SQL_RESULT_ERROR_CODES | {"EVALUATION_SQL_INVALID"}
+_FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _MODEL_PARAMETER_ALLOWLIST = frozenset(
     {
         "context_length",
@@ -70,7 +71,13 @@ _MODEL_PARAMETER_ALLOWLIST = frozenset(
         "top_p",
     }
 )
-_MODEL_REVISION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_MODEL_REVISION = re.compile(
+    r"(?:"
+    r"v?(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*)){2}(?:[-.][0-9A-Za-z]+)*|"
+    r"[0-9A-Fa-f]{7,64}|"
+    r"[A-Za-z][A-Za-z0-9]*(?:[._-][A-Za-z0-9]+){0,3}"
+    r")"
+)
 _QUANTIZATIONS = frozenset(
     {
         "NONE",
@@ -102,7 +109,31 @@ _SENSITIVE_PARAMETER_TEXT = re.compile(
     r"credential|endpoint)(?:[^a-z0-9]|$))",
     re.IGNORECASE,
 )
+_CREDENTIAL_VALUE = re.compile(
+    r"(?:"
+    r"(?:^|[._-])(?:sk-(?:(?:proj|svcacct)-)?|gh[pousr]_|github_pat_|"
+    r"glpat-|AIza|ya29\.|xox[baprs]-|(?:sk|pk|rk)_(?:live|test)_|"
+    r"whsec_|Bearer[._-])|"
+    r"^(?:(?:A3T[A-Z0-9])|AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|"
+    r"ANVA|AROA)[A-Z0-9]{16}$|"
+    r"^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$"
+    r")",
+    re.IGNORECASE,
+)
 _Scalar = StrictBool | StrictInt | StrictFloat | StrictStr
+
+
+def _looks_like_high_entropy_credential(value: str) -> bool:
+    if re.fullmatch(r"[0-9A-Fa-f]{7,64}", value):
+        return False
+    categories = sum(
+        (
+            any(char.islower() for char in value),
+            any(char.isupper() for char in value),
+            any(char.isdigit() for char in value),
+        )
+    )
+    return len(value) >= 24 and categories >= 3
 
 
 class GoldenConfigurationError(ValueError):
@@ -333,7 +364,12 @@ class ModelParameter(FrozenModel):
             if type(value) is not int or not 0 <= value <= 2**63 - 1:
                 raise ValueError("model parameter value is out of range")
         elif self.name == "model_revision":
-            if not isinstance(value, str) or not _MODEL_REVISION.fullmatch(value):
+            if (
+                not isinstance(value, str)
+                or not _MODEL_REVISION.fullmatch(value)
+                or _CREDENTIAL_VALUE.search(value)
+                or _looks_like_high_entropy_credential(value)
+            ):
                 raise ValueError("model revision is not report-safe")
         elif self.name == "quantization":
             if not isinstance(value, str) or value.upper() not in _QUANTIZATIONS:
@@ -381,6 +417,19 @@ class CaseResult(FrozenModel):
     def validate_result(self) -> "CaseResult":
         if (
             not _CASE_ID.fullmatch(self.id)
+            or not _FINGERPRINT.fullmatch(self.question_fingerprint)
+            or (
+                self.sql_fingerprint is not None
+                and not _FINGERPRINT.fullmatch(self.sql_fingerprint)
+            )
+            or (
+                self.question is not None
+                and _fingerprint(self.question) != self.question_fingerprint
+            )
+            or (
+                self.sql is not None
+                and _fingerprint(self.sql) != self.sql_fingerprint
+            )
             or self.elapsed_ms < 0
             or self.passed != (not self.failed_assertions)
             or len(self.failed_assertions) != len(set(self.failed_assertions))
@@ -452,6 +501,13 @@ class EvaluationReport(FrozenModel):
                 self.content_included
                 and any(case.question is None for case in self.cases)
             )
+            or (
+                self.content_included
+                and any(
+                    (case.sql is None) != (case.sql_fingerprint is None)
+                    for case in self.cases
+                )
+            )
             or len(self.model_parameters)
             != len({parameter.name for parameter in self.model_parameters})
         ):
@@ -471,6 +527,55 @@ class EvaluationReport(FrozenModel):
         for case in payload["cases"]:
             case.pop("elapsed_ms", None)
         return payload
+
+
+def _revalidate_report(report: EvaluationReport) -> EvaluationReport:
+    """Rebuild a report from primitives so copied nested models cannot bypass validation."""
+    try:
+        payload = {
+            "schema_version": report.schema_version,
+            "model": report.model,
+            "model_parameters": tuple(
+                {"name": parameter.name, "value": parameter.value}
+                for parameter in report.model_parameters
+            ),
+            "datasource": report.datasource,
+            "dialect": report.dialect,
+            "semantic_version": report.semantic_version,
+            "git_commit": report.git_commit,
+            "total": report.total,
+            "passed": report.passed,
+            "failed": report.failed,
+            "pass_rate": report.pass_rate,
+            "per_rule": tuple(
+                {
+                    "assertion": rule.assertion,
+                    "total": rule.total,
+                    "passed": rule.passed,
+                    "rate": rule.rate,
+                }
+                for rule in report.per_rule
+            ),
+            "cases": tuple(
+                {
+                    "id": case.id,
+                    "passed": case.passed,
+                    "failed_assertions": case.failed_assertions,
+                    "error_codes": case.error_codes,
+                    "question_fingerprint": case.question_fingerprint,
+                    "sql_fingerprint": case.sql_fingerprint,
+                    "elapsed_ms": case.elapsed_ms,
+                    "question": case.question,
+                    "sql": case.sql,
+                }
+                for case in report.cases
+            ),
+            "elapsed_ms": report.elapsed_ms,
+            "content_included": report.content_included,
+        }
+        return EvaluationReport.model_validate(payload)
+    except Exception as exc:
+        raise GoldenConfigurationError("INVALID_REPORT") from exc
 
 
 def _normalize(value: str) -> str:
@@ -803,9 +908,8 @@ class GoldenEvaluator:
         )
         if has_content and not report.content_included:
             raise GoldenConfigurationError("REPORT_CONTENT_MISMATCH")
-        report.validate_report()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = report.model_dump(mode="json", exclude_none=True)
+        validated_report = _revalidate_report(report)
+        payload = validated_report.model_dump(mode="json", exclude_none=True)
         serialized = json.dumps(
             payload,
             ensure_ascii=False,
@@ -813,6 +917,7 @@ class GoldenEvaluator:
             separators=(",", ":"),
             allow_nan=False,
         ) + "\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
         temporary_name: str | None = None
         try:
             with tempfile.NamedTemporaryFile(

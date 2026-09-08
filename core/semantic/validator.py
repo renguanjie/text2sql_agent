@@ -1096,15 +1096,28 @@ def normalize_filter_expression(
 
 
 def _date_format_time_facts(format_text: str) -> frozenset[str]:
-    tokens = {
-        match.group(1)
-        for match in re.finditer(r"%(?:[-_0^#]*)([A-Za-z%])", format_text)
-        if match.group(1) != "%"
-    }
-    year_tokens = {"Y", "y", "G", "g", "x", "X"}
-    month_tokens = {"m", "c", "b", "B", "h"}
+    tokens: set[str] = set()
+    index = 0
+    while index < len(format_text):
+        if format_text[index] != "%":
+            index += 1
+            continue
+        if index + 1 >= len(format_text):
+            return frozenset()
+        token = format_text[index + 1]
+        if token != "%":
+            if not token.isascii() or not token.isalpha():
+                return frozenset()
+            tokens.add(token)
+        index += 2
+
+    # These are MySQL DATE_FORMAT tokens, not sqlglot's normalized Python
+    # strftime tokens. In particular, raw %B/%G/%W must not be confused with
+    # normalized forms of MySQL's legal %M/%x/%u tokens.
+    year_tokens = {"Y", "y", "x", "X"}
+    month_tokens = {"m", "c", "b", "M"}
     day_tokens = {"d", "e", "D", "j"}
-    week_tokens = {"U", "u", "V", "v", "W"}
+    week_tokens = {"U", "u", "V", "v"}
     allowed = year_tokens | month_tokens | day_tokens | week_tokens
     if not tokens or not tokens <= allowed:
         return frozenset()
@@ -1125,7 +1138,42 @@ def _date_format_time_facts(format_text: str) -> frozenset[str]:
     return frozenset()
 
 
-def _time_facts_for_node(node: exp.Expression) -> tuple[frozenset[str], bool]:
+def _raw_mysql_date_formats(
+    sql: str, normalized_tree: exp.Expression
+) -> Mapping[int, str]:
+    """Bind raw MySQL DATE_FORMAT literals to normalized AST nodes by order."""
+    try:
+        neutral_statements = [item for item in parse(sql) if item is not None]
+    except Exception:
+        return MappingProxyType({})
+    if len(neutral_statements) != 1:
+        return MappingProxyType({})
+
+    normalized_nodes = [
+        node
+        for item in normalized_tree.walk()
+        if (node := item[0] if isinstance(item, tuple) else item).key.casefold()
+        == "timetostr"
+    ]
+    raw_literals: list[str] = []
+    for item in neutral_statements[0].walk():
+        node = item[0] if isinstance(item, tuple) else item
+        if not isinstance(node, exp.Anonymous) or node.name.casefold() != "date_format":
+            continue
+        arguments = node.expressions
+        if len(arguments) != 2 or not isinstance(arguments[1], exp.Literal) or not arguments[1].is_string:
+            return MappingProxyType({})
+        raw_literals.append(str(arguments[1].this))
+    if len(normalized_nodes) != len(raw_literals):
+        return MappingProxyType({})
+    return MappingProxyType(
+        {id(node): raw for node, raw in zip(normalized_nodes, raw_literals, strict=True)}
+    )
+
+
+def _time_facts_for_node(
+    node: exp.Expression, raw_date_formats: Mapping[int, str]
+) -> tuple[frozenset[str], bool]:
     key = node.key.casefold()
     if key == "datetrunc":
         unit = node.args.get("unit")
@@ -1137,9 +1185,13 @@ def _time_facts_for_node(node: exp.Expression) -> tuple[frozenset[str], bool]:
         )
         return facts, True
     if key == "timetostr":
-        format_expression = node.args.get("format")
-        format_text = str(getattr(format_expression, "this", "") or "")
-        return _date_format_time_facts(format_text), True
+        format_text = raw_date_formats.get(id(node))
+        return (
+            _date_format_time_facts(format_text)
+            if format_text is not None
+            else frozenset(),
+            True,
+        )
     if key == "year":
         return frozenset({"exact:year", "part:year"}), True
     if key in {"day", "month", "quarter", "week"}:
@@ -1246,34 +1298,92 @@ def analyze_sql_structure(
                     _filter_signature_text(atom, info, infos, indexes)
                 )
 
-    time_evidence: dict[str, set[str]] = {}
-    visited_definitions: set[tuple[int, int]] = set()
+    raw_date_formats = _raw_mysql_date_formats(sql, analysis.tree)
+    # Evidence is isolated by final output scope, underlying source occurrence,
+    # and governed field. This prevents unrelated scalar/self-join scopes from
+    # manufacturing a complete calendar key for the final result.
+    time_evidence: dict[tuple[int, int, str], set[str]] = {}
+    visited_definitions: set[tuple[int, int, int]] = set()
 
-    def collect_time_facts(
+    def unwrap_key(node: exp.Expression) -> exp.Expression:
+        while isinstance(node, (exp.Alias, exp.Paren)):
+            node = node.this
+        return node
+
+    def column_origin(
+        column: exp.Column,
+        info: _ScopeInfo,
+        visited: frozenset[tuple[int, str]],
+    ) -> tuple[int, str] | None:
+        marker = (id(info.scope), _casefold(column.sql()))
+        if marker in visited:
+            return None
+        visited = visited | {marker}
+        name = _casefold(column.name)
+        qualifier = _casefold(column.table) if column.table else ""
+
+        def from_source(source: exp.Table | Scope | None) -> tuple[int, str] | None:
+            if isinstance(source, exp.Table):
+                table = _table_name(source)
+                if indexes and name not in indexes.get(table, frozenset()):
+                    return None
+                return id(source), f"{table}.{name}"
+            if isinstance(source, Scope):
+                source_info = infos[id(source)]
+                definition = source_info.projection_expressions.get(name)
+                definition = unwrap_key(definition) if definition is not None else None
+                if isinstance(definition, exp.Column):
+                    return column_origin(definition, source_info, visited)
+            return None
+
+        if qualifier:
+            return from_source(info.sources.get(qualifier))
+        candidates = tuple(
+            candidate
+            for source in _unique_sources(info)
+            if (candidate := from_source(source)) is not None
+        )
+        return candidates[0] if len(candidates) == 1 else None
+
+    def is_direct_time_function(node: exp.Expression) -> bool:
+        for item in node.walk():
+            descendant = item[0] if isinstance(item, tuple) else item
+            if descendant is node:
+                continue
+            if isinstance(
+                descendant,
+                (exp.AggFunc, exp.Case, exp.Predicate, exp.Select, exp.Subquery),
+            ):
+                return False
+            if isinstance(descendant, exp.Func) and type(descendant).__name__ not in {
+                "TsOrDsToDate",
+                "TsOrDsToTimestamp",
+            }:
+                return False
+        return True
+
+    def collect_time_key(
         node: exp.Expression,
         info: _ScopeInfo,
+        output_scope_id: int,
         *,
         expand_projection_star: bool = False,
     ) -> None:
-        if isinstance(node, exp.AggFunc):
-            return
-        facts, terminal = _time_facts_for_node(node)
-        if facts and any(
-            isinstance(item[0] if isinstance(item, tuple) else item, exp.AggFunc)
-            for item in node.walk()
-        ):
-            return
-        if facts:
-            references: set[str] = set()
-            for column in _immediate_columns(node, info.scope.expression):
-                resolved = _resolve_column(column, info, infos, indexes)
-                if resolved.known:
-                    references.update(
-                        f"{table}.{name}" for table, name in resolved.references
-                    )
-            for reference in references:
-                time_evidence.setdefault(reference, set()).update(facts)
+        node = unwrap_key(node)
+        facts, terminal = _time_facts_for_node(node, raw_date_formats)
         if terminal:
+            if not facts or not is_direct_time_function(node):
+                return
+            columns = _immediate_columns(node, info.scope.expression)
+            if len(columns) != 1:
+                return
+            origin = column_origin(columns[0], info, frozenset())
+            if origin is None:
+                return
+            source_id, reference = origin
+            time_evidence.setdefault(
+                (output_scope_id, source_id, reference), set()
+            ).update(facts)
             return
 
         if isinstance(node, exp.Star) or (
@@ -1287,39 +1397,23 @@ def analyze_sql_structure(
                 if isinstance(source, Scope):
                     source_info = infos[id(source)]
                     for expression in source_info.projection_expressions.values():
-                        collect_time_facts(expression, source_info)
+                        collect_time_key(expression, source_info, output_scope_id)
             return
 
-        if isinstance(node, exp.Column):
-            derived = _derived_definition(node, info, infos, indexes)
-            if derived is None and not node.table:
-                expression = info.projection_expressions.get(_casefold(node.name))
-                derived = (info, expression) if expression is not None else None
-            if derived is not None:
-                definition_info, expression = derived
-                marker = (id(definition_info.scope), id(expression))
-                if marker not in visited_definitions:
-                    visited_definitions.add(marker)
-                    collect_time_facts(expression, definition_info)
+        if not isinstance(node, exp.Column):
             return
-
-        if isinstance(node, exp.Subquery):
-            child_info = next(
-                (
-                    candidate
-                    for candidate in source_infos
-                    if candidate.scope.expression is node.this
-                ),
-                None,
-            )
-            if child_info is not None and isinstance(node.this, exp.Select):
-                for expression in node.this.expressions:
-                    collect_time_facts(expression, child_info)
+        derived = _derived_definition(node, info, infos, indexes)
+        if derived is None and not node.table:
+            expression = info.projection_expressions.get(_casefold(node.name))
+            derived = (info, expression) if expression is not None else None
+        if derived is None:
             return
-        if isinstance(node, exp.Select):
+        definition_info, expression = derived
+        definition_marker = (output_scope_id, id(definition_info.scope), id(expression))
+        if definition_marker in visited_definitions:
             return
-        for child in _expression_children(node):
-            collect_time_facts(child, info)
+        visited_definitions.add(definition_marker)
+        collect_time_key(expression, definition_info, output_scope_id)
 
     for info in analysis.root_output_infos:
         select = info.scope.expression
@@ -1334,15 +1428,16 @@ def analyze_sql_structure(
             is_projection_star = isinstance(unaliased, exp.Star) or (
                 isinstance(unaliased, exp.Column) and unaliased.name == "*"
             )
-            collect_time_facts(
+            collect_time_key(
                 expression,
                 info,
+                id(info.scope),
                 expand_projection_star=is_projection_star,
             )
 
     time_grains: set[tuple[str, str]] = set()
     grain_precision = {"year": 0, "quarter": 1, "month": 2, "week": 3, "day": 4}
-    for reference, facts in time_evidence.items():
+    for (_, _, reference), facts in time_evidence.items():
         candidates = {
             grain
             for grain in grain_precision

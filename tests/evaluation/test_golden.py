@@ -154,8 +154,8 @@ def test_contracts_are_deeply_immutable():
         passed=True,
         failed_assertions=(),
         error_codes=(),
-        question_fingerprint="q",
-        sql_fingerprint="s",
+        question_fingerprint="a" * 64,
+        sql_fingerprint="b" * 64,
         elapsed_ms=0,
     )
     report = EvaluationReport(
@@ -375,6 +375,88 @@ def test_calendar_components_from_different_time_fields_do_not_combine(snapshot)
     )
 
 
+def test_calendar_components_from_scalar_subquery_do_not_combine(evaluator):
+    """Break caught: merging calendar components from unrelated query scopes."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "SELECT YEAR(o.created_at), "
+        "(SELECT MONTH(i.created_at) FROM example_orders AS i LIMIT 1), COUNT(*) "
+        "FROM example_orders AS o GROUP BY YEAR(o.created_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_calendar_components_from_exists_subquery_do_not_combine(evaluator):
+    """Break caught: collecting a period component from an EXISTS-only scope."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "SELECT YEAR(o.created_at), "
+        "EXISTS(SELECT MONTH(i.created_at) FROM example_orders AS i), COUNT(*) "
+        "FROM example_orders AS o GROUP BY YEAR(o.created_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_calendar_components_from_distinct_self_join_sources_do_not_combine(evaluator):
+    """Break caught: erasing source identity when both aliases target the same table."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "SELECT YEAR(o.created_at), MONTH(i.created_at), COUNT(*) "
+        "FROM example_orders AS o JOIN example_orders AS i ON i.id = o.id "
+        "GROUP BY YEAR(o.created_at), MONTH(i.created_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_calendar_component_hidden_in_case_is_not_a_direct_grain_key(evaluator):
+    """Break caught: treating a temporal descendant inside CASE as a grouping component."""
+    case = _case(expected_time_grain="month")
+    hidden_month = "CASE WHEN status = 'complete' THEN MONTH(created_at) ELSE 0 END"
+    sql = (
+        f"SELECT YEAR(created_at), {hidden_month}, COUNT(*) FROM example_orders "
+        f"GROUP BY YEAR(created_at), {hidden_month}"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_calendar_component_hidden_in_comparison_is_not_a_direct_grain_key(evaluator):
+    """Break caught: descending through a comparison to manufacture a component."""
+    case = _case(expected_time_grain="month")
+    hidden_month = "MONTH(created_at) > 0"
+    sql = (
+        f"SELECT YEAR(created_at), {hidden_month}, COUNT(*) FROM example_orders "
+        f"GROUP BY YEAR(created_at), {hidden_month}"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_calendar_components_resolve_through_used_cte_aliases(evaluator):
+    """Break caught: scope isolation discarding a complete key used by the final result."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT YEAR(created_at) AS year_key, "
+        "MONTH(created_at) AS month_key FROM example_orders) "
+        "SELECT year_key, month_key, COUNT(*) FROM base GROUP BY year_key, month_key"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).passed
+
+
 @pytest.mark.parametrize(
     "requested,components",
     [
@@ -435,6 +517,25 @@ def test_used_derived_grain_alias_satisfies_outer_result(evaluator):
     )
 
     assert evaluator.evaluate_case(case, _result(sql)).passed
+
+
+@pytest.mark.parametrize(
+    "grain,expression",
+    [
+        ("month", "DATE_FORMAT(created_at, '%Y-%B')"),
+        ("week", "DATE_FORMAT(created_at, '%G-%V')"),
+    ],
+)
+def test_raw_non_mysql_date_format_tokens_are_not_accepted_after_normalization(
+    evaluator, grain, expression
+):
+    """Break caught: confusing sqlglot's normalized strftime tokens with raw MySQL SQL."""
+    case = _case(expected_time_grain=grain)
+    sql = f"SELECT {expression}, COUNT(*) FROM example_orders GROUP BY {expression}"
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
 
 
 def test_structural_assertions_cover_relationship_filter_and_forbidden_objects(evaluator):
@@ -750,6 +851,18 @@ def test_model_parameter_parser_allows_only_non_sensitive_names():
         "model_revision=release?api_key=private",
         "model_revision=token=private",
         "model_revision=host.example",
+        "model_revision=sk-proj-AbCdEf0123456789",
+        "model_revision=release-sk-proj-AbCdEf0123456789",
+        "model_revision=sk-svcacct-AbCdEf0123456789",
+        "model_revision=sk-AbCdEf0123456789",
+        "model_revision=ghp_AbCdEf0123456789",
+        "model_revision=AKIAIOSFODNN7EXAMPLE",
+        "model_revision=A3TAXAMPLEKEY1234567",
+        "model_revision=AIzaSyD-ExampleCredential123456789",
+        "model_revision=ya29.AbCdEf0123456789",
+        "model_revision=xoxb-123456789012-AbCdEf",
+        "model_revision=sk_live_AbCdEf0123456789",
+        "model_revision=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
         "quantization=custom format",
         "quantization=Q4_K_M?password=private",
     ],
@@ -761,6 +874,7 @@ def test_model_parameter_values_have_strict_safe_specs(raw):
 
     assert caught.value.code == "INVALID_MODEL_PARAMETER"
     assert "private" not in str(caught.value)
+    assert raw.split("=", 1)[1] not in str(caught.value)
 
 
 def test_model_parameter_direct_construction_uses_the_same_safe_specs():
@@ -770,10 +884,21 @@ def test_model_parameter_direct_construction_uses_the_same_safe_specs():
         ("top_p", 2),
         ("seed", -1),
         ("model_revision", "secret=private"),
+        ("model_revision", "sk-proj-AbCdEf0123456789"),
         ("quantization", "unknown"),
     ):
         with pytest.raises(ValidationError):
             ModelParameter(name=name, value=value)
+
+
+@pytest.mark.parametrize(
+    "revision",
+    ["main", "release-2026", "v1.2.3", "abcdef1234567890abcdef1234567890abcdef12"],
+)
+def test_model_revision_accepts_only_narrow_nonsecret_identifiers(revision):
+    assert parse_model_parameters([f"model_revision={revision}"]) == (
+        ModelParameter(name="model_revision", value=revision),
+    )
 
 
 def test_report_serializes_parameter_summary_as_a_sorted_mapping(snapshot: SemanticSnapshot):
@@ -968,8 +1093,8 @@ def test_report_enforces_case_counts_rates_rules_and_content_flags():
         passed=True,
         failed_assertions=(),
         error_codes=(),
-        question_fingerprint="q",
-        sql_fingerprint="s",
+        question_fingerprint="a" * 64,
+        sql_fingerprint="b" * 64,
         elapsed_ms=0,
     )
     base = {
@@ -1020,6 +1145,66 @@ def test_writer_rejects_nonfinite_values_even_if_model_copy_bypasses_validation(
         evaluator.write_report(report, tmp_path / "nan.json")
 
     assert not (tmp_path / "nan.json").exists()
+
+
+def test_writer_deeply_revalidates_tampered_nested_report_values(
+    evaluator, snapshot: SemanticSnapshot, tmp_path: Path
+):
+    """Break caught: model_copy bypassing validation on nested report value objects."""
+    report = evaluator.evaluate_results(
+        [(_case(), _result("SELECT id FROM example_orders"))]
+    )
+    bad_rate = report.per_rule[0].model_copy(update={"rate": 0.5})
+    bad_fingerprint = report.cases[0].model_copy(
+        update={"question_fingerprint": "not-a-fingerprint"}
+    )
+    debug_evaluator = GoldenEvaluator(snapshot, include_content=True)
+    debug_report = debug_evaluator.evaluate_results(
+        [(_case(question="本地问题"), _result("SELECT id FROM example_orders"))]
+    )
+    mismatched_body = debug_report.cases[0].model_copy(
+        update={"question": "被篡改的问题"}
+    )
+    missing_sql_body = debug_report.cases[0].model_copy(update={"sql": None})
+    duplicate_rule = report.per_rule[0].model_copy(update={"total": 2, "passed": 2})
+    duplicate_case_ids = report.model_copy(
+        update={
+            "total": 2,
+            "passed": 2,
+            "per_rule": (duplicate_rule,),
+            "cases": (report.cases[0], report.cases[0]),
+        }
+    )
+    attempts = (
+        (evaluator, report.model_copy(update={"per_rule": (bad_rate,)})),
+        (evaluator, report.model_copy(update={"cases": (bad_fingerprint,)})),
+        (evaluator, duplicate_case_ids),
+        (
+            evaluator,
+            report.model_copy(
+                update={
+                    "cases": (report.cases[0].model_copy(update={"question": "private"}),),
+                    "content_included": False,
+                }
+            ),
+        ),
+        (
+            debug_evaluator,
+            debug_report.model_copy(update={"cases": (mismatched_body,)}),
+        ),
+        (
+            debug_evaluator,
+            debug_report.model_copy(update={"cases": (missing_sql_body,)}),
+        ),
+    )
+    path = tmp_path / "existing.json"
+    sentinel = b'{"existing":true}\n'
+    path.write_bytes(sentinel)
+
+    for writer, tampered in attempts:
+        with pytest.raises((GoldenConfigurationError, ValidationError, ValueError)):
+            writer.write_report(tampered, path)
+        assert path.read_bytes() == sentinel
 
 
 def test_report_json_is_canonical_and_written_via_atomic_replace(
