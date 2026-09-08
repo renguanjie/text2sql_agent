@@ -5,14 +5,20 @@ SQL 生成器模块
 """
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 from loguru import logger
 
-from ..retrieval.bm25_tfidf import KnowledgeRetriever
-from ..chain.sql_chain import SQLGenerationChain, QueryRewriteChain
+from ..chain.sql_chain import QueryRewriteChain, SQLGenerationChain
 from ..history.mysql_client import MySQLClient
-from .dialect_detector import SQLDialectDetector
+from ..retrieval.bm25_tfidf import KnowledgeRetriever
 from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
+from .dialect_detector import SQLDialectDetector
+from .error_codes import (
+    EXECUTION_CONTEXT_REQUIRED,
+    GENERATION_FAILED,
+    HISTORY_CONTEXT_MISMATCH,
+)
 from .validator import (
     constrain_read_query,
     is_safe_read_query,
@@ -229,7 +235,7 @@ class SQLGenerator:
     ) -> Dict[str, Any]:
         if self.correctness_pipeline is not None:
             return self._governed_error_payload(
-                code='HISTORY_CONTEXT_MISMATCH',
+                code=HISTORY_CONTEXT_MISMATCH,
                 message=message,
                 semantic_version=semantic_version,
                 sql=sql,
@@ -387,7 +393,7 @@ class SQLGenerator:
     ) -> None:
         if result.get('status') != 'success' or not result.get('sql'):
             failure = self._governed_error_payload(
-                code='GENERATION_FAILED',
+                code=GENERATION_FAILED,
                 message='未生成可供正确性校验的 SQL',
                 semantic_version=semantic_version,
                 sql=result.get('sql'),
@@ -415,7 +421,7 @@ class SQLGenerator:
     ) -> None:
         if result.get('status') != 'success' or not result.get('sql'):
             failure = self._governed_error_payload(
-                code='GENERATION_FAILED',
+                code=GENERATION_FAILED,
                 message='未生成可供正确性校验的 SQL',
                 semantic_version=semantic_version,
                 sql=result.get('sql'),
@@ -738,7 +744,7 @@ class SQLGenerator:
         if self.correctness_pipeline is not None:
             if not user_query or not semantic_version:
                 return self._governed_error_payload(
-                    code='EXECUTION_CONTEXT_REQUIRED',
+                    code=EXECUTION_CONTEXT_REQUIRED,
                     message='执行前需要原问题和语义版本',
                     semantic_version=semantic_version,
                     sql=sql,

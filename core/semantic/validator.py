@@ -15,7 +15,6 @@ from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from .models import SemanticMetric, SemanticSnapshot, ValidationIssue, ValidationReport
 
-
 _FieldReference = tuple[str, str]
 
 
@@ -405,6 +404,56 @@ def _extract_join_facts(
             )
         left_tables.update(right_tables)
     return tuple(facts)
+
+
+def is_single_readonly_query(sql: str, dialect: str = "mysql") -> bool:
+    """Return whether *sql* is exactly one query AST with no write operation."""
+    try:
+        statements = [statement for statement in parse(sql, read=dialect) if statement is not None]
+    except Exception:
+        return False
+    query_types = tuple(
+        expression_type
+        for name in ("Select", "Union", "Intersect", "Except")
+        if (expression_type := getattr(exp, name, None)) is not None
+    )
+    if len(statements) != 1 or not isinstance(statements[0], query_types):
+        return False
+    forbidden_nodes = {
+        "Alter",
+        "Command",
+        "Commit",
+        "Create",
+        "Delete",
+        "Drop",
+        "Grant",
+        "Insert",
+        "Into",
+        "LoadData",
+        "Lock",
+        "Merge",
+        "Rollback",
+        "Set",
+        "Transaction",
+        "TruncateTable",
+        "Update",
+        "Use",
+    }
+    forbidden_functions = {
+        "BENCHMARK",
+        "GET_LOCK",
+        "LOAD_FILE",
+        "PG_SLEEP",
+        "RELEASE_LOCK",
+        "SLEEP",
+    }
+    for item in statements[0].walk():
+        node = item[0] if isinstance(item, tuple) else item
+        if type(node).__name__ in forbidden_nodes or (
+            isinstance(node, exp.Anonymous) and node.name.upper() in forbidden_functions
+        ):
+            return False
+    return True
 
 
 def _analyze_sql(
@@ -1046,41 +1095,99 @@ def normalize_filter_expression(
     )
 
 
-def _time_grain_for_node(node: exp.Expression) -> str | None:
+def _date_format_time_facts(format_text: str) -> frozenset[str]:
+    tokens = {
+        match.group(1)
+        for match in re.finditer(r"%(?:[-_0^#]*)([A-Za-z%])", format_text)
+        if match.group(1) != "%"
+    }
+    year_tokens = {"Y", "y", "G", "g", "x", "X"}
+    month_tokens = {"m", "c", "b", "B", "h"}
+    day_tokens = {"d", "e", "D", "j"}
+    week_tokens = {"U", "u", "V", "v", "W"}
+    allowed = year_tokens | month_tokens | day_tokens | week_tokens
+    if not tokens or not tokens <= allowed:
+        return frozenset()
+    has_year = bool(tokens & year_tokens)
+    has_month = bool(tokens & month_tokens)
+    has_day = bool(tokens & day_tokens)
+    has_week = bool(tokens & week_tokens)
+    if has_year and has_week and not (has_month or has_day):
+        return frozenset({"exact:week"})
+    if has_year and has_day and not has_week:
+        if "j" in tokens or has_month:
+            return frozenset({"exact:day"})
+        return frozenset()
+    if has_year and has_month and not (has_day or has_week):
+        return frozenset({"exact:month"})
+    if has_year and not (has_month or has_day or has_week):
+        return frozenset({"exact:year", "part:year"})
+    return frozenset()
+
+
+def _time_facts_for_node(node: exp.Expression) -> tuple[frozenset[str], bool]:
     key = node.key.casefold()
     if key == "datetrunc":
         unit = node.args.get("unit")
         value = str(getattr(unit, "this", unit) or "").casefold()
-        return value if value in {"day", "week", "month", "quarter", "year"} else None
+        facts = (
+            frozenset({f"exact:{value}"})
+            if value in {"day", "week", "month", "quarter", "year"}
+            else frozenset()
+        )
+        return facts, True
     if key == "timetostr":
         format_expression = node.args.get("format")
         format_text = str(getattr(format_expression, "this", "") or "")
-        tokens = set(re.findall(r"%[A-Za-z]", format_text))
-        if tokens & {"%v", "%V", "%u", "%U"} and tokens & {"%x", "%X", "%Y", "%y"}:
-            return "week"
-        if tokens & {"%d", "%e", "%j"} and tokens & {"%Y", "%y"}:
-            if "%j" in tokens or tokens & {"%m", "%c"}:
-                return "day"
-        if tokens & {"%m", "%c"} and tokens & {"%Y", "%y"}:
-            return "month"
-        if tokens and tokens <= {"%Y", "%y"}:
-            return "year"
-        return None
-    if key in {"day", "month", "quarter", "week", "year"}:
-        return key
+        return _date_format_time_facts(format_text), True
+    if key == "year":
+        return frozenset({"exact:year", "part:year"}), True
+    if key in {"day", "month", "quarter", "week"}:
+        return frozenset({f"part:{key}"}), True
+    if key == "dayofyear":
+        return frozenset({"part:dayofyear"}), True
     if key == "tsordstodate":
-        return "day"
+        return frozenset({"exact:day"}), True
+    if key in {
+        "hour",
+        "minute",
+        "second",
+        "time",
+        "timetrunc",
+        "unixseconds",
+        "unixmillis",
+        "unixmicros",
+    }:
+        return frozenset(), True
     if isinstance(node, exp.Anonymous):
         name = node.name.casefold()
-        if name in {"day", "date", "month", "quarter", "week", "year"}:
-            return "day" if name == "date" else name
+        if name == "yearweek":
+            return frozenset({"exact:week"}), True
+        if name == "date":
+            return frozenset({"exact:day"}), True
+        if name == "year":
+            return frozenset({"exact:year", "part:year"}), True
+        if name in {"day", "month", "quarter", "week"}:
+            return frozenset({f"part:{name}"}), True
+        if name == "dayofyear":
+            return frozenset({"part:dayofyear"}), True
         if name == "date_trunc":
             expressions = node.expressions
             if expressions:
                 value = str(getattr(expressions[0], "this", expressions[0])).casefold()
                 if value in {"day", "week", "month", "quarter", "year"}:
-                    return value
-    return None
+                    return frozenset({f"exact:{value}"}), True
+            return frozenset(), True
+        if name in {
+            "date_format",
+            "dayname",
+            "hour",
+            "minute",
+            "second",
+            "time_format",
+        }:
+            return frozenset(), True
+    return frozenset(), False
 
 
 def analyze_sql_structure(
@@ -1092,22 +1199,8 @@ def analyze_sql_structure(
     analysis = _analyze_sql(sql, dialect, semantic_indexes)
     indexes = _semantic_field_index(semantic_indexes)
     infos = {id(info.scope): info for info in analysis.scope_infos}
-    source_lineage_ids: set[int] = set()
-
-    def include_source_lineage(info: _ScopeInfo) -> None:
-        marker = id(info.scope)
-        if marker in source_lineage_ids:
-            return
-        source_lineage_ids.add(marker)
-        for source in _unique_sources(info):
-            if isinstance(source, Scope):
-                include_source_lineage(infos[id(source)])
-
-    for root in analysis.root_output_infos:
-        include_source_lineage(root)
-    source_infos = tuple(
-        info for info in analysis.scope_infos if id(info.scope) in source_lineage_ids
-    )
+    source_infos = analysis.active_scope_infos
+    active_scope_ids = {id(info.scope) for info in source_infos}
 
     fields: set[str] = set()
     for info in source_infos:
@@ -1130,7 +1223,7 @@ def analyze_sql_structure(
 
     relationships: set[tuple[str, str]] = set()
     for fact in analysis.join_facts:
-        if id(fact.info.scope) not in source_lineage_ids:
+        if id(fact.info.scope) not in active_scope_ids:
             continue
         for left, left_field, right, right_field in fact.pairs:
             endpoints = tuple(sorted((f"{left}.{left_field}", f"{right}.{right_field}")))
@@ -1153,11 +1246,24 @@ def analyze_sql_structure(
                     _filter_signature_text(atom, info, infos, indexes)
                 )
 
-    time_grains: set[tuple[str, str]] = set()
+    time_evidence: dict[str, set[str]] = {}
+    visited_definitions: set[tuple[int, int]] = set()
 
-    def collect_time_grains(node: exp.Expression, info: _ScopeInfo) -> None:
-        grain = _time_grain_for_node(node)
-        if grain is not None:
+    def collect_time_facts(
+        node: exp.Expression,
+        info: _ScopeInfo,
+        *,
+        expand_projection_star: bool = False,
+    ) -> None:
+        if isinstance(node, exp.AggFunc):
+            return
+        facts, terminal = _time_facts_for_node(node)
+        if facts and any(
+            isinstance(item[0] if isinstance(item, tuple) else item, exp.AggFunc)
+            for item in node.walk()
+        ):
+            return
+        if facts:
             references: set[str] = set()
             for column in _immediate_columns(node, info.scope.expression):
                 resolved = _resolve_column(column, info, infos, indexes)
@@ -1165,12 +1271,57 @@ def analyze_sql_structure(
                     references.update(
                         f"{table}.{name}" for table, name in resolved.references
                     )
-            time_grains.update((reference, grain) for reference in references)
+            for reference in references:
+                time_evidence.setdefault(reference, set()).update(facts)
+        if terminal:
+            return
+
+        if isinstance(node, exp.Star) or (
+            isinstance(node, exp.Column) and node.name == "*"
+        ):
+            if not expand_projection_star:
+                return
+            qualifier = _casefold(node.table) if isinstance(node, exp.Column) else ""
+            sources = (info.sources.get(qualifier),) if qualifier else _unique_sources(info)
+            for source in sources:
+                if isinstance(source, Scope):
+                    source_info = infos[id(source)]
+                    for expression in source_info.projection_expressions.values():
+                        collect_time_facts(expression, source_info)
+            return
+
+        if isinstance(node, exp.Column):
+            derived = _derived_definition(node, info, infos, indexes)
+            if derived is None and not node.table:
+                expression = info.projection_expressions.get(_casefold(node.name))
+                derived = (info, expression) if expression is not None else None
+            if derived is not None:
+                definition_info, expression = derived
+                marker = (id(definition_info.scope), id(expression))
+                if marker not in visited_definitions:
+                    visited_definitions.add(marker)
+                    collect_time_facts(expression, definition_info)
+            return
+
+        if isinstance(node, exp.Subquery):
+            child_info = next(
+                (
+                    candidate
+                    for candidate in source_infos
+                    if candidate.scope.expression is node.this
+                ),
+                None,
+            )
+            if child_info is not None and isinstance(node.this, exp.Select):
+                for expression in node.this.expressions:
+                    collect_time_facts(expression, child_info)
+            return
+        if isinstance(node, exp.Select):
             return
         for child in _expression_children(node):
-            collect_time_grains(child, info)
+            collect_time_facts(child, info)
 
-    for info in source_infos:
+    for info in analysis.root_output_infos:
         select = info.scope.expression
         if not isinstance(select, exp.Select):
             continue
@@ -1179,7 +1330,39 @@ def analyze_sql_structure(
         if isinstance(group, exp.Group):
             expressions.extend(group.expressions)
         for expression in expressions:
-            collect_time_grains(expression, info)
+            unaliased = expression.this if isinstance(expression, exp.Alias) else expression
+            is_projection_star = isinstance(unaliased, exp.Star) or (
+                isinstance(unaliased, exp.Column) and unaliased.name == "*"
+            )
+            collect_time_facts(
+                expression,
+                info,
+                expand_projection_star=is_projection_star,
+            )
+
+    time_grains: set[tuple[str, str]] = set()
+    grain_precision = {"year": 0, "quarter": 1, "month": 2, "week": 3, "day": 4}
+    for reference, facts in time_evidence.items():
+        candidates = {
+            grain
+            for grain in grain_precision
+            if f"exact:{grain}" in facts
+        }
+        if {"part:year", "part:month"} <= facts:
+            candidates.add("month")
+        if {"part:year", "part:quarter"} <= facts:
+            candidates.add("quarter")
+        if {"part:year", "part:week"} <= facts:
+            candidates.add("week")
+        if {"part:year", "part:month", "part:day"} <= facts or {
+            "part:year",
+            "part:dayofyear",
+        } <= facts:
+            candidates.add("day")
+        if candidates:
+            time_grains.add(
+                (reference, max(candidates, key=grain_precision.__getitem__))
+            )
 
     return SQLStructure(
         scope=analysis.scope,
@@ -1548,6 +1731,7 @@ __all__ = [
     "SQLStructure",
     "SemanticSQLValidator",
     "analyze_sql_structure",
+    "is_single_readonly_query",
     "normalize_filter_expression",
     "parse_sql_scope",
 ]

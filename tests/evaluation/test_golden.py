@@ -207,7 +207,7 @@ def test_evaluator_accepts_alias_cte_and_structurally_equivalent_metric(evaluato
         ("day", "DATE(o.created_at)"),
         ("week", "DATE_TRUNC('WEEK', o.created_at)"),
         ("month", "DATE_FORMAT(o.created_at, '%Y-%m')"),
-        ("quarter", "QUARTER(o.created_at)"),
+        ("quarter", "DATE_TRUNC('QUARTER', o.created_at)"),
         ("year", "YEAR(o.created_at)"),
     ],
 )
@@ -263,6 +263,178 @@ def test_plain_time_field_does_not_prove_a_requested_grain(evaluator):
     scored = evaluator.evaluate_case(case, _result(sql))
 
     assert scored.failed_assertions == ("EXPECTED_TIME_GRAIN",)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "DATE_FORMAT(created_at, '%Y-%M')",
+        "DATE_FORMAT(created_at, '%Y-%c')",
+    ],
+)
+def test_month_grain_accepts_sqlglot_normalized_mysql_tokens(evaluator, expression):
+    """Break caught: sqlglot translating MySQL month tokens before grain inspection."""
+    case = _case(expected_time_grain="month")
+    sql = f"SELECT {expression}, COUNT(*) FROM example_orders GROUP BY {expression}"
+
+    assert evaluator.evaluate_case(case, _result(sql)).passed
+
+
+@pytest.mark.parametrize(
+    "grain,expression",
+    [
+        ("day", "DATE_FORMAT(created_at, '%Y-%m-%e')"),
+        ("week", "DATE_FORMAT(created_at, '%x-%u')"),
+    ],
+)
+def test_grain_tokens_normalized_to_dash_day_and_percent_w(
+    evaluator, grain, expression
+):
+    """Break caught: version-specific normalized %-d/%G/%W tokens being missed."""
+    case = _case(expected_time_grain=grain)
+    sql = f"SELECT {expression}, COUNT(*) FROM example_orders GROUP BY {expression}"
+
+    assert evaluator.evaluate_case(case, _result(sql)).passed
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "DATE_FORMAT(created_at, '%Y-%m-%d')",
+        "DATE_FORMAT(created_at, '%Y-%m-%D')",
+        "DATE_FORMAT(created_at, '%Y-%m-%d %H')",
+        "DATE_FORMAT(created_at, '%Y-%W')",
+    ],
+)
+def test_month_grain_rejects_finer_or_non_month_date_format_tokens(
+    evaluator, expression
+):
+    """Break caught: treating any year-and-month-looking format as exact month grain."""
+    case = _case(expected_time_grain="month")
+    sql = f"SELECT {expression}, COUNT(*) FROM example_orders GROUP BY {expression}"
+
+    scored = evaluator.evaluate_case(case, _result(sql))
+
+    assert scored.failed_assertions == ("EXPECTED_TIME_GRAIN",)
+
+
+@pytest.mark.parametrize(
+    "grain,components",
+    [
+        ("month", ("YEAR(created_at)", "MONTH(created_at)")),
+        ("quarter", ("YEAR(created_at)", "QUARTER(created_at)")),
+        ("week", ("YEARWEEK(created_at)",)),
+        ("week", ("DATE_FORMAT(created_at, '%x-%v')",)),
+    ],
+)
+def test_calendar_component_grains_require_complete_same_field_keys(
+    evaluator, grain, components
+):
+    """Break caught: accepting a partial period key that merges different years."""
+    case = _case(expected_time_grain=grain)
+    expressions = ", ".join(components)
+    sql = f"SELECT {expressions}, COUNT(*) FROM example_orders GROUP BY {expressions}"
+
+    assert evaluator.evaluate_case(case, _result(sql)).passed
+
+
+@pytest.mark.parametrize("grain,function", [("month", "MONTH"), ("quarter", "QUARTER"), ("week", "WEEK")])
+def test_partial_calendar_component_is_not_an_exact_grain(evaluator, grain, function):
+    """Break caught: month, quarter, or week number alone collapsing distinct years."""
+    case = _case(expected_time_grain=grain)
+    expression = f"{function}(created_at)"
+    sql = f"SELECT {expression}, COUNT(*) FROM example_orders GROUP BY {expression}"
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_calendar_components_from_different_time_fields_do_not_combine(snapshot):
+    """Break caught: combining YEAR and MONTH facts without checking governed lineage."""
+    second_time = SemanticField(
+        name="updated_at",
+        name_cn="更新时间",
+        data_type="datetime",
+        role="time",
+    )
+    orders = snapshot.entities[0].model_copy(
+        update={"fields": (*snapshot.entities[0].fields, second_time)}
+    )
+    evaluator = GoldenEvaluator(
+        snapshot.model_copy(update={"entities": (orders, snapshot.entities[1])})
+    )
+    case = _case(expected_time_grain="month")
+    sql = (
+        "SELECT YEAR(created_at), MONTH(updated_at), COUNT(*) FROM example_orders "
+        "GROUP BY YEAR(created_at), MONTH(updated_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+@pytest.mark.parametrize(
+    "requested,components",
+    [
+        ("year", ("YEAR(created_at)", "MONTH(created_at)")),
+        (
+            "month",
+            ("YEAR(created_at)", "MONTH(created_at)", "DAY(created_at)"),
+        ),
+    ],
+)
+def test_finer_component_key_does_not_also_claim_a_coarser_grain(
+    evaluator, requested, components
+):
+    """Break caught: retaining every prefix grain instead of the exact final key."""
+    case = _case(expected_time_grain=requested)
+    expressions = ", ".join(components)
+    sql = f"SELECT {expressions}, COUNT(*) FROM example_orders GROUP BY {expressions}"
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_aggregated_year_component_cannot_complete_a_month_group_key(evaluator):
+    """Break caught: counting temporal functions inside aggregates as grouping components."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "SELECT MIN(YEAR(created_at)), MONTH(created_at), COUNT(*) "
+        "FROM example_orders GROUP BY MONTH(created_at)"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_unused_derived_grain_expression_cannot_satisfy_outer_result(evaluator):
+    """Break caught: scanning every derived projection rather than used final lineage."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT DATE_FORMAT(created_at, '%Y-%m') AS month_key, "
+        "status FROM example_orders) "
+        "SELECT status, COUNT(*) FROM base GROUP BY status"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).failed_assertions == (
+        "EXPECTED_TIME_GRAIN",
+    )
+
+
+def test_used_derived_grain_alias_satisfies_outer_result(evaluator):
+    """Break caught: tightening derived scans without tracing referenced projection aliases."""
+    case = _case(expected_time_grain="month")
+    sql = (
+        "WITH base AS (SELECT DATE_FORMAT(created_at, '%Y-%m') AS month_key "
+        "FROM example_orders) "
+        "SELECT month_key, COUNT(*) FROM base GROUP BY month_key"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).passed
 
 
 def test_structural_assertions_cover_relationship_filter_and_forbidden_objects(evaluator):
@@ -340,20 +512,20 @@ def test_expected_metric_fails_closed_when_sql_is_not_structurally_parseable(eva
     """Break caught: inferring metric presence from the absence of a mismatch on syntax failure."""
     case = _case(expected_metrics=("example_order_amount",))
 
-    scored = evaluator.evaluate_case(case, _result("SELECT FROM"))
+    with pytest.raises(GoldenConfigurationError) as caught:
+        evaluator.evaluate_case(case, _result("SELECT FROM"))
 
-    assert scored.failed_assertions == ("EXPECTED_METRICS",)
-    assert "EVALUATION_SQL_INVALID" in scored.error_codes
+    assert caught.value.code == "INVALID_RESULT"
 
 
 def test_forbidden_metric_also_fails_closed_when_sql_cannot_be_analyzed(evaluator):
     """Break caught: treating an unparseable candidate as proof that a forbidden metric is absent."""
     case = _case(forbidden_metrics=("example_order_amount",))
 
-    scored = evaluator.evaluate_case(case, _result("SELECT FROM"))
+    with pytest.raises(GoldenConfigurationError) as caught:
+        evaluator.evaluate_case(case, _result("SELECT FROM"))
 
-    assert scored.failed_assertions == ("FORBIDDEN_METRICS",)
-    assert "EVALUATION_SQL_INVALID" in scored.error_codes
+    assert caught.value.code == "INVALID_RESULT"
 
 
 def test_unused_cte_cannot_satisfy_expected_table_or_field(evaluator):
@@ -370,6 +542,50 @@ def test_unused_cte_cannot_satisfy_expected_table_or_field(evaluator):
     scored = evaluator.evaluate_case(case, _result(sql))
 
     assert scored.failed_assertions == ("EXPECTED_FIELDS", "EXPECTED_TABLES")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        (
+            "SELECT o.id FROM example_orders o WHERE EXISTS ("
+            "SELECT 1 FROM example_customers c "
+            "WHERE c.id = o.customer_id AND c.segment = 'internal')"
+        ),
+        (
+            "SELECT (SELECT MAX(c.segment) FROM example_customers c "
+            "WHERE c.id = o.customer_id) FROM example_orders o"
+        ),
+        (
+            "SELECT o.id FROM example_orders o WHERE o.customer_id IN ("
+            "SELECT c.id FROM example_customers c WHERE c.segment = 'internal')"
+        ),
+    ],
+)
+def test_forbidden_objects_in_active_subqueries_cannot_bypass_lineage(evaluator, sql):
+    """Break caught: inspecting only FROM lineage while ignoring reachable subqueries."""
+    case = _case(
+        forbidden_tables=("example_customers",),
+        forbidden_fields=("example_customers.segment",),
+    )
+
+    scored = evaluator.evaluate_case(case, _result(sql))
+
+    assert scored.failed_assertions == ("FORBIDDEN_FIELDS", "FORBIDDEN_TABLES")
+
+
+def test_dead_cte_stays_excluded_while_active_subqueries_are_traversed(evaluator):
+    """Break caught: fixing subqueries by counting every traversed, including dead, CTE."""
+    case = _case(
+        forbidden_tables=("example_customers",),
+        forbidden_fields=("example_customers.segment",),
+    )
+    sql = (
+        "WITH dead AS (SELECT segment FROM example_customers) "
+        "SELECT id FROM example_orders"
+    )
+
+    assert evaluator.evaluate_case(case, _result(sql)).passed
 
 
 def test_forbidden_table_and_field_intersections_fail(evaluator):
@@ -463,6 +679,8 @@ def test_report_omits_all_content_by_default(evaluator, tmp_path: Path):
         codes=("POLICY_DENIED",),
     )
     result["validation"]["issues"][0]["message"] = f"raw exception {marker}"
+    result["user_query"] = f"runtime question {marker}"
+    result["error"] = f"runtime exception {marker}"
     report = evaluator.evaluate_results([(case, result)])
 
     path = evaluator.write_report(report, tmp_path / "report.json")
@@ -514,6 +732,50 @@ def test_model_parameter_parser_allows_only_non_sensitive_names():
         ModelParameter(name="temperature", value=float("nan"))
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "temperature=true",
+        "temperature=2.01",
+        "top_p=0",
+        "top_p=1.01",
+        "top_k=1.5",
+        "top_k=0",
+        "max_tokens=false",
+        "max_tokens=0",
+        "context_length=10000001",
+        "seed=-1",
+        "repeat_penalty=0",
+        "model_revision=https://invalid.example/revision",
+        "model_revision=release?api_key=private",
+        "model_revision=token=private",
+        "model_revision=host.example",
+        "quantization=custom format",
+        "quantization=Q4_K_M?password=private",
+    ],
+)
+def test_model_parameter_values_have_strict_safe_specs(raw):
+    """Break caught: an allowlisted name becoming a carrier for secrets or invalid values."""
+    with pytest.raises(GoldenConfigurationError) as caught:
+        parse_model_parameters([raw])
+
+    assert caught.value.code == "INVALID_MODEL_PARAMETER"
+    assert "private" not in str(caught.value)
+
+
+def test_model_parameter_direct_construction_uses_the_same_safe_specs():
+    """Break caught: bypassing CLI parsing by constructing report parameters directly."""
+    for name, value in (
+        ("temperature", True),
+        ("top_p", 2),
+        ("seed", -1),
+        ("model_revision", "secret=private"),
+        ("quantization", "unknown"),
+    ):
+        with pytest.raises(ValidationError):
+            ModelParameter(name=name, value=value)
+
+
 def test_report_serializes_parameter_summary_as_a_sorted_mapping(snapshot: SemanticSnapshot):
     """Break caught: emitting an awkward or nondeterministically ordered parameter summary."""
     parameters = parse_model_parameters(["temperature=0", "seed=17"])
@@ -540,6 +802,224 @@ def test_generated_result_rejects_contradictory_or_blank_success_payloads():
                 executable=executable,
                 validation={"valid": valid, "issues": []},
             )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "sql": "SELECT id FROM example_orders",
+            "status": "success",
+            "executable": True,
+            "validation": {"issues": []},
+        },
+        {
+            "sql": "SELECT id FROM example_orders",
+            "status": "success",
+            "executable": True,
+            "validation": {
+                "valid": True,
+                "issues": [{"code": "POLICY_DENIED"}],
+            },
+        },
+        {
+            "sql": None,
+            "status": "error",
+            "executable": False,
+            "validation": {"valid": False, "issues": []},
+        },
+    ],
+)
+def test_generated_result_enforces_complete_outcome_invariants(payload):
+    """Break caught: accepting incomplete success or unclassified failure payloads."""
+    with pytest.raises(ValidationError):
+        GoldenGeneratedResult(id="strict-outcome", **payload)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["SELECT FROM", "SELECT 1; SELECT 2", "DELETE FROM example_orders"],
+)
+def test_success_without_structural_expectations_still_requires_one_readonly_query(sql):
+    """Break caught: skipping AST validation when a success case has no object assertions."""
+    with pytest.raises(ValidationError):
+        GoldenGeneratedResult(
+            id="strict-query",
+            sql=sql,
+            status="success",
+            executable=True,
+            validation={"valid": True, "issues": []},
+        )
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["GENERATION_FAILED", "HISTORY_CONTEXT_MISMATCH", "EXECUTION_CONTEXT_REQUIRED"],
+)
+def test_real_generator_failure_codes_are_accepted(code):
+    """Break caught: evaluator error-code contracts drifting from public generator payloads."""
+    result = GoldenGeneratedResult(
+        id="generator-error",
+        sql=None,
+        status="error",
+        executable=False,
+        validation={"valid": False, "issues": [{"code": code}]},
+    )
+
+    assert result.validation.issues[0].code == code
+
+
+def test_governed_generator_public_payload_can_be_loaded_without_unsafe_extras(
+    tmp_path: Path,
+):
+    """Break caught: defining an outcome contract that rejects the generator's public shape."""
+    path = tmp_path / "results.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "datasource": "demo",
+                "dialect": "mysql",
+                "semantic_version": "1.0.0",
+                "results": [
+                    {
+                        "id": "generator-success",
+                        "sql": "SELECT id FROM example_orders",
+                        "status": "success",
+                        "semantic_version": "1.0.0",
+                        "validation": {"valid": True, "issues": []},
+                        "repair_attempts": 0,
+                        "executable": True,
+                        "user_query": "查询示例订单",
+                    },
+                    {
+                        "id": "generator-failure",
+                        "sql": None,
+                        "status": "error",
+                        "semantic_version": "1.0.0",
+                        "validation": {
+                            "valid": False,
+                            "issues": [{"code": "GENERATION_FAILED"}],
+                        },
+                        "repair_attempts": 0,
+                        "executable": False,
+                        "user_query": "查询示例订单",
+                        "error": "稳定公开错误描述",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_golden_results(path)
+
+    assert tuple(result.status for result in loaded.results) == ("success", "error")
+
+
+def test_generator_and_evaluator_share_the_public_error_code_allowlist():
+    """Break caught: maintaining an evaluator-only copy of generator error codes."""
+    from core.sql.error_codes import PUBLIC_SQL_RESULT_ERROR_CODES
+
+    assert {
+        "GENERATION_FAILED",
+        "HISTORY_CONTEXT_MISMATCH",
+        "EXECUTION_CONTEXT_REQUIRED",
+    }.issubset(PUBLIC_SQL_RESULT_ERROR_CODES)
+
+
+def test_report_value_objects_reject_coercion_nonfinite_and_inconsistency():
+    """Break caught: report JSON carrying coerced, NaN, or contradictory statistics."""
+    with pytest.raises(ValidationError):
+        RuleRate(assertion="SHOULD_EXECUTE", total=True, passed=1, rate=1.0)
+    with pytest.raises(ValidationError):
+        RuleRate(assertion="SHOULD_EXECUTE", total=1, passed=1, rate=float("nan"))
+    with pytest.raises(ValidationError):
+        RuleRate(assertion="SHOULD_EXECUTE", total=2, passed=1, rate=1.0)
+    with pytest.raises(ValidationError):
+        RuleRate(assertion="PRIVATE_MARKER", total=1, passed=1, rate=1.0)
+    with pytest.raises(ValidationError):
+        CaseResult(
+            id="invalid-case",
+            passed=True,
+            failed_assertions=("SHOULD_EXECUTE",),
+            error_codes=(),
+            question_fingerprint="q",
+            sql_fingerprint=None,
+            elapsed_ms=0,
+        )
+    with pytest.raises(ValidationError):
+        CaseResult(
+            id="invalid-code",
+            passed=True,
+            failed_assertions=(),
+            error_codes=("PASSWORD_PRIVATE_MARKER",),
+            question_fingerprint="q",
+            sql_fingerprint=None,
+            elapsed_ms=0,
+        )
+
+
+def test_report_enforces_case_counts_rates_rules_and_content_flags():
+    """Break caught: trusting caller-supplied report aggregates or privacy flags."""
+    case = CaseResult(
+        id="report-case",
+        passed=True,
+        failed_assertions=(),
+        error_codes=(),
+        question_fingerprint="q",
+        sql_fingerprint="s",
+        elapsed_ms=0,
+    )
+    base = {
+        "model": "local-demo",
+        "datasource": "demo",
+        "dialect": "mysql",
+        "semantic_version": "1.0.0",
+        "git_commit": "unknown",
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "pass_rate": 1.0,
+        "per_rule": (
+            RuleRate(assertion="SHOULD_EXECUTE", total=1, passed=1, rate=1.0),
+        ),
+        "cases": (case,),
+        "elapsed_ms": 0,
+    }
+    for update in (
+        {"total": 2},
+        {"passed": 0},
+        {"failed": 1},
+        {"pass_rate": 0.5},
+        {"content_included": "false"},
+        {"per_rule": ()},
+        {"per_rule": (RuleRate(assertion="SHOULD_EXECUTE", total=2, passed=1, rate=0.5),)},
+        {"per_rule": (RuleRate(assertion="SHOULD_EXECUTE", total=1, passed=0, rate=0.0),)},
+        {
+            "cases": (
+                case.model_copy(update={"question": "private"}),
+            ),
+            "content_included": False,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            EvaluationReport(**(base | update))
+
+
+def test_writer_rejects_nonfinite_values_even_if_model_copy_bypasses_validation(
+    evaluator, tmp_path: Path
+):
+    """Break caught: Python's JSON encoder emitting non-standard NaN tokens."""
+    report = evaluator.evaluate_results(
+        [(_case(), _result("SELECT id FROM example_orders"))]
+    ).model_copy(update={"pass_rate": float("nan")})
+
+    with pytest.raises(ValueError):
+        evaluator.write_report(report, tmp_path / "nan.json")
+
+    assert not (tmp_path / "nan.json").exists()
 
 
 def test_report_json_is_canonical_and_written_via_atomic_replace(
@@ -886,3 +1366,38 @@ def test_repository_golden_suite_has_required_anonymous_coverage():
     assert not re.search(r"\b1[3-9]\d{9}\b", serialized)
     assert not re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", serialized)
     assert "password" not in serialized.casefold()
+
+
+def test_repository_semantic_content_and_golden_suite_use_new_version(tmp_path: Path):
+    """Break caught: publishing changed semantic content under an already compiled version."""
+    from core.semantic.compiler import SemanticCompiler
+    from core.semantic.registry import SemanticRegistry
+
+    root = Path(__file__).resolve().parents[2]
+    semantic_payload = yaml.safe_load(
+        (root / "semantic_models/default.yaml").read_text("utf-8")
+    )
+    suite = load_golden_suite(root / "eval/golden/default.yaml")
+
+    assert semantic_payload["model_version"] == "1.1.0"
+    assert suite.semantic_version == "1.1.0"
+
+    old_source = tmp_path / "old-default.yaml"
+    old_source.write_text(
+        yaml.safe_dump(
+            semantic_payload | {"model_version": "1.0.0"},
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    compiled = tmp_path / "compiled"
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    compiler.compile_file(old_source, compiled)
+    compiler.compile_file(root / "semantic_models/default.yaml", compiled)
+
+    manifest = json.loads((compiled / "manifest.json").read_text("utf-8"))
+    active = SemanticRegistry(compiled, "default").load_active()
+    assert (compiled / "default/1.0.0.json").exists()
+    assert manifest["active"]["default"] == "1.1.0"
+    assert active.model_version == "1.1.0"

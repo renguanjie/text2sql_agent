@@ -18,6 +18,7 @@ from typing import Literal
 
 import yaml
 from pydantic import (
+    Field,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -29,38 +30,33 @@ from pydantic import (
 
 from core.semantic import FrozenModel, SemanticSnapshot
 from core.semantic.validator import (
-    SQLStructure,
     SemanticSQLValidator,
+    SQLStructure,
     analyze_sql_structure,
+    is_single_readonly_query,
     normalize_filter_expression,
 )
-
+from core.sql.error_codes import PUBLIC_SQL_RESULT_ERROR_CODES
 
 _SEMVER = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
 _CASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,127}")
-_KNOWN_RESULT_ERROR_CODES = frozenset(
+_ASSERTION_CODES = frozenset(
     {
-        "AMBIGUOUS_COLUMN",
-        "CORRECTNESS_UNAVAILABLE",
-        "DIMENSION_NOT_ALLOWED",
-        "EXPLAIN_FAILED",
-        "INVALID_JOIN",
-        "METRIC_MISMATCH",
-        "POLICY_DENIED",
-        "QUERY_SCOPE_DENIED",
-        "REPAIR_FAILED",
-        "SEMANTIC_VALIDATION_FAILED",
-        "SEMANTIC_VERSION_MISMATCH",
-        "SQL_VALIDATION_FAILED",
-        "SYNTAX_ERROR",
-        "TIME_DIMENSION_REQUIRED",
-        "UNKNOWN_COLUMN",
-        "UNKNOWN_TABLE",
-        "UNSAFE_SQL",
-        "UNSUPPORTED_SQL",
+        "EXPECTED_ERROR_CODES",
+        "EXPECTED_FIELDS",
+        "EXPECTED_FILTERS",
+        "EXPECTED_METRICS",
+        "EXPECTED_RELATIONSHIPS",
+        "EXPECTED_TABLES",
+        "EXPECTED_TIME_GRAIN",
+        "FORBIDDEN_FIELDS",
+        "FORBIDDEN_METRICS",
+        "FORBIDDEN_TABLES",
+        "SHOULD_EXECUTE",
     }
 )
+_REPORT_ERROR_CODES = PUBLIC_SQL_RESULT_ERROR_CODES | {"EVALUATION_SQL_INVALID"}
 _MODEL_PARAMETER_ALLOWLIST = frozenset(
     {
         "context_length",
@@ -73,6 +69,38 @@ _MODEL_PARAMETER_ALLOWLIST = frozenset(
         "top_k",
         "top_p",
     }
+)
+_MODEL_REVISION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_QUANTIZATIONS = frozenset(
+    {
+        "NONE",
+        "BF16",
+        "FP8",
+        "FP16",
+        "INT4",
+        "INT8",
+        "Q2_K",
+        "Q3_K_L",
+        "Q3_K_M",
+        "Q3_K_S",
+        "Q4_0",
+        "Q4_1",
+        "Q4_K_M",
+        "Q4_K_S",
+        "Q5_0",
+        "Q5_1",
+        "Q5_K_M",
+        "Q5_K_S",
+        "Q6_K",
+        "Q8_0",
+    }
+)
+_SENSITIVE_PARAMETER_TEXT = re.compile(
+    r"(?:[a-z][a-z0-9+.-]*://|www\.|"
+    r"(?:^|[^a-z0-9])(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?:#]|$)|"
+    r"(?:^|[^a-z0-9])(?:api[_-]?key|access[_-]?token|token|secret|password|"
+    r"credential|endpoint)(?:[^a-z0-9]|$))",
+    re.IGNORECASE,
 )
 _Scalar = StrictBool | StrictInt | StrictFloat | StrictStr
 
@@ -137,7 +165,7 @@ class GoldenCase(FrozenModel):
     @classmethod
     def validate_error_codes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
         if any(
-            not _ERROR_CODE.fullmatch(value) or value not in _KNOWN_RESULT_ERROR_CODES
+            not _ERROR_CODE.fullmatch(value) or value not in PUBLIC_SQL_RESULT_ERROR_CODES
             for value in values
         ):
             raise ValueError("invalid error code")
@@ -180,7 +208,7 @@ class GeneratedIssue(FrozenModel):
     @field_validator("code")
     @classmethod
     def validate_code(cls, value: str) -> str:
-        if not _ERROR_CODE.fullmatch(value) or value not in _KNOWN_RESULT_ERROR_CODES:
+        if not _ERROR_CODE.fullmatch(value) or value not in PUBLIC_SQL_RESULT_ERROR_CODES:
             raise ValueError("invalid error code")
         return value
 
@@ -196,6 +224,10 @@ class GoldenGeneratedResult(FrozenModel):
     status: Literal["success", "rejected", "error"]
     executable: StrictBool
     validation: GeneratedValidation
+    semantic_version: StrictStr | None = None
+    repair_attempts: Literal[0, 1] | None = None
+    user_query: StrictStr | None = Field(default=None, repr=False)
+    error: StrictStr | None = Field(default=None, repr=False)
 
     @field_validator("id")
     @classmethod
@@ -204,14 +236,31 @@ class GoldenGeneratedResult(FrozenModel):
             raise ValueError("invalid result id")
         return value
 
+    @field_validator("semantic_version")
+    @classmethod
+    def validate_result_semantic_version(cls, value: str | None) -> str | None:
+        if value is not None and not _SEMVER.fullmatch(value):
+            raise ValueError("invalid semantic version")
+        return value
+
     @model_validator(mode="after")
     def validate_consistent_outcome(self) -> "GoldenGeneratedResult":
         if self.sql is not None and not self.sql.strip():
             raise ValueError("blank sql")
         if self.status == "success":
-            if not self.executable or self.sql is None or self.validation.valid is False:
+            if (
+                not self.executable
+                or self.sql is None
+                or self.validation.valid is not True
+                or self.validation.issues
+                or not is_single_readonly_query(self.sql, dialect="mysql")
+            ):
                 raise ValueError("inconsistent successful result")
-        elif self.executable or self.validation.valid is True:
+        elif (
+            self.executable
+            or self.validation.valid is not False
+            or not self.validation.issues
+        ):
             raise ValueError("inconsistent non-successful result")
         return self
 
@@ -233,7 +282,11 @@ class GoldenResults(FrozenModel):
     @model_validator(mode="after")
     def validate_result_ids(self) -> "GoldenResults":
         ids = [result.id for result in self.results]
-        if len(ids) != len(set(ids)):
+        if len(ids) != len(set(ids)) or any(
+            result.semantic_version is not None
+            and result.semantic_version != self.semantic_version
+            for result in self.results
+        ):
             raise ValueError("result ids must be unique")
         return self
 
@@ -249,51 +302,161 @@ class ModelParameter(FrozenModel):
             raise ValueError("model parameter is not report-safe")
         return value
 
-    @field_validator("value")
-    @classmethod
-    def validate_value(cls, value: _Scalar) -> _Scalar:
+    @model_validator(mode="after")
+    def validate_value_spec(self) -> "ModelParameter":
+        value = self.value
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError("model parameter value is not finite")
-        if isinstance(value, str) and (not value or len(value) > 128 or "\n" in value):
+        if isinstance(value, str) and (
+            not value
+            or len(value) > 128
+            or any(unicodedata.category(char).startswith("C") for char in value)
+            or _SENSITIVE_PARAMETER_TEXT.search(value)
+        ):
             raise ValueError("model parameter value is not report-safe")
-        return value
+
+        if self.name in {"temperature", "top_p", "repeat_penalty"}:
+            if type(value) not in {int, float}:
+                raise ValueError("model parameter value has invalid type")
+            ranges = {
+                "temperature": (0.0, 2.0, True),
+                "top_p": (0.0, 1.0, False),
+                "repeat_penalty": (0.0, 10.0, False),
+            }
+            lower, upper, include_lower = ranges[self.name]
+            if value > upper or (value < lower if include_lower else value <= lower):
+                raise ValueError("model parameter value is out of range")
+        elif self.name in {"context_length", "max_tokens", "top_k"}:
+            if type(value) is not int or not 1 <= value <= 10_000_000:
+                raise ValueError("model parameter value is out of range")
+        elif self.name == "seed":
+            if type(value) is not int or not 0 <= value <= 2**63 - 1:
+                raise ValueError("model parameter value is out of range")
+        elif self.name == "model_revision":
+            if not isinstance(value, str) or not _MODEL_REVISION.fullmatch(value):
+                raise ValueError("model revision is not report-safe")
+        elif self.name == "quantization":
+            if not isinstance(value, str) or value.upper() not in _QUANTIZATIONS:
+                raise ValueError("quantization is unsupported")
+        return self
 
 
 class RuleRate(FrozenModel):
     assertion: StrictStr
-    total: int
-    passed: int
-    rate: float
+    total: StrictInt
+    passed: StrictInt
+    rate: StrictFloat
+
+    @model_validator(mode="after")
+    def validate_rate(self) -> "RuleRate":
+        if (
+            self.assertion not in _ASSERTION_CODES
+            or self.total <= 0
+            or not 0 <= self.passed <= self.total
+            or not math.isfinite(self.rate)
+            or not 0.0 <= self.rate <= 1.0
+            or not math.isclose(
+                self.rate,
+                self.passed / self.total,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("inconsistent rule rate")
+        return self
 
 
 class CaseResult(FrozenModel):
     id: StrictStr
-    passed: bool
+    passed: StrictBool
     failed_assertions: tuple[StrictStr, ...]
     error_codes: tuple[StrictStr, ...]
     question_fingerprint: StrictStr
     sql_fingerprint: StrictStr | None
-    elapsed_ms: int
+    elapsed_ms: StrictInt
     question: StrictStr | None = None
     sql: StrictStr | None = None
 
+    @model_validator(mode="after")
+    def validate_result(self) -> "CaseResult":
+        if (
+            not _CASE_ID.fullmatch(self.id)
+            or self.elapsed_ms < 0
+            or self.passed != (not self.failed_assertions)
+            or len(self.failed_assertions) != len(set(self.failed_assertions))
+            or not set(self.failed_assertions).issubset(_ASSERTION_CODES)
+            or len(self.error_codes) != len(set(self.error_codes))
+            or not set(self.error_codes).issubset(_REPORT_ERROR_CODES)
+        ):
+            raise ValueError("inconsistent case result")
+        return self
+
 
 class EvaluationReport(FrozenModel):
-    schema_version: Literal[1] = 1
+    schema_version: StrictInt = 1
     model: StrictStr
     model_parameters: tuple[ModelParameter, ...] = ()
     datasource: StrictStr
     dialect: Literal["mysql"]
     semantic_version: StrictStr
     git_commit: StrictStr
-    total: int
-    passed: int
-    failed: int
-    pass_rate: float
+    total: StrictInt
+    passed: StrictInt
+    failed: StrictInt
+    pass_rate: StrictFloat
     per_rule: tuple[RuleRate, ...]
     cases: tuple[CaseResult, ...]
-    elapsed_ms: int
-    content_included: bool = False
+    elapsed_ms: StrictInt
+    content_included: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_report(self) -> "EvaluationReport":
+        case_ids = [case.id for case in self.cases]
+        rule_names = [rule.assertion for rule in self.per_rule]
+        failed_rule_counts = Counter(
+            assertion
+            for case in self.cases
+            for assertion in case.failed_assertions
+        )
+        actual_passed = sum(case.passed for case in self.cases)
+        expected_rate = actual_passed / len(self.cases) if self.cases else 0.0
+        has_content = any(
+            case.question is not None or case.sql is not None for case in self.cases
+        )
+        if (
+            self.schema_version != 1
+            or self.elapsed_ms < 0
+            or min(self.total, self.passed, self.failed) < 0
+            or self.total != len(self.cases)
+            or len(case_ids) != len(set(case_ids))
+            or self.passed != actual_passed
+            or self.failed != self.total - self.passed
+            or not math.isfinite(self.pass_rate)
+            or not math.isclose(
+                self.pass_rate, expected_rate, rel_tol=0.0, abs_tol=1e-12
+            )
+            or len(rule_names) != len(set(rule_names))
+            or (self.total > 0 and "SHOULD_EXECUTE" not in rule_names)
+            or any(rule.total > self.total for rule in self.per_rule)
+            or any(
+                rule.passed != rule.total - failed_rule_counts[rule.assertion]
+                for rule in self.per_rule
+            )
+            or not set(failed_rule_counts).issubset(rule_names)
+            or any(
+                rule.assertion == "SHOULD_EXECUTE" and rule.total != self.total
+                for rule in self.per_rule
+            )
+            or (has_content and not self.content_included)
+            or (
+                self.content_included
+                and any(case.question is None for case in self.cases)
+            )
+            or len(self.model_parameters)
+            != len({parameter.name for parameter in self.model_parameters})
+        ):
+            raise ValueError("inconsistent evaluation report")
+        return self
 
     @field_serializer("model_parameters")
     def serialize_model_parameters(
@@ -384,9 +547,13 @@ def parse_model_parameters(values: Sequence[str]) -> tuple[ModelParameter, ...]:
         if isinstance(value, str) and (not value or len(value) > 128 or "\n" in value):
             raise GoldenConfigurationError("INVALID_MODEL_PARAMETER")
         parsed[name] = value
-    return tuple(
-        ModelParameter(name=name, value=value) for name, value in sorted(parsed.items())
-    )
+    try:
+        return tuple(
+            ModelParameter(name=name, value=value)
+            for name, value in sorted(parsed.items())
+        )
+    except Exception as exc:
+        raise GoldenConfigurationError("INVALID_MODEL_PARAMETER") from exc
 
 
 def get_git_commit(repo_root: Path) -> str:
@@ -636,6 +803,7 @@ class GoldenEvaluator:
         )
         if has_content and not report.content_included:
             raise GoldenConfigurationError("REPORT_CONTENT_MISMATCH")
+        report.validate_report()
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = report.model_dump(mode="json", exclude_none=True)
         serialized = json.dumps(
@@ -643,6 +811,7 @@ class GoldenEvaluator:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         ) + "\n"
         temporary_name: str | None = None
         try:
