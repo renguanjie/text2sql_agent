@@ -42,13 +42,19 @@ class SemanticContextBuilder:
         if len(header) > self._max_chars:
             raise SemanticContextError("max_chars 无法容纳版本信息")
 
-        selected: list[_ContextItem] = []
         matched_metrics = [
             metric for metric in snapshot.metrics if self._matches(question, self._metric_terms(metric))
         ]
-        for metric in matched_metrics:
-            bundle = self._metric_dependency_bundle(metric, snapshot)
-            self._append_mandatory_bundle(header, selected, bundle)
+        mandatory_items = self._deduplicated(
+            [],
+            tuple(
+                item
+                for metric in matched_metrics
+                for item in self._metric_dependency_bundle(metric, snapshot)
+            ),
+        )
+        self._validate_mandatory_items(header, mandatory_items)
+        selected = mandatory_items
 
         for item in self._lower_priority_hits(question, snapshot, selected):
             self._append_if_fits(header, selected, item)
@@ -65,17 +71,12 @@ class SemanticContextBuilder:
             rendered=rendered,
         )
 
-    def _append_mandatory_bundle(
-        self, header: str, selected: list[_ContextItem], bundle: tuple[_ContextItem, ...]
-    ) -> None:
-        if len(bundle) > self._max_items:
+    def _validate_mandatory_items(self, header: str, items: list[_ContextItem]) -> None:
+        if len(items) > self._max_items:
             raise SemanticContextError("max_items 无法容纳完整指标依赖组")
-        bundle_rendered = "\n".join(item.line for item in bundle)
-        if len(header) + 1 + len(bundle_rendered) > self._max_chars:
+        rendered = "\n".join([header, *(item.line for item in items)])
+        if len(rendered) > self._max_chars:
             raise SemanticContextError("max_chars 无法容纳完整指标依赖组")
-        candidate = self._deduplicated(selected, bundle)
-        if self._fits(header, candidate):
-            selected[:] = candidate
 
     def _append_if_fits(
         self, header: str, selected: list[_ContextItem], item: _ContextItem

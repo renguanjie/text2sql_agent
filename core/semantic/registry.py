@@ -99,8 +99,8 @@ class SemanticRegistry:
         try:
             jsonschema.validate(payload, SemanticSnapshot.model_json_schema())
             return SemanticSnapshot.model_validate(payload)
-        except (jsonschema.ValidationError, ValidationError) as exc:
-            raise SemanticRegistryError(f"快照格式无效: {exc}") from exc
+        except (jsonschema.ValidationError, ValidationError):
+            raise SemanticRegistryError("快照格式无效") from None
 
     @staticmethod
     def _content_sha256(snapshot: SemanticSnapshot) -> str:

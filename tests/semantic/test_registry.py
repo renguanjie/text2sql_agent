@@ -93,3 +93,19 @@ def test_registry_rejects_manifest_or_snapshot_contract_mismatches(
 
     with pytest.raises(SemanticRegistryError, match=expected):
         SemanticRegistry(compiled_model_dir, "sales").load_active()
+
+
+def test_registry_does_not_expose_sensitive_invalid_value_in_validation_error(
+    compiled_model_dir: Path,
+):
+    """Break caught: relaying schema-validator diagnostics containing malformed sensitive input."""
+    sensitive_value = "SENSITIVE_MOBILE_13800138000"
+    active_file = compiled_model_dir / "sales/1.0.0.json"
+    payload = json.loads(active_file.read_text(encoding="utf-8"))
+    payload["entities"][0]["fields"][0]["role"] = sensitive_value
+    active_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SemanticRegistryError, match="^快照格式无效$") as exc_info:
+        SemanticRegistry(compiled_model_dir, "sales").load_active()
+
+    assert sensitive_value not in str(exc_info.value)

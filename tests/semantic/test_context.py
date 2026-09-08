@@ -4,7 +4,7 @@ import pytest
 
 from core.semantic.compiler import SemanticCompiler
 from core.semantic.context import SemanticContextBuilder, SemanticContextError
-from core.semantic.models import SemanticSnapshot
+from core.semantic.models import SemanticMetric, SemanticSnapshot
 
 
 @pytest.fixture
@@ -88,3 +88,25 @@ def test_context_uses_substring_matches_for_chinese_metric_names(sales_snapshot:
     )
 
     assert context.metrics == ("order_amount",)
+
+
+def test_context_rejects_limit_that_cannot_fit_all_matched_metric_dependencies(
+    sales_snapshot: SemanticSnapshot,
+):
+    """Break caught: omitting a later matched metric when only the combined bundles overflow."""
+    second_metric = SemanticMetric(
+        name="order_amount_summary",
+        name_cn="订单金额汇总",
+        expression="SUM(orders.amount)",
+        allowed_dimensions=("orders.created_at",),
+        required_filters=("orders.status",),
+        default_time_field="orders.created_at",
+    )
+    two_metric_snapshot = sales_snapshot.model_copy(
+        update={"metrics": (sales_snapshot.metrics[0], second_metric)}
+    )
+
+    with pytest.raises(SemanticContextError, match="max_items"):
+        SemanticContextBuilder(max_chars=800, max_items=8).build(
+            "订单金额汇总", two_metric_snapshot
+        )
