@@ -455,8 +455,12 @@ def _normalized_join_type(join: exp.Join) -> tuple[str, bool]:
         return "UNSUPPORTED JOIN", False
     if kind == "CROSS":
         return "CROSS JOIN", False
-    if side in {"LEFT", "RIGHT", "FULL"} and kind in {"", "OUTER"}:
-        return f"{side} JOIN", side in {"LEFT", "RIGHT"}
+    if side == "LEFT" and kind in {"", "OUTER"}:
+        return "LEFT JOIN", True
+    if side == "RIGHT" and kind in {"", "OUTER"}:
+        return "RIGHT JOIN", False
+    if side == "FULL" and kind in {"", "OUTER"}:
+        return "FULL JOIN", False
     if not side and kind in {"", "INNER"}:
         return "INNER JOIN", True
     return "UNSUPPORTED JOIN", False
@@ -1887,7 +1891,7 @@ class SemanticSQLValidator:
                     relation_join_type = relation.join_type.upper()
                     if relation_join_type != fact.join_type:
                         continue
-                    if relation_join_type in {"LEFT JOIN", "RIGHT JOIN"} and not (
+                    if relation_join_type == "LEFT JOIN" and not (
                         _casefold(relation.from_entity) in fact.left_tables
                         and _casefold(relation.to_entity) in fact.right_tables
                     ):

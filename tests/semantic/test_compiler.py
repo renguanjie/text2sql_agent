@@ -184,7 +184,7 @@ def test_compile_rejects_relationship_predicates_outside_canonical_grammar(
         _compile_yaml(tmp_path, _rich_model(extra=relationship))
 
 
-def test_compile_canonicalizes_supported_relationship_predicate_atoms(tmp_path: Path):
+def test_compile_canonicalizes_supported_left_relationship_predicate_atoms(tmp_path: Path):
     """Break caught: null predicates or AND atoms being dropped from the compiled contract."""
     relationship = """
         relationships:
@@ -193,7 +193,7 @@ def test_compile_canonicalizes_supported_relationship_predicate_atoms(tmp_path: 
             from_field: ID
             to_entity: CUSTOMERS
             to_field: ID
-            join_type: RIGHT JOIN
+            join_type: LEFT JOIN
             extra_condition: >-
               ORDERS.status = CUSTOMERS.status
               AND ORDERS.status IS NOT NULL
@@ -202,12 +202,28 @@ def test_compile_canonicalizes_supported_relationship_predicate_atoms(tmp_path: 
 
     snapshot = _compile_yaml(tmp_path, _rich_model(extra=relationship))
 
-    assert snapshot.relationships[0].join_type == "RIGHT JOIN"
+    assert snapshot.relationships[0].join_type == "LEFT JOIN"
     assert snapshot.relationships[0].extra_condition == (
         "orders.status = customers.status "
         "AND orders.status IS NOT NULL "
         "AND customers.status IS NULL"
     )
+
+
+def test_compile_rejects_right_join_relationship_contract(tmp_path: Path):
+    """RIGHT JOIN must not become a published semantic authorization contract."""
+    relationship = """
+        relationships:
+          - name: order_customer
+            from_entity: orders
+            from_field: id
+            to_entity: customers
+            to_field: id
+            join_type: RIGHT JOIN
+    """
+
+    with pytest.raises(SemanticCompileError):
+        _compile_yaml(tmp_path, _rich_model(extra=relationship))
 
 
 @pytest.mark.parametrize(

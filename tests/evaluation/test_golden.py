@@ -32,7 +32,7 @@ from core.semantic import (
     SemanticRelationship,
     SemanticSnapshot,
 )
-from core.semantic.validator import analyze_sql_structure
+from core.semantic.validator import SemanticSQLValidator, analyze_sql_structure
 
 
 @pytest.fixture
@@ -185,6 +185,30 @@ def test_contracts_are_deeply_immutable():
         report.model_sha256 = "changed"
     with pytest.raises(TypeError):
         report.model_parameters[0] = ModelParameter(name="seed", value=1)
+
+
+def test_default_example_relationship_is_valid_for_the_default_left_contract(
+    snapshot: SemanticSnapshot,
+):
+    """The tracked smoke result must use the relationship's LEFT JOIN semantics."""
+    example_path = (
+        Path(__file__).resolve().parents[2]
+        / "eval/examples/default-results.example.json"
+    )
+    payload = json.loads(example_path.read_text(encoding="utf-8"))
+    sql = next(
+        result["sql"]
+        for result in payload["results"]
+        if result["id"] == "default-relationship-001"
+    )
+
+    report = SemanticSQLValidator().validate(
+        sql,
+        "查询示例订单对应的客户分组",
+        snapshot,
+    )
+
+    assert report.valid, report.issues
 
 
 def test_evaluator_accepts_alias_cte_and_structurally_equivalent_metric(evaluator):

@@ -75,7 +75,7 @@ class SemanticRelationship(FrozenModel):
     from_field: Identifier
     to_entity: Identifier
     to_field: Identifier
-    join_type: Literal["INNER JOIN", "LEFT JOIN", "RIGHT JOIN"] = "LEFT JOIN"
+    join_type: Literal["INNER JOIN", "LEFT JOIN"] = "LEFT JOIN"
     extra_condition: NonEmptyText | None = None
 
 

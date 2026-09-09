@@ -462,8 +462,6 @@ def test_accepts_only_the_governed_join_key_in_either_direction(
         ("LEFT JOIN", "JOIN", False),
         ("LEFT JOIN", "INNER JOIN", False),
         ("LEFT JOIN", "RIGHT JOIN", False),
-        ("RIGHT JOIN", "RIGHT JOIN", True),
-        ("RIGHT JOIN", "LEFT JOIN", False),
     ],
 )
 def test_relationship_join_kind_is_an_exact_authorization_contract(
@@ -506,6 +504,18 @@ def test_directional_join_contract_preserves_declared_left_and_right_entities(
     )
 
     assert "INVALID_JOIN" in {issue.code for issue in report.issues}
+
+
+def test_right_join_remains_parseable_without_a_governed_relationship_contract():
+    """Removing RIGHT authorization must not regress generic SQL scope parsing."""
+    scope = parse_sql_scope(
+        "SELECT o.amount, c.name FROM orders o "
+        "RIGHT JOIN customers c ON o.customer_id = c.id",
+        dialect="mysql",
+    )
+
+    assert set(scope.tables) == {"orders", "customers"}
+    assert {("orders", "amount"), ("customers", "name")} <= set(scope.columns)
 
 
 @pytest.mark.parametrize("actual", ["CROSS JOIN", "FULL JOIN"])

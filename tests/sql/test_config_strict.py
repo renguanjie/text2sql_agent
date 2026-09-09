@@ -106,6 +106,8 @@ raise SystemExit(0)
         ("SQL_QUERY_MAX_ROWS", "0"),
         ("SQL_QUERY_TIMEOUT_MS", "0"),
         ("PROMPT_MAX_LENGTH", "0"),
+        ("PROMPT_MAX_LENGTH", "999"),
+        ("PROMPT_MAX_LENGTH", "100001"),
         ("SEMANTIC_CONTEXT_MAX_CHARS", "0"),
         ("SEMANTIC_CONTEXT_MAX_ITEMS", "0"),
         ("SQL_REPAIR_MAX_ATTEMPTS", "2"),
@@ -141,7 +143,8 @@ def test_integer_environment_parser_does_not_echo_invalid_value():
         ({"sql_max_length": 100_001}, "SQL_MAX_LENGTH"),
         ({"sql_query_max_rows": 0}, "SQL_QUERY_MAX_ROWS"),
         ({"sql_query_timeout_ms": 0}, "SQL_QUERY_TIMEOUT_MS"),
-        ({"prompt_max_length": 0}, "PROMPT_MAX_LENGTH"),
+        ({"prompt_max_length": 999}, "PROMPT_MAX_LENGTH"),
+        ({"prompt_max_length": 100_001}, "PROMPT_MAX_LENGTH"),
         ({"semantic_context_max_chars": 0}, "SEMANTIC_CONTEXT_MAX_CHARS"),
         ({"semantic_context_max_items": 0}, "SEMANTIC_CONTEXT_MAX_ITEMS"),
         ({"sql_repair_max_attempts": 2}, "SQL_REPAIR_MAX_ATTEMPTS"),
@@ -174,6 +177,26 @@ def test_runtime_integer_validation_rejects_bool_and_string_values(value):
 
     with pytest.raises(RuntimeConfigurationError, match="SQL_MAX_LENGTH"):
         validate_runtime_config({"sql_max_length": value})
+
+
+def test_prompt_length_minimum_is_shared_by_startup_and_reload_validation():
+    """A 999-character prompt budget must not bypass startup or reload validation."""
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+    from core.config_validation import validate_runtime_config
+
+    accepted = _run_config_script(
+        "import config; print(config.PROMPT_MAX_LENGTH)",
+        PROMPT_MAX_LENGTH="1000",
+    )
+    rejected = _run_config_script("import config", PROMPT_MAX_LENGTH="999")
+
+    assert accepted.returncode == 0
+    assert accepted.stdout.strip() == "1000"
+    assert rejected.returncode != 0
+    assert "PROMPT_MAX_LENGTH" in rejected.stdout + rejected.stderr
+    validate_runtime_config({"prompt_max_length": 1000})
+    with pytest.raises(ApplicationConfigurationError, match="PROMPT_MAX_LENGTH"):
+        ApplicationContext._validate_candidate_config({"prompt_max_length": 999})
 
 
 def test_postgres_remains_valid_when_governance_and_explain_are_disabled():

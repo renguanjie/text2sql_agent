@@ -27,7 +27,7 @@
     },
     {
       "id": "default-relationship-001",
-      "sql": "SELECT c.segment FROM example_orders AS o JOIN example_customers AS c ON o.customer_id = c.id",
+      "sql": "SELECT c.segment FROM example_orders AS o LEFT JOIN example_customers AS c ON o.customer_id = c.id",
       "status": "success",
       "executable": true,
       "validation": {"valid": true, "issues": []}

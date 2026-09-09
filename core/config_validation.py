@@ -28,7 +28,7 @@ _INTEGER_CONFIG_LIMITS = {
     "mysql_pool_timeout": ("MYSQL_POOL_TIMEOUT", 1, 3_600),
     "neo4j_max_pool_size": ("NEO4J_MAX_POOL_SIZE", 1, 1_000),
     "neo4j_connection_timeout": ("NEO4J_CONNECTION_TIMEOUT", 1, 3_600),
-    "prompt_max_length": ("PROMPT_MAX_LENGTH", 1, 100_000),
+    "prompt_max_length": ("PROMPT_MAX_LENGTH", 1_000, 100_000),
     "retrieval_top_k": ("RETRIEVAL_TOP_K", 1, 100),
     "upload_max_bytes": ("UPLOAD_MAX_BYTES", 1, 1_073_741_824),
     "graph_max_nodes": ("GRAPH_MAX_NODES", 1, 1_000_000),

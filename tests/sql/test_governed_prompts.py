@@ -155,6 +155,19 @@ def test_generation_budget_counts_both_message_skeletons_before_semantics():
         )
 
 
+def test_minimum_valid_prompt_budget_never_exceeds_its_configured_limit():
+    """A valid 1000-character configuration must be enforced without a hidden clamp."""
+    from core.chain.prompts import SQLPromptTemplates
+
+    messages = SQLPromptTemplates(max_length=1000).create_sql_generation_messages(
+        user_query="查询订单",
+        schema_info="orders(id)",
+        knowledge_info="无",
+    )
+
+    assert _message_chars(messages) <= 1000
+
+
 def test_governed_repair_keeps_full_issues_and_escapes_pinned_question_in_budget():
     """Break caught: repair losing intent or truncating structured validation issues."""
     from core.chain.prompts import SQLPromptTemplates

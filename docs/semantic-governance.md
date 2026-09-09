@@ -30,7 +30,7 @@ source .venv/bin/activate
 | `SQL_MAX_LENGTH` | `2000` | 必须是 `1`–`100000` 的整数。 |
 | `SQL_QUERY_MAX_ROWS` | `500` | 必须是 `1`–`100000` 的整数。 |
 | `SQL_QUERY_TIMEOUT_MS` | `10000` | 必须是 `1`–`3600000` 的整数，单位毫秒。 |
-| `PROMPT_MAX_LENGTH` | `4000` | 必须是 `1`–`100000` 的整数。 |
+| `PROMPT_MAX_LENGTH` | `4000` | 必须是 `1000`–`100000` 的整数。 |
 | `MAX_PREPARED_REQUESTS` | `256` | 治理 capability 容量，必须是 `1`–`4096` 的整数。 |
 | `PREPARED_REQUEST_TTL_SECONDS` | `120` | 治理 capability TTL，必须大于 `0` 且不超过 `3600` 秒。 |
 | `GOVERNED_HISTORY_BINDING_TTL_SECONDS` | `900` | 治理历史 binding TTL，必须大于 `0` 且不超过 `3600` 秒。 |
@@ -43,10 +43,10 @@ source .venv/bin/activate
 
 首版只接受 `schema_version: 1`、`dialect: mysql`，且 `model_version` 必须是严格的 `MAJOR.MINOR.PATCH`。模型字段角色限定为 `identifier`、`dimension`、`measure`、`time`。治理源、编译快照、Golden 用例都不得包含凭据或真实业务值。
 
-关系的 `join_type` 是执行授权契约，只允许规范形式 `INNER JOIN`、`LEFT JOIN`、
-`RIGHT JOIN`。裸 `JOIN` 规范为 `INNER JOIN`；`LEFT OUTER JOIN` 规范为
-`LEFT JOIN`。`LEFT`/`RIGHT` 还固定 `from_entity` 与 `to_entity` 的左右位置，不能用
-相反方向或其他 JOIN 种类替代。`CROSS JOIN`、`FULL JOIN`、`NATURAL JOIN` 不能声明为
+关系的 `join_type` 是执行授权契约，只允许规范形式 `INNER JOIN`、`LEFT JOIN`。
+裸 `JOIN` 规范为 `INNER JOIN`；`LEFT OUTER JOIN` 规范为 `LEFT JOIN`。`LEFT` 固定
+`from_entity` 与 `to_entity` 的左右位置，不能用相反方向或其他 JOIN 种类替代。
+`RIGHT JOIN`、`CROSS JOIN`、`FULL JOIN`、`NATURAL JOIN` 不能声明为
 语义关系，也不能通过添加 `ON` 条件冒充已治理关系。
 
 关系 `extra_condition` 只允许字段/字面量的 `=`、字段 `IS NULL`、字段

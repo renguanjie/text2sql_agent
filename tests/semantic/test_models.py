@@ -87,7 +87,7 @@ def test_semantic_model_rejects_empty_or_unsafe_identifiers(path, value):
         SemanticModel.model_validate(payload)
 
 
-@pytest.mark.parametrize("join_type", ["INNER JOIN", "LEFT JOIN", "RIGHT JOIN"])
+@pytest.mark.parametrize("join_type", ["INNER JOIN", "LEFT JOIN"])
 def test_semantic_relationship_accepts_only_directional_join_contracts(join_type):
     """Break caught: a supported directional relationship kind being rejected as schema-invalid."""
     relationship = SemanticRelationship(
@@ -102,7 +102,7 @@ def test_semantic_relationship_accepts_only_directional_join_contracts(join_type
     assert relationship.join_type == join_type
 
 
-@pytest.mark.parametrize("join_type", ["CROSS JOIN", "FULL JOIN", "LEFT"])
+@pytest.mark.parametrize("join_type", ["CROSS JOIN", "FULL JOIN", "RIGHT JOIN", "LEFT"])
 def test_semantic_relationship_rejects_non_directional_or_noncanonical_join_kinds(
     join_type,
 ):

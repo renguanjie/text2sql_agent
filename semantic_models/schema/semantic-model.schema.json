@@ -237,8 +237,7 @@
           "default": "LEFT JOIN",
           "enum": [
             "INNER JOIN",
-            "LEFT JOIN",
-            "RIGHT JOIN"
+            "LEFT JOIN"
           ],
           "title": "Join Type",
           "type": "string"
