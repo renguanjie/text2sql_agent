@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 import logging
 import re
+import threading
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -32,11 +34,12 @@ def test_mysql_explain_emits_hinted_select_without_session_mutation_or_limit():
             executed_sql.append(str(statement))
             return [ResultRow()]
 
-    @contextmanager
-    def connection_context():
-        yield Connection()
+        def close(self):
+            return None
 
-    client.get_connection = connection_context
+    engine = Mock()
+    engine.connect.return_value = Connection()
+    client.engine = engine
 
     assert client.explain_query("SELECT id FROM users", timeout_ms=3000) == [{"rows": 7}]
     assert executed_sql == ["EXPLAIN SELECT /*+ MAX_EXECUTION_TIME(3000) */ id FROM users"]
@@ -159,3 +162,106 @@ def test_preflight_exception_log_contains_metadata_without_sensitive_text(caplog
     assert "stage=mysql_explain" in caplog.text
     assert "exception_type=RuntimeError" in caplog.text
     assert re.search(r"error_id=[0-9a-f]{32}", caplog.text)
+
+
+def test_preflight_one_millisecond_deadline_does_not_wait_for_blocking_fake():
+    """The optimizer hint cannot substitute for a client-side wall-clock bound."""
+    from core.sql.preflight import MySQLExplainPreflight
+
+    released = threading.Event()
+
+    class BlockingClient:
+        def explain_query(self, _sql: str, _timeout_ms: int):
+            try:
+                time.sleep(0.12)
+                return [{"rows": 1}]
+            finally:
+                released.set()
+
+    started = time.monotonic()
+    result = MySQLExplainPreflight(BlockingClient(), timeout_ms=1).check("SELECT 1")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.05
+    assert result.valid is False
+    assert result.issues[0].code == "EXPLAIN_FAILED"
+    assert released.wait(0.5), "the late worker must finish and release its resources"
+
+
+def test_mysql_explain_timeout_invalidates_connection_without_commit():
+    from core.history.mysql_client import MySQLClient
+
+    released = threading.Event()
+
+    class ResultRow:
+        _mapping = {"rows": 1}
+
+    class Connection:
+        def __init__(self):
+            self.invalidations = 0
+            self.closes = 0
+            self.commits = 0
+
+        def execute(self, _statement):
+            time.sleep(0.12)
+            return [ResultRow()]
+
+        def invalidate(self):
+            self.invalidations += 1
+
+        def close(self):
+            self.closes += 1
+            released.set()
+
+        def commit(self):
+            self.commits += 1
+
+    connection = Connection()
+    engine = Mock()
+    engine.connect.return_value = connection
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    client.engine = engine
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="EXPLAIN deadline exceeded"):
+        client.explain_query("SELECT 1", timeout_ms=1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.05
+    assert released.wait(0.5)
+    assert connection.invalidations >= 1
+    assert connection.closes == 1
+    assert connection.commits == 0
+
+
+def test_repeated_blocking_preflights_use_a_bounded_worker_set():
+    from core.sql.preflight import MySQLExplainPreflight
+
+    release = threading.Event()
+
+    class BlockingClient:
+        def explain_query(self, _sql: str, _timeout_ms: int):
+            release.wait(0.5)
+            return [{"rows": 1}]
+
+    preflight = MySQLExplainPreflight(BlockingClient(), timeout_ms=1)
+    baseline = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("mysql-explain-deadline")
+    }
+
+    results = [preflight.check("SELECT 1") for _ in range(20)]
+    workers = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("mysql-explain-deadline")
+        and thread.ident not in baseline
+    ]
+    release.set()
+    for worker in workers:
+        worker.join(0.5)
+
+    assert all(not result.valid for result in results)
+    assert len(workers) <= 4
+    assert not [worker for worker in workers if worker.is_alive()]

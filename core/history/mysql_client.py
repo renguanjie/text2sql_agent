@@ -10,12 +10,15 @@ from sqlalchemy.pool import QueuePool
 from loguru import logger
 from sqlglot import exp, parse_one
 from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
+from ..sql.preflight import ExplainDeadlineExceeded, run_with_wall_clock_deadline
 import json
 import uuid
 
 
 class MySQLClient:
     """MySQL 数据库客户端 - 使用 SQLAlchemy 连接池"""
+
+    explain_query_enforces_wall_clock_deadline = True
 
     def __init__(self, host: str, port: int, user: str, password: str, database: str,
                  pool_size: int = 10, max_overflow: int = 20, pool_timeout: int = 30,
@@ -148,7 +151,7 @@ class MySQLClient:
             return [dict(row) for row in rows[:max_rows]], truncated
 
     def explain_query(self, query: str, timeout_ms: int) -> List[Dict]:
-        """执行不改变连接会话状态的 MySQL SELECT 查询计划预检。"""
+        """Run EXPLAIN on a disposable checkout within a wall-clock deadline."""
         if timeout_ms <= 0:
             raise ValueError("timeout_ms 必须大于 0")
 
@@ -161,9 +164,28 @@ class MySQLClient:
             exp.Hint(expressions=[exp.Var(this=f"MAX_EXECUTION_TIME({int(timeout_ms)})")]),
         )
         explain_sql = f"EXPLAIN {statement.sql(dialect='mysql')}"
-        with self.get_connection() as conn:
-            result = conn.execute(text(explain_sql))
-            return [dict(row._mapping) for row in result]
+        if self.engine is None:
+            raise RuntimeError("MySQL 未连接")
+
+        def execute(cancelled) -> List[Dict]:
+            conn = self.engine.connect()
+            try:
+                if cancelled.is_set():
+                    raise ExplainDeadlineExceeded("EXPLAIN deadline exceeded")
+                result = conn.execute(text(explain_sql))
+                rows = [dict(row._mapping) for row in result]
+                if cancelled.is_set():
+                    raise ExplainDeadlineExceeded("EXPLAIN deadline exceeded")
+                return rows
+            finally:
+                if cancelled.is_set():
+                    try:
+                        conn.invalidate()
+                    except Exception:
+                        pass
+                conn.close()
+
+        return run_with_wall_clock_deadline(execute, timeout_ms)
 
     def execute_update(self, query: str, params: Optional[dict] = None,
                        raise_on_error: bool = False) -> int:
