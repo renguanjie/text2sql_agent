@@ -8,11 +8,11 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine, text
 
-from config import LLM_API_KEY, LLM_MODEL, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
+from config import LLM_API_KEY, LLM_MODEL, NEO4J_PASSWORD, NEO4J_URI, NEO4J_USER
 from core.knowledge.neon_knowledge import Neo4jKnowledgeRetriever, build_dynamic_prompt
 from core.llm.qwen_generator import QwenMaxLLM, generate_sql_with_qwen
-from sqlalchemy import create_engine, text
 
 # Neon 数据库连接
 NEON_URL = os.getenv("NEON_DB_URL", "")

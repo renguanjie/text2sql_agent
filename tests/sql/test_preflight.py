@@ -1,8 +1,8 @@
-from contextlib import contextmanager
 import logging
 import re
 import threading
 import time
+from contextlib import contextmanager
 from unittest.mock import Mock
 
 import pytest

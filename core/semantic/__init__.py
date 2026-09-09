@@ -1,3 +1,4 @@
+from .context import SemanticPromptBundle
 from .models import (
     CorrectnessResult,
     FrozenModel,
@@ -20,7 +21,6 @@ from .terms import (
     SemanticTermResolutionError,
     SemanticTermResolver,
 )
-from .context import SemanticPromptBundle
 
 __all__ = [
     "FrozenModel",

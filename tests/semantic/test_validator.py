@@ -11,7 +11,7 @@ from core.semantic.models import (
     SemanticSnapshot,
     SemanticTerm,
 )
-from core.semantic.validator import SQLScope, SemanticSQLValidator, parse_sql_scope
+from core.semantic.validator import SemanticSQLValidator, SQLScope, parse_sql_scope
 
 
 @pytest.fixture

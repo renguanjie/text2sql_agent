@@ -3,13 +3,13 @@
 定义 SQL 生成相关的提示词模板
 """
 import json
-from typing import Dict, List, Optional
 from html import escape
+from typing import Dict, List, Optional
+
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
-from langchain_core.messages import SystemMessage, HumanMessage
 
 from ..semantic.context import SemanticPromptBundle
-
 
 # ==================== 系统提示词 ====================
 

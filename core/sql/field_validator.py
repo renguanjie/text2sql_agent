@@ -4,17 +4,25 @@ SQL 字段验证器
 使用 sqlglot 进行 AST 解析，精准提取表名和字段名
 """
 import os
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from sqlalchemy import create_engine, inspect
-from typing import Dict, List, Set, Tuple, Optional, Any
 from loguru import logger
+from sqlalchemy import create_engine, inspect
 
 try:
-    from sqlglot import exp, parse, ParseError
+    from sqlglot import ParseError, exp, parse
     from sqlglot.expressions import (
-        Select, Table, Column, Identifier,
-        Join, From, CTE, Subquery, Alias
+        CTE,
+        Alias,
+        Column,
+        From,
+        Identifier,
+        Join,
+        Select,
+        Subquery,
+        Table,
     )
+
     from core.semantic.validator import parse_sql_scope
     SQLGLOT_AVAILABLE = True
 except ImportError:

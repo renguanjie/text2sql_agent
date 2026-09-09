@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import re
+from collections.abc import Mapping
 from typing import Any
-
 
 _PUBLIC_ISSUE_MESSAGES = {
     "AMBIGUOUS_COLUMN": "字段引用存在歧义",

@@ -1,7 +1,7 @@
 from copy import deepcopy
 
-from pydantic import ValidationError
 import pytest
+from pydantic import ValidationError
 
 from core.semantic.models import SemanticModel, ValidationIssue
 

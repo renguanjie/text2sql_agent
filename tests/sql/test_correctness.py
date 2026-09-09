@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-import json
 from pathlib import Path
 from threading import Barrier
 
@@ -323,8 +323,8 @@ def test_authorization_rejects_overlong_sql_before_any_parser(monkeypatch):
 
 def test_process_pins_one_snapshot_across_context_and_repair_validation():
     """Catches a request mixing semantic versions by reading the registry twice."""
-    from core.sql.correctness import CorrectnessPipeline
     from core.semantic.context import SemanticPromptBundle
+    from core.sql.correctness import CorrectnessPipeline
 
     registry = ChangingRegistry(_snapshot("1.0.0"), _snapshot("1.1.0"))
     contexts: list[str] = []

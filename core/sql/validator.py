@@ -2,14 +2,14 @@
 SQL 校验器模块
 使用 SQLFluff 进行 SQL 语法校验和格式化
 """
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
+
 import sqlfluff
+from loguru import logger
 from sqlfluff.core import Linter
 from sqlfluff.core.errors import SQLParseError
-from loguru import logger
 
 from ..utils.log_sanitizer import log_safe_exception
-
 
 SYSTEM_SCHEMAS = {"information_schema", "mysql", "performance_schema", "sys", "pg_catalog"}
 DEFAULT_BLOCKED_TABLES = {

@@ -20,7 +20,6 @@ from .terms import (
     SemanticTermResolver,
 )
 
-
 _QUALIFIED_FIELD = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
 
 

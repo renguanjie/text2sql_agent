@@ -1,6 +1,6 @@
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import ANY, Mock
-from hashlib import sha256
 
 import pytest
 

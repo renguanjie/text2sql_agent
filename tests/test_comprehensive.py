@@ -2,12 +2,12 @@
 Text2SQL 智能体 - 综合功能测试套件
 覆盖全部核心功能的 30+ 测试用例
 """
-import pytest
 import os
 import time
 from datetime import datetime
 from pathlib import Path
 
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,9 +76,11 @@ class TestConfig:
     def test_02_config_values(self):
         """测试 2: 配置值验证"""
         from config import (
-            MYSQL_PORT, MYSQL_DATABASE,
+            MYSQL_DATABASE,
+            MYSQL_PORT,
             NEO4J_URI,
-            RETRIEVAL_TOP_K, SQL_DIALECT
+            RETRIEVAL_TOP_K,
+            SQL_DIALECT,
         )
         assert MYSQL_PORT == 3306
         assert MYSQL_DATABASE == 'text2sql_db'
@@ -372,9 +374,9 @@ class TestIntegration:
     
     def test_34_full_workflow_import(self):
         """测试 34: 完整工作流导入 - 跳过 is_safe_sql"""
+        from core.history.mysql_client import MySQLClient
         from core.retrieval.bm25_tfidf import KnowledgeRetriever
         from core.sql.validator import SQLValidator
-        from core.history.mysql_client import MySQLClient
         # 所有核心模块可导入
         assert KnowledgeRetriever is not None
         assert SQLValidator is not None

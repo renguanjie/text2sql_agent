@@ -2,15 +2,16 @@
 LangChain 链式处理模块
 实现 SQL 生成的完整链路（支持异步）
 """
-from typing import Dict, List, Optional, Any, Tuple
+import asyncio
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from loguru import logger
-import re
-import asyncio
 
-from .prompts import SemanticPromptBudgetError, get_prompt_templates
 from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
+from .prompts import SemanticPromptBudgetError, get_prompt_templates
 
 
 class SQLGenerationChain:

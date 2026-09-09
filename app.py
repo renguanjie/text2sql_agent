@@ -3,36 +3,83 @@ Text2SQL 智能体 - Streamlit 主入口
 基于本地知识库的 SQL 智能生成应用
 """
 # ruff: noqa: E402
-import streamlit as st
-import sys
 import json
+import sys
 from pathlib import Path
+
+import streamlit as st
 
 # 添加项目根目录到路径
 project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
+import uuid
+
+from loguru import logger
+
 from config import (
-    MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE,
-    NEO4J_ENABLED, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE,
-    NEO4J_MAX_POOL_SIZE, NEO4J_CONNECTION_TIMEOUT,
-    LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL,
-    LLM_PROVIDERS, EMBEDDING_PROVIDERS,
-    RETRIEVAL_TOP_K, PROMPT_MAX_LENGTH, SQL_DIALECT, SQL_VALIDATION_ENABLED, SQL_MAX_LENGTH,
-    SQL_QUERY_MAX_ROWS, SQL_QUERY_TIMEOUT_MS, SQL_SCOPE_ENFORCEMENT, SQL_BLOCKED_TABLES,
-    SEMANTIC_GOVERNANCE_ENABLED, SEMANTIC_MODEL_DIR, SEMANTIC_DATASOURCE,
-    SEMANTIC_CONTEXT_MAX_CHARS, SEMANTIC_CONTEXT_MAX_ITEMS,
-    SQL_REPAIR_MAX_ATTEMPTS, SQL_EXPLAIN_ENABLED, SQL_EXPLAIN_TIMEOUT_MS,
+    BM25_B,
+    BM25_K1,
+    BM25_WEIGHT,
+    DENSE_WEIGHT,
+    EMBEDDING_API_BASE,
+    EMBEDDING_API_KEY,
+    EMBEDDING_MODEL,
+    EMBEDDING_PROVIDER,
+    EMBEDDING_PROVIDERS,
+    FAISS_EMBEDDING_DIM,
+    FAISS_ENABLED,
+    FAISS_INDEX_TYPE,
+    FEW_SHOT_ENABLED,
+    FEW_SHOT_MIN_SIMILARITY,
+    FEW_SHOT_TOP_K,
+    GRAPH_MAX_DEPTH,
+    GRAPH_MAX_EDGES,
+    GRAPH_MAX_NODES,
+    GRAPH_MAX_STRING_LENGTH,
+    HISTORY_AUTO_SAVE,
+    HISTORY_MAX_RECORDS,
+    INDEX_CACHE_DIR,
+    INDEX_CACHE_ENABLED,
+    LLM_API_KEY,
+    LLM_BASE_URL,
+    LLM_MODEL,
+    LLM_PROVIDER,
+    LLM_PROVIDERS,
+    MYSQL_DATABASE,
+    MYSQL_HOST,
+    MYSQL_MAX_OVERFLOW,
+    MYSQL_PASSWORD,
+    MYSQL_POOL_SIZE,
+    MYSQL_POOL_TIMEOUT,
+    MYSQL_PORT,
+    MYSQL_USER,
+    NEO4J_CONNECTION_TIMEOUT,
+    NEO4J_DATABASE,
+    NEO4J_ENABLED,
+    NEO4J_MAX_POOL_SIZE,
+    NEO4J_PASSWORD,
+    NEO4J_URI,
+    NEO4J_USER,
+    PROMPT_MAX_LENGTH,
+    RETRIEVAL_TOP_K,
+    SEMANTIC_CONTEXT_MAX_CHARS,
+    SEMANTIC_CONTEXT_MAX_ITEMS,
+    SEMANTIC_DATASOURCE,
+    SEMANTIC_GOVERNANCE_ENABLED,
+    SEMANTIC_MODEL_DIR,
+    SQL_BLOCKED_TABLES,
+    SQL_DIALECT,
+    SQL_EXPLAIN_ENABLED,
     SQL_EXPLAIN_MAX_ESTIMATED_ROWS,
-    BM25_K1, BM25_B, BM25_WEIGHT, DENSE_WEIGHT,
-    FAISS_ENABLED, FAISS_EMBEDDING_DIM, FAISS_INDEX_TYPE,
-    INDEX_CACHE_ENABLED, INDEX_CACHE_DIR,
-    EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_API_KEY, EMBEDDING_API_BASE,
-    FEW_SHOT_ENABLED, FEW_SHOT_TOP_K, FEW_SHOT_MIN_SIMILARITY,
-    MYSQL_POOL_SIZE, MYSQL_MAX_OVERFLOW, MYSQL_POOL_TIMEOUT,
-    HISTORY_AUTO_SAVE, HISTORY_MAX_RECORDS,
-    UPLOAD_MAX_BYTES, GRAPH_MAX_NODES, GRAPH_MAX_EDGES,
-    GRAPH_MAX_DEPTH, GRAPH_MAX_STRING_LENGTH,
+    SQL_EXPLAIN_TIMEOUT_MS,
+    SQL_MAX_LENGTH,
+    SQL_QUERY_MAX_ROWS,
+    SQL_QUERY_TIMEOUT_MS,
+    SQL_REPAIR_MAX_ATTEMPTS,
+    SQL_SCOPE_ENFORCEMENT,
+    SQL_VALIDATION_ENABLED,
+    UPLOAD_MAX_BYTES,
 )
 from core.app_context import ApplicationContext
 from core.sql.validator import validate_sql
@@ -47,8 +94,6 @@ from core.utils.log_sanitizer import (
     safe_log_format,
 )
 from core.utils.upload_limits import UploadValidationError, read_uploaded_text
-from loguru import logger
-import uuid
 
 
 def get_knowledge_graph_template() -> dict:
@@ -1148,7 +1193,9 @@ with tab2:
                     if st.button("确认增强到知识图谱", key=f"confirm_{i}", type="primary", use_container_width=True):
                         # 更新 Neo4j 权重
                         if ctx and ctx.neo4j_client and ctx.neo4j_client.driver:
-                            from core.graph_builder.loader.weight_initializer import rebalance_with_history
+                            from core.graph_builder.loader.weight_initializer import (
+                                rebalance_with_history,
+                            )
                             stats = rebalance_with_history(extracted, ctx.neo4j_client)
                             st.success(f"增强完成：更新 {stats['updated']} 条，新建 {stats['created']} 条关系")
                         else:

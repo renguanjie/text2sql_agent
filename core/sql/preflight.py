@@ -10,7 +10,6 @@ from typing import Any, Generic, TypeVar, cast
 from ..semantic.models import PreflightResult, ValidationIssue
 from ..utils.log_sanitizer import log_safe_exception
 
-
 _T = TypeVar("_T")
 _DEADLINE_WORKERS = 4
 _DEADLINE_SLOTS = BoundedSemaphore(_DEADLINE_WORKERS)

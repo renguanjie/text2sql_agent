@@ -1,8 +1,8 @@
 """
 Text2SQL 智能体测试模块
 """
-import pytest
 import numpy as np
+import pytest
 
 
 class TestNeo4jClient:
@@ -186,8 +186,9 @@ class TestPromptTemplates:
 
     def test_extract_sql_from_codeblock(self):
         """测试从代码块提取 SQL"""
-        from core.chain.sql_chain import SQLGenerationChain
         from unittest.mock import Mock
+
+        from core.chain.sql_chain import SQLGenerationChain
 
         chain = SQLGenerationChain(Mock(), dialect="mysql")
 
@@ -201,8 +202,9 @@ SELECT * FROM users WHERE id = 1
 
     def test_extract_sql_plain(self):
         """测试从纯文本提取 SQL"""
-        from core.chain.sql_chain import SQLGenerationChain
         from unittest.mock import Mock
+
+        from core.chain.sql_chain import SQLGenerationChain
 
         chain = SQLGenerationChain(Mock(), dialect="mysql")
 
