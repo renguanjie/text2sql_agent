@@ -556,16 +556,22 @@ class ApplicationContext:
             config=self._retriever_config(candidate_config),
             embedding_factory=self._embedding_factory,
         )
-        self._populate_retriever(
-            candidate_retriever,
-            candidate_config,
-            correctness_pipeline=candidate_pipeline,
-        )
         candidate_generator = self._build_sql_generator(
             llm=self._llm,
             knowledge_retriever=candidate_retriever,
             sql_chain=self._sql_chain,
             config=candidate_config,
+            correctness_pipeline=candidate_pipeline,
+        )
+        self._validate_component_graph(
+            candidate_config,
+            semantic_registry=candidate_registry,
+            correctness_pipeline=candidate_pipeline,
+            sql_generator=candidate_generator,
+        )
+        self._populate_retriever(
+            candidate_retriever,
+            candidate_config,
             correctness_pipeline=candidate_pipeline,
         )
 

@@ -1181,10 +1181,13 @@ def test_governance_reload_rejects_inconsistent_candidate_component_graph(monkey
         "_build_sql_generator",
         lambda **_kwargs: SimpleNamespace(correctness_pipeline=None),
     )
+    populate_retriever = Mock()
+    monkeypatch.setattr(context, "_populate_retriever", populate_retriever)
 
     with pytest.raises(ApplicationConfigurationError, match="组件图"):
         context.reload_governance(semantic_governance_enabled=True)
 
+    populate_retriever.assert_not_called()
     assert context.config is old_config
     assert context.semantic_registry is old_registry
     assert context.correctness_pipeline is old_pipeline
