@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -199,6 +200,47 @@ def test_registry_rejects_file_replaced_by_symlink_during_load(
         SemanticRegistry(compiled_model_dir, "sales").load_active()
 
     assert target.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("target_name", "marker"),
+    [
+        ("manifest.json", "active"),
+        ("sales/1.0.0.json", "compiler_version"),
+    ],
+    ids=["manifest", "artifact"],
+)
+def test_registry_rejects_same_inode_file_truncated_after_parse(
+    compiled_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+    marker: str,
+):
+    """Break caught: parsed bytes remaining trusted after same-inode corruption."""
+    target = compiled_model_dir / target_name
+    original_inode = target.stat().st_ino
+    real_loads = json.loads
+    attacked = False
+
+    def loads_then_truncate(value, *args, **kwargs):
+        nonlocal attacked
+        parsed = real_loads(value, *args, **kwargs)
+        if not attacked and isinstance(parsed, dict) and marker in parsed:
+            with target.open("r+b", buffering=0) as handle:
+                handle.write(b"{}")
+                handle.truncate()
+                os.fsync(handle.fileno())
+            attacked = True
+        return parsed
+
+    monkeypatch.setattr("core.semantic.registry.json.loads", loads_then_truncate)
+
+    with pytest.raises(SemanticRegistryError, match="读取|替换|内容"):
+        SemanticRegistry(compiled_model_dir, "sales").load_active()
+
+    assert attacked is True
+    assert target.stat().st_ino == original_inode
+    assert target.read_bytes() == b"{}"
 
 
 @pytest.mark.parametrize(

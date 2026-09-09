@@ -31,6 +31,8 @@ from .storage import (
     VerifiedRead,
     atomic_write_bytes,
     read_bytes_no_follow,
+    remove_file_no_follow,
+    semantic_transaction_lock,
     validate_no_symlink_path,
 )
 
@@ -124,20 +126,37 @@ class SemanticCompiler:
             compiled_at=self._clock(),
         )
 
-        # Read and validate every existing destination before mkdir or replace.
-        plan = self._prepare_write(candidate, output_root)
-        self._verify_plan_reads(plan)
-        snapshot = plan.existing_snapshot or candidate
-        artifact_read = plan.artifact_read
-        if plan.existing_snapshot is None:
-            self._write_json_atomically(snapshot.model_dump(mode="json"), plan.artifact)
-            artifact_read = self._read_verified(plan.artifact)
-        self._verify_plan_reads(plan, artifact_read=artifact_read)
-        self._write_json_schema(plan.schema_path)
-        self._verify_plan_reads(plan, artifact_read=artifact_read)
-        self._write_json_atomically(plan.manifest, plan.manifest_path)
-        self._verify_read(artifact_read)
-        return snapshot
+        # Reject every pre-existing unsafe destination before creating the lock root.
+        self._validated_write_paths(candidate, output_root)
+        try:
+            with semantic_transaction_lock(output_root):
+                # Hold one process/thread lock across the complete storage transaction.
+                plan = self._prepare_write(candidate, output_root)
+                self._verify_plan_reads(plan)
+                snapshot = plan.existing_snapshot or candidate
+                artifact_read = plan.artifact_read
+                if plan.existing_snapshot is None:
+                    self._write_json_atomically(
+                        snapshot.model_dump(mode="json"), plan.artifact
+                    )
+                    artifact_read = self._read_verified(plan.artifact)
+                self._verify_plan_reads(plan, artifact_read=artifact_read)
+                self._write_json_schema(plan.schema_path)
+                self._verify_plan_reads(plan, artifact_read=artifact_read)
+                activation_read = self._verify_activation_artifact(
+                    plan,
+                    snapshot,
+                    artifact_read,
+                )
+                try:
+                    self._write_json_atomically(plan.manifest, plan.manifest_path)
+                    self._verify_read(activation_read)
+                except SemanticCompileError:
+                    self._restore_manifest(plan)
+                    raise
+                return snapshot
+        except SemanticStorageError as exc:
+            raise SemanticCompileError(str(exc)) from None
 
     def _normalize_and_validate(self, model: SemanticModel) -> SemanticModel:
         indexes = self._build_indexes(model)
@@ -573,12 +592,9 @@ class SemanticCompiler:
     def _prepare_write(
         self, snapshot: SemanticSnapshot, output_root: Path
     ) -> _WritePlan:
-        artifact = output_root / snapshot.datasource / f"{snapshot.model_version}.json"
-        manifest_path = output_root / "manifest.json"
-        schema_path = output_root.parent / "schema/semantic-model.schema.json"
-        self._validate_output_path(output_root, artifact)
-        self._validate_output_path(output_root, manifest_path)
-        self._validate_output_path(output_root.parent, schema_path)
+        artifact, manifest_path, schema_path = self._validated_write_paths(
+            snapshot, output_root
+        )
 
         manifest: dict[str, Any] = {"active": {}}
         manifest_read = None
@@ -615,6 +631,17 @@ class SemanticCompiler:
             manifest_read=manifest_read,
             artifact_read=artifact_read,
         )
+
+    def _validated_write_paths(
+        self, snapshot: SemanticSnapshot, output_root: Path
+    ) -> tuple[Path, Path, Path]:
+        artifact = output_root / snapshot.datasource / f"{snapshot.model_version}.json"
+        manifest_path = output_root / "manifest.json"
+        schema_path = output_root.parent / "schema/semantic-model.schema.json"
+        self._validate_output_path(output_root, artifact)
+        self._validate_output_path(output_root, manifest_path)
+        self._validate_output_path(output_root.parent, schema_path)
+        return artifact, manifest_path, schema_path
 
     @staticmethod
     def _read_manifest(path: Path) -> tuple[dict[str, Any], VerifiedRead]:
@@ -674,6 +701,43 @@ class SemanticCompiler:
         ):
             raise SemanticCompileError("现有版本 artifact 摘要无效，拒绝覆盖")
         return snapshot, read
+
+    def _verify_activation_artifact(
+        self,
+        plan: _WritePlan,
+        expected_snapshot: SemanticSnapshot,
+        expected_read: VerifiedRead | None,
+    ) -> VerifiedRead:
+        if expected_read is None:
+            raise SemanticCompileError("待激活 artifact 未经安全读取")
+        self._verify_read(expected_read)
+        current_snapshot, current_read = self._read_existing_snapshot(plan.artifact)
+        if (
+            current_read.file_identity != expected_read.file_identity
+            or current_read.content_sha256 != expected_read.content_sha256
+            or current_read.content != expected_read.content
+            or current_snapshot != expected_snapshot
+        ):
+            raise SemanticCompileError("待激活 artifact 身份或内容已改变")
+        self._verify_read(plan.manifest_read)
+        self._verify_read(current_read)
+        return current_read
+
+    @staticmethod
+    def _restore_manifest(plan: _WritePlan) -> None:
+        try:
+            if plan.manifest_read is None:
+                remove_file_no_follow(plan.manifest_path)
+                return
+            atomic_write_bytes(plan.manifest_path, plan.manifest_read.content)
+            restored = read_bytes_no_follow(plan.manifest_path)
+            if (
+                restored.content != plan.manifest_read.content
+                or restored.content_sha256 != plan.manifest_read.content_sha256
+            ):
+                raise SemanticStorageError("无法恢复原始语义清单内容")
+        except SemanticStorageError as exc:
+            raise SemanticCompileError(f"无法恢复原始语义清单: {exc}") from None
 
     @staticmethod
     def _read_verified(path: Path) -> VerifiedRead:

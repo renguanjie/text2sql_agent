@@ -1,6 +1,8 @@
 import json
 import os
 import textwrap
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -378,6 +380,7 @@ def test_compile_validates_every_destination_type_before_any_write(tmp_path: Pat
     with pytest.raises(SemanticCompileError, match="输出路径"):
         _compile_yaml(tmp_path, _rich_model(), output_root=output_root)
 
+    assert not output_root.exists()
     assert not (output_root / "sales/1.0.0.json").exists()
     assert not (output_root / "manifest.json").exists()
 
@@ -494,6 +497,157 @@ def test_compile_revalidates_existing_artifact_before_return(
     assert artifact.is_symlink()
 
 
+def test_compile_rejects_existing_artifact_truncated_after_parse_before_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: same-inode artifact corruption being activated by the manifest."""
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+    artifact = tmp_path / ".compiled/sales/1.0.0.json"
+    manifest = tmp_path / ".compiled/manifest.json"
+    manifest.write_bytes(b'{"active":{"sales":"0.9.0"}}\n')
+    original_manifest = manifest.read_bytes()
+    original_inode = artifact.stat().st_ino
+    real_loads = json.loads
+    attacked = False
+
+    def loads_then_truncate_artifact(value, *args, **kwargs):
+        nonlocal attacked
+        parsed = real_loads(value, *args, **kwargs)
+        if (
+            not attacked
+            and isinstance(parsed, dict)
+            and parsed.get("compiler_version") == "2"
+        ):
+            with artifact.open("r+b", buffering=0) as handle:
+                handle.write(b"{}")
+                handle.truncate()
+                os.fsync(handle.fileno())
+            attacked = True
+        return parsed
+
+    monkeypatch.setattr("core.semantic.compiler.json.loads", loads_then_truncate_artifact)
+
+    with pytest.raises(SemanticCompileError):
+        _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+
+    assert attacked is True
+    assert artifact.stat().st_ino == original_inode
+    assert artifact.read_bytes() == b"{}"
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_compile_revalidates_new_artifact_at_manifest_activation_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: detecting artifact corruption only after activating it."""
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    old_model = _rich_model().replace("model_version: 1.0.0", "model_version: 0.9.0")
+    _compile_yaml(tmp_path, old_model, compiler=compiler)
+    manifest = tmp_path / ".compiled/manifest.json"
+    original_manifest = manifest.read_bytes()
+    artifact = tmp_path / ".compiled/sales/1.0.0.json"
+    real_verify = SemanticCompiler._verify_plan_reads
+    verify_count = 0
+    attacked = False
+
+    def verify_then_truncate(cls, plan, *, artifact_read=None):
+        nonlocal attacked, verify_count
+        real_verify(plan, artifact_read=artifact_read)
+        verify_count += 1
+        if verify_count == 3:
+            with artifact.open("r+b", buffering=0) as handle:
+                handle.write(b"{}")
+                handle.truncate()
+                os.fsync(handle.fileno())
+            attacked = True
+
+    monkeypatch.setattr(
+        SemanticCompiler,
+        "_verify_plan_reads",
+        classmethod(verify_then_truncate),
+    )
+
+    with pytest.raises(SemanticCompileError):
+        _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+
+    assert attacked is True
+    assert artifact.read_bytes() == b"{}"
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_compile_restores_manifest_if_artifact_changes_during_manifest_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: post-activation detection leaving a corrupt version active."""
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    old_model = _rich_model().replace("model_version: 1.0.0", "model_version: 0.9.0")
+    _compile_yaml(tmp_path, old_model, compiler=compiler)
+    manifest = tmp_path / ".compiled/manifest.json"
+    original_manifest = manifest.read_bytes()
+    artifact = tmp_path / ".compiled/sales/1.0.0.json"
+    real_replace = os.replace
+    attacked = False
+
+    def replace_manifest_after_corrupting_artifact(source, destination, *args, **kwargs):
+        nonlocal attacked
+        if not attacked and Path(destination).name == "manifest.json":
+            with artifact.open("r+b", buffering=0) as handle:
+                handle.write(b"{}")
+                handle.truncate()
+                os.fsync(handle.fileno())
+            attacked = True
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "core.semantic.storage.os.replace",
+        replace_manifest_after_corrupting_artifact,
+    )
+
+    with pytest.raises(SemanticCompileError):
+        _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+
+    assert attacked is True
+    assert artifact.read_bytes() == b"{}"
+    assert manifest.read_bytes() == original_manifest
+
+
+def test_compile_removes_new_manifest_if_artifact_changes_during_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: failed first activation leaving a newly created manifest behind."""
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    old_model = _rich_model().replace("model_version: 1.0.0", "model_version: 0.9.0")
+    _compile_yaml(tmp_path, old_model, compiler=compiler)
+    manifest = tmp_path / ".compiled/manifest.json"
+    manifest.unlink()
+    artifact = tmp_path / ".compiled/sales/1.0.0.json"
+    real_replace = os.replace
+    attacked = False
+
+    def replace_manifest_after_corrupting_artifact(source, destination, *args, **kwargs):
+        nonlocal attacked
+        if not attacked and Path(destination).name == "manifest.json":
+            with artifact.open("r+b", buffering=0) as handle:
+                handle.write(b"{}")
+                handle.truncate()
+                os.fsync(handle.fileno())
+            attacked = True
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "core.semantic.storage.os.replace",
+        replace_manifest_after_corrupting_artifact,
+    )
+
+    with pytest.raises(SemanticCompileError):
+        _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+
+    assert attacked is True
+    assert artifact.read_bytes() == b"{}"
+    assert not manifest.exists()
+
+
 def test_compile_fails_closed_without_dirfd_no_follow_support(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -502,3 +656,56 @@ def test_compile_fails_closed_without_dirfd_no_follow_support(
 
     with pytest.raises(SemanticCompileError, match="no-follow"):
         _compile_yaml(tmp_path, _rich_model())
+
+
+def test_compile_fails_closed_when_flock_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: compiling without cross-process transaction serialization."""
+    monkeypatch.setattr("core.semantic.storage._fcntl", None, raising=False)
+
+    with pytest.raises(SemanticCompileError, match="flock|文件锁"):
+        _compile_yaml(tmp_path, _rich_model())
+
+
+def test_compile_serializes_complete_storage_transaction_across_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: concurrent compilers planning against the same old manifest."""
+    source = tmp_path / "sales.yaml"
+    source.write_text(textwrap.dedent(_rich_model()), encoding="utf-8")
+    output_root = tmp_path / ".compiled"
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    counter_lock = threading.Lock()
+    real_prepare = SemanticCompiler._prepare_write
+    prepare_count = 0
+
+    def prepare_with_gate(self, snapshot, root):
+        nonlocal prepare_count
+        with counter_lock:
+            prepare_count += 1
+            call_number = prepare_count
+        if call_number == 1:
+            first_entered.set()
+            if not release_first.wait(timeout=5):
+                raise AssertionError("test did not release first compiler")
+        elif call_number == 2:
+            second_entered.set()
+        return real_prepare(self, snapshot, root)
+
+    monkeypatch.setattr(SemanticCompiler, "_prepare_write", prepare_with_gate)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(SemanticCompiler().compile_file, source, output_root)
+        assert first_entered.wait(timeout=5)
+        second = executor.submit(SemanticCompiler().compile_file, source, output_root)
+        try:
+            assert not second_entered.wait(timeout=0.2)
+        finally:
+            release_first.set()
+        first.result(timeout=5)
+        second.result(timeout=5)
+
+    assert second_entered.is_set()
