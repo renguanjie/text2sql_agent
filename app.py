@@ -41,6 +41,11 @@ from core.utils.correctness_ui import (
     public_failure_messages,
     structured_validation_messages,
 )
+from core.utils.log_sanitizer import (
+    log_safe_exception,
+    make_safe_streamlit_sink,
+    safe_log_format,
+)
 from core.utils.upload_limits import UploadValidationError, read_uploaded_text
 from loguru import logger
 import uuid
@@ -167,8 +172,17 @@ def get_knowledge_graph_template() -> dict:
 
 # 配置日志
 logger.remove()
-logger.add(lambda msg: st.write(msg), level="INFO")
-logger.add(project_root / "logs" / "app.log", level="DEBUG", rotation="1 day")
+logger.add(
+    make_safe_streamlit_sink(st.write),
+    level="INFO",
+    format=safe_log_format,
+)
+logger.add(
+    project_root / "logs" / "app.log",
+    level="DEBUG",
+    rotation="1 day",
+    format=safe_log_format,
+)
 
 # ==================== 页面配置 ====================
 st.set_page_config(
@@ -355,7 +369,7 @@ def _apply_llm_config(provider: str, model: str, api_key: str, base_url: str) ->
         logger.info(f"LLM 配置已更新：{provider}/{model}")
         return True
     except Exception as e:
-        logger.error(f"LLM 配置更新失败：{e}")
+        log_safe_exception("llm_config_reload", e)
         return False
 
 
@@ -380,7 +394,7 @@ def _apply_embedding_config(provider: str, model: str, api_key: str) -> bool:
         logger.info(f"Embedding 配置已更新：{provider}/{model}")
         return True
     except Exception as e:
-        logger.error(f"Embedding 配置更新失败：{e}")
+        log_safe_exception("embedding_config_reload", e)
         return False
 
 

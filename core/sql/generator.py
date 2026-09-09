@@ -349,6 +349,36 @@ class SQLGenerator:
                 sql=None,
             )
 
+    def _generation_failure_payload(
+        self,
+        user_query: str,
+        exc: Exception,
+        *,
+        stage: str,
+        semantic_version: str | None = None,
+        content_sha256: str | None = None,
+    ) -> Dict[str, Any]:
+        """Return a fixed public failure while recording only safe diagnostics."""
+        log_safe_exception(stage, exc, fingerprint_source=user_query)
+        message = "SQL 生成暂时不可用，请稍后重试"
+        if self.correctness_pipeline is None:
+            return {
+                'sql': None,
+                'status': 'error',
+                'error': message,
+                'raw_response': None,
+            }
+        result = self._governed_error_payload(
+            code=GENERATION_FAILED,
+            message=message,
+            semantic_version=semantic_version,
+            content_sha256=content_sha256,
+            sql=None,
+            stage='generation',
+        )
+        result['user_query'] = user_query
+        return result
+
     @staticmethod
     def _governed_error_payload(
         *,
@@ -527,7 +557,14 @@ class SQLGenerator:
             f"开始生成 SQL：query_id={text_fingerprint(user_query)}, chars={len(user_query)}"
         )
 
-        ctx = self._prepare_pipeline(user_query, target_dialect, target_database_id, use_few_shot)
+        try:
+            ctx = self._prepare_pipeline(
+                user_query, target_dialect, target_database_id, use_few_shot
+            )
+        except Exception as exc:
+            return self._generation_failure_payload(
+                user_query, exc, stage="sql_generator"
+            )
 
         (
             correctness_request,
@@ -568,6 +605,14 @@ class SQLGenerator:
                     result['allowed_tables'],
                     result['allowed_schemas'],
                 )
+        except Exception as exc:
+            result = self._generation_failure_payload(
+                user_query,
+                exc,
+                stage="sql_generator",
+                semantic_version=semantic_version,
+                content_sha256=content_sha256,
+            )
         finally:
             if self.correctness_pipeline is not None:
                 self.correctness_pipeline.discard_prepared(correctness_request)
@@ -588,9 +633,14 @@ class SQLGenerator:
             f"开始异步生成 SQL：query_id={text_fingerprint(user_query)}, chars={len(user_query)}"
         )
 
-        ctx = await self._prepare_pipeline_async(
-            user_query, target_dialect, target_database_id, use_few_shot
-        )
+        try:
+            ctx = await self._prepare_pipeline_async(
+                user_query, target_dialect, target_database_id, use_few_shot
+            )
+        except Exception as exc:
+            return self._generation_failure_payload(
+                user_query, exc, stage="sql_generator_async"
+            )
 
         (
             correctness_request,
@@ -631,6 +681,14 @@ class SQLGenerator:
                     result['allowed_tables'],
                     result['allowed_schemas'],
                 )
+        except Exception as exc:
+            result = self._generation_failure_payload(
+                user_query,
+                exc,
+                stage="sql_generator_async",
+                semantic_version=semantic_version,
+                content_sha256=content_sha256,
+            )
         finally:
             if self.correctness_pipeline is not None:
                 self.correctness_pipeline.discard_prepared(correctness_request)

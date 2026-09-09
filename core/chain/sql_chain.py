@@ -10,7 +10,7 @@ import re
 import asyncio
 
 from .prompts import SemanticPromptBudgetError, get_prompt_templates
-from ..utils.log_sanitizer import mask_sensitive, text_fingerprint, truncate_log
+from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
 
 
 class SQLGenerationChain:
@@ -103,13 +103,23 @@ class SQLGenerationChain:
 
     @staticmethod
     def _is_retryable_error(e: Exception) -> bool:
-        """判断异常是否可重试（网络错误、限流、超时可重试；认证错误、模型不存在不可重试）"""
-        msg = str(e).lower()
-        non_retryable = ['invalid_api_key', 'authentication', 'forbidden', 'model_not_found',
-                         'invalid_model', 'permission', 'quota exceeded', 'billing']
-        for keyword in non_retryable:
-            if keyword in msg:
-                return False
+        """Classify retries without inspecting attacker-controlled exception text."""
+        exception_name = type(e).__name__.casefold()
+        non_retryable_names = (
+            "authentication",
+            "authorization",
+            "forbidden",
+            "invalidrequest",
+            "notfound",
+            "permission",
+            "quota",
+            "billing",
+        )
+        if any(name in exception_name for name in non_retryable_names):
+            return False
+        status = getattr(e, "status_code", getattr(e, "status", None))
+        if isinstance(status, int) and status in {400, 401, 403, 404}:
+            return False
         return True
 
     def _invoke_llm_with_retry(self, messages: List, max_retries: int = 2) -> Any:
@@ -121,10 +131,6 @@ class SQLGenerationChain:
                 return self.llm.invoke(messages)
             except Exception as e:
                 if not self._is_retryable_error(e):
-                    logger.error(
-                        f"LLM 调用不可重试错误："
-                        f"{truncate_log(mask_sensitive(str(e)), 160)}"
-                    )
                     raise
                 retry_count += 1
                 if retry_count <= max_retries:
@@ -132,7 +138,6 @@ class SQLGenerationChain:
                     import time
                     time.sleep(1 * retry_count)
                 else:
-                    logger.error(f"LLM 调用失败，已重试 {max_retries} 次")
                     raise
 
     async def _ainvoke_llm_with_retry(self, messages: List, max_retries: int = 2) -> Any:
@@ -144,17 +149,12 @@ class SQLGenerationChain:
                 return await self.llm.ainvoke(messages)
             except Exception as e:
                 if not self._is_retryable_error(e):
-                    logger.error(
-                        f"LLM 异步调用不可重试错误："
-                        f"{truncate_log(mask_sensitive(str(e)), 160)}"
-                    )
                     raise
                 retry_count += 1
                 if retry_count <= max_retries:
                     logger.warning(f"LLM 异步调用失败（可重试），第 {retry_count} 次重试")
                     await asyncio.sleep(1 * retry_count)
                 else:
-                    logger.error(f"LLM 异步调用失败，已重试 {max_retries} 次")
                     raise
 
     # ==================== 公共方法 ====================
@@ -190,7 +190,7 @@ class SQLGenerationChain:
                 'error': str(e), 'raw_response': None
             }
         except Exception as e:
-            logger.opt(exception=e).error("SQL 生成失败")
+            log_safe_exception("sql_generation", e, fingerprint_source=user_query)
             self.stats['failed_generations'] += 1
             return {
                 'sql': None, 'status': 'error',
@@ -228,7 +228,7 @@ class SQLGenerationChain:
                 'error': str(e), 'raw_response': None
             }
         except Exception as e:
-            logger.opt(exception=e).error("异步 SQL 生成失败")
+            log_safe_exception("sql_generation_async", e, fingerprint_source=user_query)
             self.stats['failed_generations'] += 1
             return {
                 'sql': None, 'status': 'error',
@@ -249,7 +249,7 @@ class SQLGenerationChain:
             fixed_sql = self._extract_sql(response.content)
             return self._process_fix_result(fixed_sql)
         except Exception as e:
-            logger.opt(exception=e).error("SQL 修复失败")
+            log_safe_exception("sql_repair", e, fingerprint_source=sql)
             return {'sql': None, 'status': 'error', 'error': 'SQL 修复服务调用失败'}
 
     async def fix_sql_async(self, sql: str, error: str, schema_info: Dict) -> Dict[str, Any]:
@@ -266,28 +266,36 @@ class SQLGenerationChain:
             fixed_sql = self._extract_sql(response.content)
             return self._process_fix_result(fixed_sql)
         except Exception as e:
-            logger.opt(exception=e).error("异步 SQL 修复失败")
+            log_safe_exception("sql_repair_async", e, fingerprint_source=sql)
             return {'sql': None, 'status': 'error', 'error': 'SQL 修复服务调用失败'}
 
     def fix_sql_governed(
         self, sql: str, issues: list[dict], semantic_context: str
     ) -> Dict[str, Any]:
         """使用结构化治理问题修复 SQL，且不在此层重试。"""
-        messages = self.prompt_templates.create_governed_fix_messages(
-            sql=sql, issues=issues, semantic_context=semantic_context
-        )
-        response = self._invoke_llm_with_retry(messages, max_retries=0)
-        return self._process_fix_result(self._extract_sql(response.content))
+        try:
+            messages = self.prompt_templates.create_governed_fix_messages(
+                sql=sql, issues=issues, semantic_context=semantic_context
+            )
+            response = self._invoke_llm_with_retry(messages, max_retries=0)
+            return self._process_fix_result(self._extract_sql(response.content))
+        except Exception as e:
+            log_safe_exception("sql_repair_governed", e, fingerprint_source=sql)
+            raise
 
     async def fix_sql_governed_async(
         self, sql: str, issues: list[dict], semantic_context: str
     ) -> Dict[str, Any]:
         """异步使用结构化治理问题修复 SQL，且不在此层重试。"""
-        messages = self.prompt_templates.create_governed_fix_messages(
-            sql=sql, issues=issues, semantic_context=semantic_context
-        )
-        response = await self._ainvoke_llm_with_retry(messages, max_retries=0)
-        return self._process_fix_result(self._extract_sql(response.content))
+        try:
+            messages = self.prompt_templates.create_governed_fix_messages(
+                sql=sql, issues=issues, semantic_context=semantic_context
+            )
+            response = await self._ainvoke_llm_with_retry(messages, max_retries=0)
+            return self._process_fix_result(self._extract_sql(response.content))
+        except Exception as e:
+            log_safe_exception("sql_repair_governed_async", e, fingerprint_source=sql)
+            raise
 
     @staticmethod
     def _process_fix_result(fixed_sql: Optional[str]) -> Dict[str, Any]:

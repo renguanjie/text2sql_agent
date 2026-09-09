@@ -3,7 +3,9 @@
 提供统一的日志脱敏函数，防止敏感信息泄露
 """
 import hashlib
-from typing import Literal
+import re
+from collections.abc import Callable, Mapping
+from typing import Any, Literal
 from uuid import uuid4
 
 from loguru import logger
@@ -95,18 +97,60 @@ def log_safe_exception(
     exc: Exception,
     *,
     sql: str | None = None,
+    fingerprint_source: str | None = None,
     level: Literal["error", "warning"] = "error",
 ) -> str:
-    """Log exception metadata without traceback, exception text, or raw SQL."""
+    """Log fixed exception metadata without traceback or attacker-controlled text."""
     error_id = uuid4().hex
-    message = "operation_failure error_id={} stage={} exception_type={}"
-    args = [error_id, stage, type(exc).__name__]
-    if isinstance(sql, str):
-        message += " sql_id={}"
-        args.append(text_fingerprint(sql))
+    source = fingerprint_source if fingerprint_source is not None else sql
+    if source is None:
+        source = f"{stage}:{type(exc).__name__}"
+    message = (
+        "operation_failure error_id={} stage={} exception_type={} fingerprint={}"
+    )
+    args = [error_id, stage, type(exc).__name__, text_fingerprint(source)]
     log = logger.warning if level == "warning" else logger.error
     log(message, *args)
     return error_id
+
+
+_AUTHORIZATION_RE = re.compile(
+    r"\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;]+",
+    flags=re.IGNORECASE,
+)
+_BEARER_RE = re.compile(r"\bbearer\s+[^\s,;]+", flags=re.IGNORECASE)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"\b(?:password|passwd|api[_-]?key|access[_-]?token|token|secret)"
+    r"\s*[:=]\s*[^\s,;]+",
+    flags=re.IGNORECASE,
+)
+
+
+def sanitize_log_message(message: Any) -> str:
+    """Remove common credential forms from a value before it reaches a log sink."""
+    text = str(message)
+    text = _AUTHORIZATION_RE.sub("[REDACTED_CREDENTIAL]", text)
+    text = _BEARER_RE.sub("[REDACTED_CREDENTIAL]", text)
+    return _SECRET_ASSIGNMENT_RE.sub("[REDACTED_CREDENTIAL]", text)
+
+
+def safe_log_format(record: Mapping[str, Any]) -> str:
+    """Loguru formatter that omits exception payloads and sanitizes the message."""
+    extra = record.get("extra")
+    if isinstance(extra, dict):
+        extra["safe_message"] = sanitize_log_message(record.get("message", ""))
+    return (
+        "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | "
+        "{name}:{function}:{line} - {extra[safe_message]}\n"
+    )
+
+
+def make_safe_streamlit_sink(writer: Callable[[str], Any]) -> Callable[[Any], None]:
+    """Wrap a UI writer so accidental raw messages are credential-scrubbed."""
+    def sink(message: Any) -> None:
+        writer(sanitize_log_message(message).rstrip("\n"))
+
+    return sink
 
 
 def mask_sensitive(text: str, pattern: str = r'(password|api_key|token|secret)\s*[=:]\s*\S+',
@@ -126,5 +170,5 @@ def mask_sensitive(text: str, pattern: str = r'(password|api_key|token|secret)\s
         >>> mask_sensitive("api_key=sk-123456")
         'api_key=***'
     """
-    import re
-    return re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    masked = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return sanitize_log_message(masked)

@@ -114,7 +114,7 @@ class ApplicationContext:
             return False
         except Exception as e:
             self._initialization_error = "系统初始化失败"
-            logger.error(f"系统初始化失败：{e}")
+            log_safe_exception("application_startup", e)
             self.shutdown()
             self._initialized = False
             return False

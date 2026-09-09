@@ -366,6 +366,24 @@ async def test_generator_correctness_error_has_stable_top_level_fallback(use_asy
     assert "secret" not in str(result)
 
 
+def test_generator_prepare_exception_returns_stable_error_without_leaking(caplog):
+    generator = _generator(pipeline=_pipeline())
+    generator._prepare_pipeline.side_effect = RuntimeError(
+        "Authorization: Bearer adapter-secret SELECT hidden"
+    )
+
+    with capture_loguru(caplog):
+        result = generator.generate_sql("订单金额", auto_save_history=False)
+
+    assert result["status"] == "error"
+    assert result["error"] == "SQL 生成暂时不可用，请稍后重试"
+    assert result["executable"] is False
+    assert "adapter-secret" not in caplog.text
+    assert "Bearer" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "stage=sql_generator" in caplog.text
+
+
 def test_sync_generator_discards_prepared_request_when_chain_raises(monkeypatch):
     """An exception before correctness processing must not leave a live token."""
     pipeline = _pipeline()
@@ -381,12 +399,13 @@ def test_sync_generator_discards_prepared_request_when_chain_raises(monkeypatch)
     generator = _generator(pipeline=pipeline)
     generator.sql_chain.generate.side_effect = RuntimeError("LLM unavailable")
 
-    with pytest.raises(RuntimeError, match="LLM unavailable"):
-        generator.generate_sql("订单金额", auto_save_history=False)
+    result = generator.generate_sql("订单金额", auto_save_history=False)
 
     replay = pipeline.process_prepared(
         issued[0], "SELECT SUM(amount) FROM orders"
     )
+    assert result["status"] == "error"
+    assert result["error"] == "SQL 生成暂时不可用，请稍后重试"
     assert replay.status == "error"
     assert replay.executable is False
 
@@ -433,14 +452,15 @@ def test_sync_generator_discards_request_when_generation_context_is_malformed(
     generator = _generator(pipeline=pipeline)
     monkeypatch.setattr(generator, "_prepare_pipeline", lambda *_args: {})
 
-    with pytest.raises(KeyError, match="final_query"):
-        generator.generate_sql("订单金额", auto_save_history=False)
+    result = generator.generate_sql("订单金额", auto_save_history=False)
 
     with pytest.raises(ValueError, match="invalid or expired"):
         pipeline.describe_prepared(issued[0])
     replay = pipeline.process_prepared(
         issued[0], "SELECT SUM(amount) FROM orders"
     )
+    assert result["status"] == "error"
+    assert result["error"] == "SQL 生成暂时不可用，请稍后重试"
     assert replay.status == "error"
     assert replay.executable is False
 
@@ -501,14 +521,17 @@ async def test_async_generator_discards_request_when_generation_context_is_malfo
 
     monkeypatch.setattr(generator, "_prepare_pipeline_async", malformed_context)
 
-    with pytest.raises(KeyError, match="final_query"):
-        await generator.generate_sql_async("订单金额", auto_save_history=False)
+    result = await generator.generate_sql_async(
+        "订单金额", auto_save_history=False
+    )
 
     with pytest.raises(ValueError, match="invalid or expired"):
         pipeline.describe_prepared(issued[0])
     replay = pipeline.process_prepared(
         issued[0], "SELECT SUM(amount) FROM orders"
     )
+    assert result["status"] == "error"
+    assert result["error"] == "SQL 生成暂时不可用，请稍后重试"
     assert replay.status == "error"
     assert replay.executable is False
 
@@ -1310,6 +1333,27 @@ def test_ui_failure_messages_render_correctness_unavailable_without_raw_error():
     assert public_failure_messages(result) == [
         "[CORRECTNESS_UNAVAILABLE] SQL 正确性校验暂时不可用"
     ]
+
+
+def test_ui_failure_helpers_do_not_render_untrusted_bearer_text():
+    from core.utils.correctness_ui import public_failure_messages
+
+    result = {
+        "error": "Authorization: Bearer ui-secret",
+        "validation": {
+            "issues": [
+                {
+                    "code": "CORRECTNESS_UNAVAILABLE",
+                    "message": "Authorization: Bearer issue-secret",
+                }
+            ]
+        },
+    }
+
+    rendered = " ".join(public_failure_messages(result))
+    assert rendered == "[CORRECTNESS_UNAVAILABLE] SQL 正确性校验暂时不可用"
+    assert "Bearer" not in rendered
+    assert "secret" not in rendered
 
 
 def test_execute_exception_log_uses_safe_metadata_without_sql_or_traceback(caplog):
