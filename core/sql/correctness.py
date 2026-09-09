@@ -38,6 +38,11 @@ _REPAIR_FAILED = ValidationIssue(
     message="SQL 修复失败",
     stage="semantic",
 )
+_SQL_LENGTH_EXCEEDED = ValidationIssue(
+    code="SQL_LENGTH_EXCEEDED",
+    message="SQL 长度超过安全限制",
+    stage="safety",
+)
 
 
 class _CorrectnessRequest:
@@ -64,15 +69,19 @@ class CorrectnessPipeline:
         preflight: MySQLExplainPreflight | None = None,
         max_repair_attempts: Literal[0, 1] = 1,
         blocked_tables: tuple[str, ...] = (),
+        max_sql_length: int = 2000,
     ):
         if type(max_repair_attempts) is not int or max_repair_attempts not in (0, 1):
             raise ValueError("max_repair_attempts 必须是 0 或 1")
+        if type(max_sql_length) is not int or max_sql_length <= 0:
+            raise ValueError("max_sql_length 必须是正整数")
         self.registry = registry
         self.context_builder = context_builder
         self.semantic_validator = semantic_validator
         self.preflight = preflight
         self.max_repair_attempts = max_repair_attempts
         self.blocked_tables = blocked_tables
+        self.max_sql_length = max_sql_length
         self._prepared_requests: dict[_CorrectnessRequest, _PreparedState] = {}
         self._prepared_lock = Lock()
 
@@ -149,6 +158,8 @@ class CorrectnessPipeline:
         snapshot, validation = initial
         if validation.valid:
             return self._result(candidate_sql, snapshot, validation, 0)
+        if self._has_issue(validation, "SQL_LENGTH_EXCEEDED"):
+            return self._result(candidate_sql, snapshot, validation, 0)
         if repair is None or self.max_repair_attempts == 0:
             return self._result(candidate_sql, snapshot, validation, 0)
 
@@ -218,6 +229,8 @@ class CorrectnessPipeline:
             return initial
         snapshot, validation = initial
         if validation.valid:
+            return self._result(candidate_sql, snapshot, validation, 0)
+        if self._has_issue(validation, "SQL_LENGTH_EXCEEDED"):
             return self._result(candidate_sql, snapshot, validation, 0)
         if repair is None or self.max_repair_attempts == 0:
             return self._result(candidate_sql, snapshot, validation, 0)
@@ -425,6 +438,8 @@ class CorrectnessPipeline:
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> ValidationReport:
+        if isinstance(sql, str) and len(sql) > self.max_sql_length:
+            return ValidationReport(valid=False, issues=(_SQL_LENGTH_EXCEEDED,))
         if not isinstance(sql, str) or not sql.strip():
             return ValidationReport(
                 valid=False,
@@ -556,6 +571,10 @@ class CorrectnessPipeline:
     @staticmethod
     def _public_issues(validation: ValidationReport) -> list[dict]:
         return [issue.model_dump(mode="json") for issue in validation.issues]
+
+    @staticmethod
+    def _has_issue(validation: ValidationReport, code: str) -> bool:
+        return any(issue.code == code for issue in validation.issues)
 
     @staticmethod
     def _repaired_sql(result: Any) -> str | None:

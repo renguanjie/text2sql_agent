@@ -174,6 +174,139 @@ def test_successful_repair_runs_full_validation_again(pipeline):
     assert result.validation.valid
 
 
+def test_overlong_candidate_is_rejected_before_parsers_preflight_or_repair(monkeypatch):
+    """SQL_MAX_LENGTH is a first-stage resource boundary, not a linter rule."""
+    import core.sql.correctness as correctness_module
+    from core.sql.correctness import CorrectnessPipeline
+
+    parser = pytest.fail
+    monkeypatch.setattr(
+        correctness_module,
+        "validate_sql",
+        lambda *_args, **_kwargs: parser("validate_sql must not receive overlong SQL"),
+    )
+    repairs: list[str] = []
+    preflight = SequencedPreflight()
+    pipeline = CorrectnessPipeline(
+        registry=MutableRegistry(_snapshot()),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+        preflight=preflight,
+        max_sql_length=12,
+    )
+
+    result = pipeline.process(
+        "查询订单",
+        "SELECT id FROM orders",
+        repair=lambda sql, *_args: repairs.append(sql) or {"status": "success", "sql": sql},
+    )
+
+    assert result.status == "rejected"
+    assert result.executable is False
+    assert result.repair_attempts == 0
+    assert [issue.code for issue in result.validation.issues] == [
+        "SQL_LENGTH_EXCEEDED"
+    ]
+    assert repairs == []
+    assert preflight.sql == []
+
+
+@pytest.mark.asyncio
+async def test_async_overlong_candidate_uses_the_same_early_length_gate(monkeypatch):
+    import core.sql.correctness as correctness_module
+    from core.sql.correctness import CorrectnessPipeline
+
+    monkeypatch.setattr(
+        correctness_module,
+        "validate_sql",
+        lambda *_args, **_kwargs: pytest.fail("validate_sql must not be called"),
+    )
+    repairs: list[str] = []
+
+    async def repair(sql: str, *_args):
+        repairs.append(sql)
+        return {"status": "success", "sql": sql}
+
+    pipeline = CorrectnessPipeline(
+        registry=MutableRegistry(_snapshot()),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+        max_sql_length=12,
+    )
+    result = await pipeline.process_async(
+        "查询订单", "SELECT id FROM orders", repair=repair
+    )
+
+    assert result.validation.issues[0].code == "SQL_LENGTH_EXCEEDED"
+    assert result.executable is False
+    assert repairs == []
+
+
+def test_overlong_repair_output_is_rejected_before_second_parser_call(monkeypatch):
+    import core.sql.correctness as correctness_module
+    from core.sql.correctness import CorrectnessPipeline
+
+    parser_calls: list[str] = []
+
+    def validate_once(sql: str, **_kwargs):
+        parser_calls.append(sql)
+        return {
+            "valid": False,
+            "syntax_valid": True,
+            "execution_valid": True,
+            "errors": ["invalid"],
+        }
+
+    monkeypatch.setattr(correctness_module, "validate_sql", validate_once)
+    original = "SELECT id FROM orders"
+    repaired = "SELECT " + ("x" * 80) + " FROM orders"
+    pipeline = CorrectnessPipeline(
+        registry=MutableRegistry(_snapshot()),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+        max_sql_length=40,
+    )
+
+    result = pipeline.process(
+        "查询订单",
+        original,
+        repair=lambda *_args: {"status": "success", "sql": repaired},
+    )
+
+    assert parser_calls == [original]
+    assert result.sql == repaired
+    assert result.repair_attempts == 1
+    assert result.executable is False
+    assert result.validation.issues[0].code == "SQL_LENGTH_EXCEEDED"
+
+
+def test_authorization_rejects_overlong_sql_before_any_parser(monkeypatch):
+    import core.sql.correctness as correctness_module
+    from core.sql.correctness import CorrectnessPipeline
+
+    monkeypatch.setattr(
+        correctness_module,
+        "validate_sql",
+        lambda *_args, **_kwargs: pytest.fail("validate_sql must not be called"),
+    )
+    pipeline = CorrectnessPipeline(
+        registry=MutableRegistry(_snapshot()),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+        max_sql_length=12,
+    )
+
+    result = pipeline.authorize_execution(
+        question="查询订单",
+        sql="SELECT id FROM orders",
+        expected_semantic_version="1.0.0",
+        expected_content_sha256="1" * 64,
+    )
+
+    assert result.validation.issues[0].code == "SQL_LENGTH_EXCEEDED"
+    assert result.executable is False
+
+
 def test_process_pins_one_snapshot_across_context_and_repair_validation():
     """Catches a request mixing semantic versions by reading the registry twice."""
     from core.sql.correctness import CorrectnessPipeline

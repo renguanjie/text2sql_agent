@@ -1150,6 +1150,26 @@ def test_governance_reload_builds_candidate_then_atomically_replaces_pair(
     )
 
 
+def test_governance_pipeline_receives_configured_sql_max_length(
+    tmp_path: Path, monkeypatch
+):
+    from core.app_context import ApplicationContext
+
+    _write_model(tmp_path / "sales.yaml")
+    context = ApplicationContext({"semantic_governance_enabled": False})
+    context._mysql_client = Mock()
+    context._llm = Mock()
+    context._knowledge_retriever = Mock()
+    context._sql_chain = Mock()
+    monkeypatch.setattr(context, "_build_sql_generator", Mock(return_value=object()))
+
+    context.reload_governance(
+        **(_governance_config(tmp_path) | {"sql_max_length": 37})
+    )
+
+    assert context.correctness_pipeline.max_sql_length == 37
+
+
 def test_failed_governance_reload_keeps_old_registry_generator_and_config(
     tmp_path: Path,
 ):

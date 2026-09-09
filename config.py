@@ -257,6 +257,8 @@ def validate_config():
         errors.append(f"SQL_QUERY_MAX_ROWS 必须大于 0：{SQL_QUERY_MAX_ROWS}")
     if SQL_QUERY_TIMEOUT_MS <= 0:
         errors.append(f"SQL_QUERY_TIMEOUT_MS 必须大于 0：{SQL_QUERY_TIMEOUT_MS}")
+    if SQL_MAX_LENGTH <= 0:
+        errors.append(f"SQL_MAX_LENGTH 必须大于 0：{SQL_MAX_LENGTH}")
     if SQL_REPAIR_MAX_ATTEMPTS not in (0, 1):
         errors.append(
             "SQL_REPAIR_MAX_ATTEMPTS 必须是 0 或 1："

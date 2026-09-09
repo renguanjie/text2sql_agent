@@ -284,6 +284,7 @@ class ApplicationContext:
                 preflight=preflight,
                 max_repair_attempts=config.get('sql_repair_max_attempts', 1),
                 blocked_tables=tuple(config.get('sql_blocked_tables') or ()),
+                max_sql_length=config.get('sql_max_length', 2000),
             )
             return registry, pipeline
         except Exception as exc:
