@@ -28,6 +28,11 @@ source .venv/bin/activate
 | `SQL_EXPLAIN_TIMEOUT_MS` | `3000` | 必须大于 `0`，单位毫秒。 |
 | `SQL_EXPLAIN_MAX_ESTIMATED_ROWS` | `0` | 不得为负；`0` 表示不因估算扫描行数拒绝。 |
 
+所有布尔环境变量只接受不区分大小写的 `true` 或 `false`（允许首尾空白）；
+`1`、`0`、`yes`、`on` 及拼写错误都会让启动或热重载失败。错误只指出变量名，
+不会回显环境变量值。语义治理或 `EXPLAIN` 任一开启时，`SQL_DIALECT` 必须为
+`mysql`；二者都关闭时仍可使用其他受旧链路支持的方言，例如 `postgres`。
+
 首版只接受 `schema_version: 1`、`dialect: mysql`，且 `model_version` 必须是严格的 `MAJOR.MINOR.PATCH`。模型字段角色限定为 `identifier`、`dimension`、`measure`、`time`。治理源、编译快照、Golden 用例都不得包含凭据或真实业务值。
 
 ## 2. 作者 → 校验/编译 → 激活

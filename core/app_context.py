@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Any
 from loguru import logger
 
+from core.config_validation import RuntimeConfigurationError, validate_runtime_config
 from core.utils.log_sanitizer import log_safe_exception
 
 
@@ -90,6 +91,7 @@ class ApplicationContext:
         logger.info("开始初始化系统组件...")
 
         try:
+            self._validate_candidate_config(self.config)
             self._init_llm()
             self._init_neo4j()
             self._init_mysql()
@@ -236,16 +238,16 @@ class ApplicationContext:
             return model_dir
         return Path(__file__).resolve().parents[1] / model_dir
 
+    @staticmethod
+    def _validate_candidate_config(config: Dict[str, Any]) -> None:
+        try:
+            validate_runtime_config(config)
+        except RuntimeConfigurationError as exc:
+            raise ApplicationConfigurationError(str(exc)) from None
+
     def _build_governance_components(self, config: Dict[str, Any]):
         """Compile and validate a complete candidate pair before publication."""
-        if (
-            config.get('sql_explain_enabled', False)
-            and not config.get('semantic_governance_enabled', False)
-        ):
-            raise ApplicationConfigurationError(
-                "SQL_EXPLAIN_ENABLED=true 要求 "
-                "SEMANTIC_GOVERNANCE_ENABLED=true"
-            )
+        self._validate_candidate_config(config)
         if not config.get('semantic_governance_enabled', False):
             return None, None
 
@@ -337,6 +339,7 @@ class ApplicationContext:
         from core.llm_factory import create_llm
 
         candidate_config = {**self.config, **updates}
+        self._validate_candidate_config(candidate_config)
         candidate_llm = create_llm(
             provider=candidate_config.get('llm_provider', 'openai'),
             model=candidate_config.get('llm_model', 'gpt-4'),
@@ -368,6 +371,7 @@ class ApplicationContext:
         from core.retrieval.bm25_tfidf import KnowledgeRetriever
 
         candidate_config = {**self.config, **updates}
+        self._validate_candidate_config(candidate_config)
         candidate_embedding = EmbeddingFactory(
             provider=candidate_config.get('embedding_provider', 'dashscope'),
             model=candidate_config.get('embedding_model', 'text-embedding-v1'),

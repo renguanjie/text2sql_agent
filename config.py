@@ -5,7 +5,10 @@
 import os
 from pathlib import Path
 from urllib.parse import quote_plus
+
 from dotenv import load_dotenv
+
+from core.config_validation import parse_env_bool, validate_runtime_config
 
 # 加载环境变量
 load_dotenv()
@@ -109,7 +112,7 @@ MYSQL_URI = (
 )
 
 # ==================== Neo4j 配置 ====================
-NEO4J_ENABLED = os.getenv("NEO4J_ENABLED", "false").lower() == "true"
+NEO4J_ENABLED = parse_env_bool("NEO4J_ENABLED", False)
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j@123")
@@ -145,10 +148,10 @@ BM25_WEIGHT = float(os.getenv("BM25_WEIGHT", 0.6))
 DENSE_WEIGHT = float(os.getenv("DENSE_WEIGHT", 0.4))
 
 # FAISS 向量检索配置
-FAISS_ENABLED = os.getenv("FAISS_ENABLED", "true").lower() == "true"
+FAISS_ENABLED = parse_env_bool("FAISS_ENABLED", True)
 FAISS_EMBEDDING_DIM = int(os.getenv("FAISS_EMBEDDING_DIM", "1024"))  # bge-m3 dense 维度
 FAISS_INDEX_TYPE = os.getenv("FAISS_INDEX_TYPE", "flat")  # flat, ivf, hnsw
-INDEX_CACHE_ENABLED = os.getenv("INDEX_CACHE_ENABLED", "false").lower() == "true"
+INDEX_CACHE_ENABLED = parse_env_bool("INDEX_CACHE_ENABLED", False)
 INDEX_CACHE_DIR = os.getenv("INDEX_CACHE_DIR", str(PROJECT_ROOT / "data" / "index_cache"))
 
 # ==================== Embedding 配置 ====================
@@ -160,7 +163,7 @@ EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "")  # 可选 API Base URL
 
 # ==================== Few-Shot 配置 ====================
 # 动态 Few-Shot 示例检索配置
-FEW_SHOT_ENABLED = os.getenv("FEW_SHOT_ENABLED", "true").lower() == "true"
+FEW_SHOT_ENABLED = parse_env_bool("FEW_SHOT_ENABLED", True)
 FEW_SHOT_TOP_K = int(os.getenv("FEW_SHOT_TOP_K", "3"))  # 检索示例数量
 FEW_SHOT_MIN_SIMILARITY = float(os.getenv("FEW_SHOT_MIN_SIMILARITY", "0.5"))  # 最小相似度阈值
 
@@ -168,10 +171,10 @@ FEW_SHOT_MIN_SIMILARITY = float(os.getenv("FEW_SHOT_MIN_SIMILARITY", "0.5"))  # 
 # SQLFluff 配置
 SQL_DIALECT = os.getenv("SQL_DIALECT", "mysql")
 SQL_MAX_LENGTH = int(os.getenv("SQL_MAX_LENGTH", 2000))
-SQL_VALIDATION_ENABLED = os.getenv("SQL_VALIDATION_ENABLED", "true").lower() == "true"
+SQL_VALIDATION_ENABLED = parse_env_bool("SQL_VALIDATION_ENABLED", True)
 SQL_QUERY_MAX_ROWS = int(os.getenv("SQL_QUERY_MAX_ROWS", "500"))
 SQL_QUERY_TIMEOUT_MS = int(os.getenv("SQL_QUERY_TIMEOUT_MS", "10000"))
-SQL_SCOPE_ENFORCEMENT = os.getenv("SQL_SCOPE_ENFORCEMENT", "true").lower() == "true"
+SQL_SCOPE_ENFORCEMENT = parse_env_bool("SQL_SCOPE_ENFORCEMENT", True)
 SQL_BLOCKED_TABLES = [
     value.strip() for value in os.getenv(
         "SQL_BLOCKED_TABLES",
@@ -180,15 +183,15 @@ SQL_BLOCKED_TABLES = [
 ]
 
 # 语义治理与执行预检（默认关闭以保持旧调用行为）
-SEMANTIC_GOVERNANCE_ENABLED = (
-    os.getenv("SEMANTIC_GOVERNANCE_ENABLED", "false").lower() == "true"
+SEMANTIC_GOVERNANCE_ENABLED = parse_env_bool(
+    "SEMANTIC_GOVERNANCE_ENABLED", False
 )
 SEMANTIC_MODEL_DIR = os.getenv("SEMANTIC_MODEL_DIR", "semantic_models")
 SEMANTIC_DATASOURCE = os.getenv("SEMANTIC_DATASOURCE", "default")
 SEMANTIC_CONTEXT_MAX_CHARS = int(os.getenv("SEMANTIC_CONTEXT_MAX_CHARS", "2400"))
 SEMANTIC_CONTEXT_MAX_ITEMS = int(os.getenv("SEMANTIC_CONTEXT_MAX_ITEMS", "24"))
 SQL_REPAIR_MAX_ATTEMPTS = int(os.getenv("SQL_REPAIR_MAX_ATTEMPTS", "1"))
-SQL_EXPLAIN_ENABLED = os.getenv("SQL_EXPLAIN_ENABLED", "false").lower() == "true"
+SQL_EXPLAIN_ENABLED = parse_env_bool("SQL_EXPLAIN_ENABLED", False)
 SQL_EXPLAIN_TIMEOUT_MS = int(os.getenv("SQL_EXPLAIN_TIMEOUT_MS", "3000"))
 SQL_EXPLAIN_MAX_ESTIMATED_ROWS = int(
     os.getenv("SQL_EXPLAIN_MAX_ESTIMATED_ROWS", "0")
@@ -200,20 +203,34 @@ LOG_FILE = PROJECT_ROOT / "logs" / "app.log"
 
 # ==================== 应用配置 ====================
 STREAMLIT_SERVER_PORT = int(os.getenv("STREAMLIT_SERVER_PORT", "8501"))
-STREAMLIT_HEAD = os.getenv("STREAMLIT_HEAD", "true").lower() == "true"
+STREAMLIT_HEAD = parse_env_bool("STREAMLIT_HEAD", True)
 
 # ==================== 历史配置 ====================
 # 历史记录保留条数
 HISTORY_MAX_RECORDS = int(os.getenv("HISTORY_MAX_RECORDS", 1000))
 # 自动保存历史记录
-HISTORY_AUTO_SAVE = os.getenv("HISTORY_AUTO_SAVE", "true").lower() == "true"
+HISTORY_AUTO_SAVE = parse_env_bool("HISTORY_AUTO_SAVE", True)
 
 
 # ==================== 配置验证 ====================
 def validate_config():
     """验证配置参数的有效性，在模块加载时执行"""
+    validate_runtime_config(
+        {
+            "neo4j_enabled": NEO4J_ENABLED,
+            "faiss_enabled": FAISS_ENABLED,
+            "index_cache_enabled": INDEX_CACHE_ENABLED,
+            "few_shot_enabled": FEW_SHOT_ENABLED,
+            "sql_validation_enabled": SQL_VALIDATION_ENABLED,
+            "sql_scope_enforcement": SQL_SCOPE_ENFORCEMENT,
+            "semantic_governance_enabled": SEMANTIC_GOVERNANCE_ENABLED,
+            "sql_explain_enabled": SQL_EXPLAIN_ENABLED,
+            "streamlit_head": STREAMLIT_HEAD,
+            "history_auto_save": HISTORY_AUTO_SAVE,
+            "sql_dialect": SQL_DIALECT,
+        }
+    )
     errors = []
-    explain_dependency_error = None
 
     # 验证检索权重总和
     if abs(BM25_WEIGHT + DENSE_WEIGHT - 1.0) > 0.01:
@@ -283,12 +300,6 @@ def validate_config():
             "SQL_EXPLAIN_MAX_ESTIMATED_ROWS 不能为负："
             f"{SQL_EXPLAIN_MAX_ESTIMATED_ROWS}"
         )
-    if SQL_EXPLAIN_ENABLED and not SEMANTIC_GOVERNANCE_ENABLED:
-        explain_dependency_error = (
-            "SQL_EXPLAIN_ENABLED=true 要求 "
-            "SEMANTIC_GOVERNANCE_ENABLED=true"
-        )
-        errors.append(explain_dependency_error)
     if PROMPT_MAX_LENGTH < 1000:
         errors.append(f"PROMPT_MAX_LENGTH 不应小于 1000：{PROMPT_MAX_LENGTH}")
     if UPLOAD_MAX_BYTES <= 0 or GRAPH_MAX_NODES <= 0 or GRAPH_MAX_EDGES <= 0:
@@ -305,8 +316,6 @@ def validate_config():
         logger.error("配置验证失败：")
         for error in errors:
             logger.error(f"  - {error}")
-        if explain_dependency_error is not None:
-            raise ValueError(f"配置验证失败：{explain_dependency_error}")
         raise ValueError(f"配置验证失败，共 {len(errors)} 个错误")
 
 
