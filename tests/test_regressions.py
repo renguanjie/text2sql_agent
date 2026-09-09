@@ -4,7 +4,8 @@ import logging
 import re
 import subprocess
 import sys
-from unittest.mock import AsyncMock, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import numpy as np
 import pytest
@@ -191,7 +192,13 @@ def test_saved_history_uses_validation_state_not_extraction_state():
 
     result = generator.generate_sql("query")
 
-    assert mysql.save_sql_history.call_args.kwargs["validation_status"] == "success"
+    saved = mysql.save_sql_history.call_args.kwargs
+    assert saved["validation_status"] == "success"
+    assert saved["semantic_datasource"] is None
+    assert saved["semantic_dialect"] is None
+    assert saved["semantic_version"] is None
+    assert saved["semantic_content_sha256"] is None
+    assert saved["governance_validated"] is False
     assert result["history_id"] == 7
     generator.knowledge_retriever.add_history_record.assert_not_called()
 
@@ -516,8 +523,195 @@ def test_generator_factory_loads_only_fully_successful_history_for_few_shot():
     assert [record["id"] for record in generator.knowledge_retriever.history_records] == [7]
 
 
-def test_mysql_few_shot_query_requires_validation_and_execution_success():
+def test_governed_generator_factory_loads_only_the_current_snapshot_history():
+    """Startup must reject cross-datasource, old-content, and legacy examples."""
+    from core.embedding_factory import EmbeddingFactory
+    from core.sql.generator import create_sql_generator
+
+    current = {
+        "semantic_datasource": "sales",
+        "semantic_dialect": "mysql",
+        "semantic_version": "1.0.0",
+        "semantic_content_sha256": "a" * 64,
+        "governance_validated": True,
+    }
+    rows = [
+        {
+            "id": 1,
+            "user_query": "current",
+            "generated_sql": "SELECT 1",
+            "validation_status": "success",
+            "execution_status": "success",
+            **current,
+        },
+        {
+            "id": 2,
+            "user_query": "other datasource",
+            "generated_sql": "SELECT 2",
+            "validation_status": "success",
+            "execution_status": "success",
+            **(current | {"semantic_datasource": "finance"}),
+        },
+        {
+            "id": 3,
+            "user_query": "old version",
+            "generated_sql": "SELECT 3",
+            "validation_status": "success",
+            "execution_status": "success",
+            **(current | {"semantic_version": "0.9.0"}),
+        },
+        {
+            "id": 4,
+            "user_query": "same version changed content",
+            "generated_sql": "SELECT 4",
+            "validation_status": "success",
+            "execution_status": "success",
+            **(current | {"semantic_content_sha256": "b" * 64}),
+        },
+        {
+            "id": 5,
+            "user_query": "legacy validator",
+            "generated_sql": "SELECT 5",
+            "validation_status": "success",
+            "execution_status": "success",
+            **(current | {"governance_validated": False}),
+        },
+        {
+            "id": 6,
+            "user_query": "legacy row",
+            "generated_sql": "SELECT 6",
+            "validation_status": "success",
+            "execution_status": "success",
+        },
+    ]
+    mysql = Mock()
+    mysql.get_successful_history_for_few_shot.return_value = rows
+    neo4j = Mock()
+    neo4j.get_schema_metadata.return_value = {"tables": [], "columns": []}
+    pipeline = Mock()
+    pipeline.registry.get_snapshot.return_value = SimpleNamespace(
+        datasource="sales",
+        dialect="mysql",
+        model_version="1.0.0",
+        content_sha256="a" * 64,
+    )
+
+    generator = create_sql_generator(
+        Mock(),
+        neo4j,
+        mysql,
+        config={"few_shot_enabled": True},
+        embedding_factory=EmbeddingFactory(
+            provider="offline",
+            model="hash",
+            dimensions=8,
+        ),
+        correctness_pipeline=pipeline,
+    )
+
+    mysql.get_successful_history_for_few_shot.assert_called_once_with(
+        limit=100,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="a" * 64,
+        governance_validated=True,
+    )
+    assert [record["id"] for record in generator.knowledge_retriever.history_records] == [1]
+
+
+def test_single_few_shot_add_rejects_noncurrent_or_ungoverned_history():
+    """A single post-execution promotion gets the same identity filter as bulk startup."""
+    from core.embedding_factory import EmbeddingFactory
+    from core.history.identity import GovernedHistoryIdentity
+    from core.retrieval.bm25_tfidf import FAISS_AVAILABLE, KnowledgeRetriever
+
+    if not FAISS_AVAILABLE:
+        pytest.skip("FAISS is unavailable")
+    identity = GovernedHistoryIdentity(
+        datasource="sales",
+        dialect="mysql",
+        semantic_version="1.0.0",
+        content_sha256="a" * 64,
+    )
+    retriever = KnowledgeRetriever(
+        embedding_factory=EmbeddingFactory(
+            provider="offline",
+            model="hash",
+            dimensions=8,
+        )
+    )
+    current = {
+        "id": 1,
+        "user_query": "current",
+        "generated_sql": "SELECT 1",
+        "validation_status": "success",
+        "execution_status": "success",
+        **identity.storage_fields(validated=True),
+    }
+
+    for mismatched in (
+        current | {"id": 2, "semantic_datasource": "finance"},
+        current | {"id": 3, "semantic_dialect": "postgresql"},
+        current | {"id": 4, "semantic_version": "0.9.0"},
+        current | {"id": 5, "semantic_content_sha256": "b" * 64},
+        current | {"id": 6, "governance_validated": False},
+        {
+            key: value
+            for key, value in (current | {"id": 7}).items()
+            if not key.startswith("semantic_") and key != "governance_validated"
+        },
+    ):
+        retriever.add_history_record(
+            mismatched,
+            governance_identity=identity,
+        )
+
+    assert retriever.history_records == []
+    assert retriever.history_index is None
+
+    retriever.add_history_record(current, governance_identity=identity)
+
+    assert [record["id"] for record in retriever.history_records] == [1]
+
+
+def test_mysql_few_shot_query_requires_full_governed_identity_and_both_successes():
     """Startup candidates must have passed validation as well as execution."""
+    from core.history.mysql_client import MySQLClient
+
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    client.execute_query = Mock(return_value=[])
+
+    client.get_successful_history_for_few_shot(
+        limit=12,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="a" * 64,
+        governance_validated=True,
+    )
+
+    query, params = client.execute_query.call_args.args
+    normalized_query = " ".join(query.split()).lower()
+    assert "validation_status = 'success'" in normalized_query
+    assert "execution_status = 'success'" in normalized_query
+    assert "governance_validated = :governance_validated" in normalized_query
+    assert "semantic_datasource = :semantic_datasource" in normalized_query
+    assert "semantic_dialect = :semantic_dialect" in normalized_query
+    assert "semantic_version = :semantic_version" in normalized_query
+    assert "semantic_content_sha256 = :semantic_content_sha256" in normalized_query
+    assert params == {
+        "limit": 12,
+        "semantic_datasource": "sales",
+        "semantic_dialect": "mysql",
+        "semantic_version": "1.0.0",
+        "semantic_content_sha256": "a" * 64,
+        "governance_validated": True,
+    }
+
+
+def test_mysql_few_shot_query_preserves_ungoverned_legacy_compatibility():
+    """Governance-off startup keeps the historical dual-success behavior."""
     from core.history.mysql_client import MySQLClient
 
     client = MySQLClient("localhost", 3306, "user", "password", "database")
@@ -529,6 +723,8 @@ def test_mysql_few_shot_query_requires_validation_and_execution_success():
     normalized_query = " ".join(query.split()).lower()
     assert "validation_status = 'success'" in normalized_query
     assert "execution_status = 'success'" in normalized_query
+    assert "governance_validated =" not in normalized_query
+    assert "semantic_datasource =" not in normalized_query
     assert params == {"limit": 12}
 
 
@@ -546,6 +742,11 @@ def test_guarded_history_update_binds_session_sql_and_validation_status():
         generated_sql="SELECT 1",
         expected_user_query="original question",
         require_validation_success=True,
+        expected_semantic_datasource="sales",
+        expected_semantic_dialect="mysql",
+        expected_semantic_version="1.0.0",
+        expected_semantic_content_sha256="a" * 64,
+        require_governance_validated=True,
     )
 
     query, params = client.execute_update.call_args.args
@@ -555,9 +756,156 @@ def test_guarded_history_update_binds_session_sql_and_validation_status():
     assert "generated_sql = :generated_sql" in normalized_query
     assert "user_query = :expected_user_query" in normalized_query
     assert "validation_status = 'success'" in normalized_query
+    assert "semantic_datasource = :expected_semantic_datasource" in normalized_query
+    assert "semantic_dialect = :expected_semantic_dialect" in normalized_query
+    assert "semantic_version = :expected_semantic_version" in normalized_query
+    assert (
+        "semantic_content_sha256 = :expected_semantic_content_sha256"
+        in normalized_query
+    )
+    assert "governance_validated = 1" in normalized_query
     assert params["session_id"] == "session-a"
     assert params["generated_sql"] == "SELECT 1"
     assert params["expected_user_query"] == "original question"
+    assert params["expected_semantic_datasource"] == "sales"
+    assert params["expected_semantic_dialect"] == "mysql"
+    assert params["expected_semantic_version"] == "1.0.0"
+    assert params["expected_semantic_content_sha256"] == "a" * 64
+
+
+def test_history_governance_schema_migration_is_idempotent():
+    """Existing rows stay ungoverned while missing columns and the lookup index are added once."""
+    from core.history.mysql_client import MySQLClient
+
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    required_columns = [
+        "semantic_datasource",
+        "semantic_dialect",
+        "semantic_version",
+        "semantic_content_sha256",
+        "governance_validated",
+    ]
+    client.execute_query = Mock(
+        side_effect=[
+            [{"column_name": "id"}],
+            [],
+            [{"column_name": name} for name in ["id", *required_columns]],
+            [{"index_name": "idx_governed_few_shot"}],
+        ]
+    )
+    client.execute_update = Mock(return_value=0)
+
+    client._migrate_history_schema()
+    first_calls = list(client.execute_update.call_args_list)
+    client.execute_update.reset_mock()
+    client._migrate_history_schema()
+
+    statements = [" ".join(call.args[0].split()).lower() for call in first_calls]
+    assert len(statements) == 6
+    assert all(
+        any(f"add column {column}" in statement for statement in statements)
+        for column in required_columns
+    )
+    governance_statement = next(
+        statement for statement in statements if "add column governance_validated" in statement
+    )
+    assert "not null default 0" in governance_statement
+    assert any("add index idx_governed_few_shot" in statement for statement in statements)
+    client.execute_update.assert_not_called()
+
+
+def test_history_governance_schema_migration_tolerates_concurrent_duplicates():
+    """Concurrent startup may win the same DDL race without hiding other errors."""
+    from core.history.mysql_client import MySQLClient
+
+    class DuplicateSchemaChange(Exception):
+        def __init__(self, errno):
+            self.errno = errno
+
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    client.execute_query = Mock(
+        side_effect=[
+            [{"column_name": "id"}],
+            [],
+        ]
+    )
+    client.execute_update = Mock(
+        side_effect=[
+            *(DuplicateSchemaChange(1060) for _ in range(5)),
+            DuplicateSchemaChange(1061),
+        ]
+    )
+
+    client._migrate_history_schema()
+
+    assert client.execute_update.call_count == 6
+
+
+def test_mysql_save_history_binds_complete_governance_identity():
+    """The durable INSERT, not only the generator call, carries every identity field."""
+    from core.history.mysql_client import MySQLClient
+
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    connection = Mock()
+    connection.execute.return_value.lastrowid = 17
+
+    @contextmanager
+    def connection_context():
+        yield connection
+
+    client.get_connection = connection_context
+    client._prune_history = Mock()
+
+    history_id = client.save_sql_history(
+        user_query="订单金额",
+        generated_sql="SELECT SUM(amount) FROM orders",
+        validation_status="success",
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="a" * 64,
+        governance_validated=True,
+    )
+
+    statement, params = connection.execute.call_args.args
+    normalized_statement = " ".join(str(statement).split()).lower()
+    assert history_id == 17
+    for column in (
+        "semantic_datasource",
+        "semantic_dialect",
+        "semantic_version",
+        "semantic_content_sha256",
+        "governance_validated",
+    ):
+        assert column in normalized_statement
+        assert column in params
+    assert params["semantic_datasource"] == "sales"
+    assert params["semantic_dialect"] == "mysql"
+    assert params["semantic_version"] == "1.0.0"
+    assert params["semantic_content_sha256"] == "a" * 64
+    assert params["governance_validated"] is True
+
+
+def test_mysql_connect_migrates_history_before_reporting_success(monkeypatch):
+    """A restarted process must migrate an existing history table before it can load it."""
+    from core.history import mysql_client as mysql_module
+
+    engine = MagicMock()
+    monkeypatch.setattr(mysql_module, "create_engine", Mock(return_value=engine))
+    client = mysql_module.MySQLClient(
+        "localhost",
+        3306,
+        "user",
+        "password",
+        "database",
+    )
+    events = []
+    client._migrate_history_schema = lambda: events.append("migrated")
+
+    connected = client.connect()
+
+    assert connected is True
+    assert events == ["migrated"]
 
 
 def test_history_update_preserves_legacy_seven_positional_arguments():

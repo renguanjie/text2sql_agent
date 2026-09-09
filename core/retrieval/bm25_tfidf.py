@@ -18,6 +18,7 @@ except ImportError:
 
 # 导入 Embedding 工厂
 from ..embedding_factory import EmbeddingFactory
+from ..history.identity import GovernedHistoryIdentity
 
 
 def _default_embedding_factory() -> EmbeddingFactory:
@@ -558,7 +559,12 @@ class KnowledgeRetriever:
         self.retriever.index_documents(documents, metadata)
         logger.info(f"知识库索引构建完成，共 {len(documents)} 个节点")
 
-    def build_few_shot_index(self, history_records: List[Dict]):
+    def build_few_shot_index(
+        self,
+        history_records: List[Dict],
+        *,
+        governance_identity: GovernedHistoryIdentity | None = None,
+    ):
         """
         从历史成功记录构建 Few-Shot 示例索引
 
@@ -578,6 +584,10 @@ class KnowledgeRetriever:
             r for r in history_records
             if r.get('validation_status') == 'success'
             and r.get('execution_status') == 'success'
+            and (
+                governance_identity is None
+                or governance_identity.matches(r)
+            )
         ]
 
         if len(successful_records) < 1:
@@ -653,7 +663,12 @@ class KnowledgeRetriever:
         logger.info(f"检索到 {len(examples)} 个 Few-Shot 示例")
         return examples
 
-    def add_history_record(self, record: Dict):
+    def add_history_record(
+        self,
+        record: Dict,
+        *,
+        governance_identity: GovernedHistoryIdentity | None = None,
+    ):
         """
         添加单条历史记录到 Few-Shot 索引
 
@@ -667,6 +682,10 @@ class KnowledgeRetriever:
         if (
             record.get('validation_status') != 'success'
             or record.get('execution_status') != 'success'
+            or (
+                governance_identity is not None
+                and not governance_identity.matches(record)
+            )
         ):
             return
 

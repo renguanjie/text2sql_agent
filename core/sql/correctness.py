@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from hmac import compare_digest
 from threading import Lock
 from time import monotonic
 from typing import Any, Literal
 
+from ..history.identity import GovernedHistoryIdentity
 from ..semantic.context import SemanticContextBuilder, SemanticPromptBundle
 from ..semantic.models import (
     CorrectnessResult,
@@ -23,7 +25,6 @@ from ..semantic.validator import SemanticSQLValidator
 from ..utils.log_sanitizer import log_safe_exception
 from .preflight import MySQLExplainPreflight
 from .validator import validate_query_scope, validate_sql
-
 
 _CORRECTNESS_UNAVAILABLE = ValidationIssue(
     code="CORRECTNESS_UNAVAILABLE",
@@ -114,6 +115,9 @@ class CorrectnessPipeline:
             _CorrectnessRequest, _PreparedState
         ] = OrderedDict()
         self._prepared_lock = Lock()
+        self._authorized_history_identity: ContextVar[
+            tuple[int, GovernedHistoryIdentity] | None
+        ] = ContextVar("authorized_history_identity", default=None)
 
     def prepare_generation(self, question: str) -> _CorrectnessRequest:
         """Pin and render the immutable snapshot used by one generation request."""
@@ -147,6 +151,19 @@ class CorrectnessPipeline:
             state.snapshot.model_version,
             state.snapshot.content_sha256,
         )
+
+    def describe_prepared_history_identity(
+        self, request: Any
+    ) -> GovernedHistoryIdentity:
+        """Return the persisted identity of the exact snapshot pinned by a live token."""
+        if not isinstance(request, _CorrectnessRequest):
+            raise ValueError("prepared correctness request is invalid or expired")
+        with self._prepared_lock:
+            self._prune_prepared_locked(self._clock())
+            state = self._prepared_requests.get(request)
+        if state is None:
+            raise ValueError("prepared correctness request is invalid or expired")
+        return GovernedHistoryIdentity.from_snapshot(state.snapshot)
 
     def process(
         self,
@@ -301,11 +318,49 @@ class CorrectnessPipeline:
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
+        """Authorize execution against the current semantic snapshot."""
+        result, identity = self._authorize_execution_with_history_identity(
+            question=question,
+            sql=sql,
+            expected_semantic_version=expected_semantic_version,
+            expected_content_sha256=expected_content_sha256,
+            allowed_tables=allowed_tables,
+            allowed_schemas=allowed_schemas,
+        )
+        self._authorized_history_identity.set(
+            (id(result), identity)
+            if result.executable and identity is not None
+            else None
+        )
+        return result
+
+    def take_authorization_history_identity(
+        self, authorization: CorrectnessResult
+    ) -> GovernedHistoryIdentity | None:
+        """Consume the identity paired with this context's latest authorization."""
+        stored = self._authorized_history_identity.get()
+        if stored is None or stored[0] != id(authorization):
+            return None
+        self._authorized_history_identity.set(None)
+        return stored[1]
+
+    def _authorize_execution_with_history_identity(
+        self,
+        question: str,
+        sql: str,
+        expected_semantic_version: str,
+        expected_content_sha256: str | None = None,
+        allowed_tables: tuple[str, ...] = (),
+        allowed_schemas: tuple[str, ...] = (),
+    ) -> tuple[CorrectnessResult, GovernedHistoryIdentity | None]:
+        """Authorize execution and return the identity of the exact snapshot used."""
         try:
             snapshot = self.registry.get_snapshot()
         except Exception as exc:
             self._log_internal_failure("snapshot", exc)
-            return self._error_result(sql, None, 0)
+            return self._error_result(sql, None, 0), None
+
+        identity = GovernedHistoryIdentity.from_snapshot(snapshot)
 
         if snapshot.model_version != expected_semantic_version:
             validation = ValidationReport(
@@ -318,7 +373,7 @@ class CorrectnessPipeline:
                     ),
                 ),
             )
-            return self._result(sql, snapshot, validation, 0)
+            return self._result(sql, snapshot, validation, 0), identity
 
         if (
             not isinstance(expected_content_sha256, str)
@@ -334,7 +389,7 @@ class CorrectnessPipeline:
                     ),
                 ),
             )
-            return self._result(sql, snapshot, validation, 0)
+            return self._result(sql, snapshot, validation, 0), identity
 
         try:
             validation = self._validate_once(
@@ -349,8 +404,8 @@ class CorrectnessPipeline:
             self._log_internal_failure("authorization", exc)
             return self._error_result(
                 sql, snapshot.model_version, 0, snapshot.content_sha256
-            )
-        return self._result(sql, snapshot, validation, 0)
+            ), identity
+        return self._result(sql, snapshot, validation, 0), identity
 
     def _pin_request(
         self, question: str

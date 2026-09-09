@@ -27,7 +27,6 @@ from core.semantic.models import (
 from core.semantic.validator import SemanticSQLValidator
 from core.sql.correctness import CorrectnessPipeline
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -651,6 +650,11 @@ def test_governed_history_is_saved_after_rejection_with_only_structured_codes():
     assert saved["generated_sql"] == "SELECT COUNT(*) FROM orders"
     assert saved["validation_status"] == "fail"
     assert saved["validation_error"] == "METRIC_MISMATCH"
+    assert saved["semantic_datasource"] == "sales"
+    assert saved["semantic_dialect"] == "mysql"
+    assert saved["semantic_version"] == "1.0.0"
+    assert saved["semantic_content_sha256"] == "1" * 64
+    assert saved["governance_validated"] is False
     generator.knowledge_retriever.add_history_record.assert_not_called()
     assert not generator._governed_history_bindings
 
@@ -799,6 +803,48 @@ def test_concurrent_governed_history_execution_consumes_binding_once():
     assert mysql.update_sql_execution.call_count == 1
 
 
+def test_governed_history_persists_the_pinned_snapshot_identity_without_exposing_hash():
+    """Generation saves the pinned content hash even when the registry later changes."""
+    pipeline, registry = _changing_pipeline()
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+
+    result = generator.generate_sql("订单金额", session_id="session-a")
+
+    saved = mysql.save_sql_history.call_args.kwargs
+    assert saved["semantic_datasource"] == "sales"
+    assert saved["semantic_dialect"] == "mysql"
+    assert saved["semantic_version"] == "1.0.0"
+    assert saved["semantic_content_sha256"] == "1" * 64
+    assert saved["governance_validated"] is True
+    assert "semantic_content_sha256" not in result
+    assert registry.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_governed_history_persists_the_pinned_snapshot_identity():
+    """The async save path must persist the same pinned content identity."""
+    pipeline, registry = _changing_pipeline()
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+
+    result = await generator.generate_sql_async(
+        "订单金额",
+        session_id="session-a",
+    )
+
+    saved = mysql.save_sql_history.call_args.kwargs
+    assert saved["semantic_datasource"] == "sales"
+    assert saved["semantic_dialect"] == "mysql"
+    assert saved["semantic_version"] == "1.0.0"
+    assert saved["semantic_content_sha256"] == "1" * 64
+    assert saved["governance_validated"] is True
+    assert "semantic_content_sha256" not in result
+    assert registry.calls == 1
+
+
 def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:
     return {
         "id": 17,
@@ -807,6 +853,11 @@ def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:
         "generated_sql": sql,
         "validation_status": "success",
         "execution_status": "success",
+        "semantic_datasource": "sales",
+        "semantic_dialect": "mysql",
+        "semantic_version": "1.0.0",
+        "semantic_content_sha256": "1" * 64,
+        "governance_validated": True,
     }
 
 
@@ -817,6 +868,11 @@ def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:
         ({"sql": "SELECT SUM(amount) AS total FROM orders"}, {}),
         ({"user_query": "查询订单号"}, {}),
         ({"semantic_version": "9.9.9"}, {}),
+        ({}, {"semantic_datasource": "finance"}),
+        ({}, {"semantic_dialect": "postgresql"}),
+        ({}, {"semantic_version": "0.9.0"}),
+        ({}, {"semantic_content_sha256": "2" * 64}),
+        ({}, {"governance_validated": False}),
         (
             {"sql": "SELECT SUM(amount) FROM orders"},
             {
@@ -831,6 +887,11 @@ def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:
         "sql_mismatch",
         "question_mismatch",
         "semantic_version_mismatch",
+        "persisted_datasource_mismatch",
+        "persisted_dialect_mismatch",
+        "persisted_version_mismatch",
+        "persisted_content_mismatch",
+        "legacy_validation_source",
         "rejected_history_with_legal_sql",
     ],
 )
@@ -885,6 +946,7 @@ def test_governed_success_updates_and_promotes_only_the_bound_history():
     mysql.execute_query_limited.return_value = ([{"total": 10}], False)
     generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
     generated = generator.generate_sql("订单金额", session_id="session-a")
+    governance_identity = generator._governed_history_bindings[17].identity
     mysql.reset_mock()
     mysql.get_history_detail.return_value = _successful_history(sql=generated["sql"])
     mysql.execute_query_limited.return_value = ([{"total": 10}], False)
@@ -907,9 +969,16 @@ def test_governed_success_updates_and_promotes_only_the_bound_history():
     assert update["generated_sql"] == generated["sql"]
     assert update["expected_user_query"] == "订单金额"
     assert update["require_validation_success"] is True
+    assert update["expected_semantic_datasource"] == "sales"
+    assert update["expected_semantic_dialect"] == "mysql"
+    assert update["expected_semantic_version"] == "1.0.0"
+    assert update["expected_semantic_content_sha256"] == "1" * 64
+    assert update["require_governance_validated"] is True
     generator.knowledge_retriever.add_history_record.assert_called_once_with(
-        mysql.get_history_detail.return_value
+        mysql.get_history_detail.return_value,
+        governance_identity=governance_identity,
     )
+    assert 17 not in generator._governed_history_bindings
 
 
 def test_history_question_changed_after_read_cannot_be_updated_or_promoted():
@@ -948,12 +1017,46 @@ def test_history_question_changed_after_read_cannot_be_updated_or_promoted():
     generator.knowledge_retriever.add_history_record.assert_not_called()
 
 
-def test_restarted_generator_fails_closed_for_old_governed_history_id():
-    """A process-local semantic binding cannot be inferred from legacy columns."""
+def test_restarted_generator_uses_complete_persisted_governance_identity():
+    """A restart can safely bind a row that carries the complete current snapshot identity."""
     mysql = Mock()
     mysql.get_history_detail.return_value = _successful_history(
         sql="SELECT SUM(amount) FROM orders"
     )
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+    mysql.update_sql_execution.return_value = True
+    restarted = _generator(pipeline=_pipeline(), mysql_client=mysql)
+
+    result = restarted.execute_sql(
+        "SELECT SUM(amount) FROM orders",
+        history_id=17,
+        session_id="session-a",
+        allowed_tables=["orders"],
+        allowed_schemas=[],
+        user_query="订单金额",
+        semantic_version="1.0.0",
+        content_sha256="1" * 64,
+    )
+
+    assert result["status"] == "success"
+    mysql.execute_query_limited.assert_called_once()
+    mysql.update_sql_execution.assert_called_once()
+    restarted.knowledge_retriever.add_history_record.assert_called_once()
+
+
+def test_restarted_generator_fails_closed_for_old_governed_history_id():
+    """A persisted row without the complete identity cannot authorize execution."""
+    mysql = Mock()
+    history = _successful_history(sql="SELECT SUM(amount) FROM orders")
+    for field in (
+        "semantic_datasource",
+        "semantic_dialect",
+        "semantic_version",
+        "semantic_content_sha256",
+        "governance_validated",
+    ):
+        history.pop(field)
+    mysql.get_history_detail.return_value = history
     restarted = _generator(pipeline=_pipeline(), mysql_client=mysql)
 
     result = restarted.execute_sql(
@@ -974,6 +1077,72 @@ def test_restarted_generator_fails_closed_for_old_governed_history_id():
     mysql.execute_query_limited.assert_not_called()
     mysql.update_sql_execution.assert_not_called()
     restarted.knowledge_retriever.add_history_record.assert_not_called()
+
+
+def test_restarted_generator_rejects_legacy_history_without_governance_identity():
+    """A legacy dual-success row cannot become governed Few-Shot after restart."""
+    mysql = Mock()
+    history = _successful_history(sql="SELECT SUM(amount) FROM orders")
+    for field in (
+        "semantic_datasource",
+        "semantic_dialect",
+        "semantic_version",
+        "semantic_content_sha256",
+        "governance_validated",
+    ):
+        history.pop(field)
+    mysql.get_history_detail.return_value = history
+    restarted = _generator(pipeline=_pipeline(), mysql_client=mysql)
+
+    result = restarted.execute_sql(
+        "SELECT SUM(amount) FROM orders",
+        history_id=17,
+        session_id="session-a",
+        allowed_tables=["orders"],
+        allowed_schemas=[],
+        user_query="订单金额",
+        semantic_version="1.0.0",
+        content_sha256="1" * 64,
+    )
+
+    assert result["status"] == "error"
+    assert result["validation"]["issues"][0]["code"] == (
+        "HISTORY_CONTEXT_MISMATCH"
+    )
+    mysql.execute_query_limited.assert_not_called()
+    mysql.update_sql_execution.assert_not_called()
+    restarted.knowledge_retriever.add_history_record.assert_not_called()
+
+
+def test_execution_rejects_history_when_snapshot_changes_after_authorization():
+    """The history binding must use the exact snapshot that authorized execution."""
+    pipeline, _registry = _changing_pipeline()
+    mysql = Mock()
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    ) | {"semantic_content_sha256": "2" * 64}
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+    mysql.update_sql_execution.return_value = True
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+
+    result = generator.execute_sql(
+        "SELECT SUM(amount) FROM orders",
+        history_id=17,
+        session_id="session-a",
+        allowed_tables=["orders"],
+        allowed_schemas=[],
+        user_query="订单金额",
+        semantic_version="1.0.0",
+        content_sha256="1" * 64,
+    )
+
+    assert result["status"] == "error"
+    assert result["validation"]["issues"][0]["code"] == (
+        "HISTORY_CONTEXT_MISMATCH"
+    )
+    mysql.execute_query_limited.assert_not_called()
+    mysql.update_sql_execution.assert_not_called()
+    generator.knowledge_retriever.add_history_record.assert_not_called()
 
 
 def test_disabled_governance_preserves_legacy_result_shape_and_chain_call():
@@ -1378,6 +1547,9 @@ def test_governance_reload_builds_candidate_then_atomically_replaces_pair(
     context._knowledge_retriever = Mock()
     context._sql_chain = Mock()
     context._mysql_client = Mock()
+    context._mysql_client.get_table_schema.return_value = []
+    context._mysql_client.get_successful_history_for_few_shot.return_value = []
+    context._embedding_factory = Mock()
     old_registry = object()
     old_generator = object()
     context._semantic_registry = old_registry
@@ -1407,7 +1579,7 @@ def test_governance_pipeline_receives_configured_sql_max_length(
 
     _write_model(tmp_path / "sales.yaml")
     context = ApplicationContext({"semantic_governance_enabled": False})
-    context._mysql_client = Mock()
+    context._mysql_client = Mock(engine=None)
     context._llm = Mock()
     context._knowledge_retriever = Mock()
     context._sql_chain = Mock()
@@ -1418,6 +1590,113 @@ def test_governance_pipeline_receives_configured_sql_max_length(
     )
 
     assert context.correctness_pipeline.max_sql_length == 37
+
+
+@pytest.mark.parametrize("loader", ["startup", "bulk"])
+def test_application_history_loaders_scope_governed_few_shot_to_current_snapshot(loader):
+    """Both initialization and retriever rebuilds must pass the full active identity."""
+    from core.app_context import ApplicationContext
+
+    context = ApplicationContext({"few_shot_enabled": True})
+    context._mysql_client = Mock(engine=object())
+    context._mysql_client.get_successful_history_for_few_shot.return_value = []
+    context._mysql_client.get_table_schema.return_value = []
+    context._knowledge_retriever = Mock()
+    context._correctness_pipeline = _pipeline()
+
+    if loader == "startup":
+        context._load_few_shot_history()
+        retriever = context._knowledge_retriever
+    else:
+        retriever = Mock()
+        context._populate_retriever(retriever, {"few_shot_enabled": True})
+
+    context._mysql_client.get_successful_history_for_few_shot.assert_called_once_with(
+        limit=100,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="1" * 64,
+        governance_validated=True,
+    )
+    identity = retriever.build_few_shot_index.call_args.kwargs[
+        "governance_identity"
+    ]
+    assert (
+        identity.datasource,
+        identity.dialect,
+        identity.semantic_version,
+        identity.content_sha256,
+    ) == ("sales", "mysql", "1.0.0", "1" * 64)
+
+
+def test_application_history_loader_keeps_governance_off_compatibility():
+    """A governance-off index uses the legacy query and receives no governed identity."""
+    from core.app_context import ApplicationContext
+
+    context = ApplicationContext({"few_shot_enabled": True})
+    context._mysql_client = Mock(engine=object())
+    context._mysql_client.get_successful_history_for_few_shot.return_value = []
+    context._knowledge_retriever = Mock()
+    context._correctness_pipeline = None
+
+    context._load_few_shot_history()
+
+    context._mysql_client.get_successful_history_for_few_shot.assert_called_once_with(
+        limit=100
+    )
+    context._knowledge_retriever.build_few_shot_index.assert_called_once_with([])
+
+
+def test_governance_reload_rebuilds_few_shot_with_candidate_identity(monkeypatch):
+    """Reload may not retain Few-Shot examples from the previously active snapshot."""
+    from core.app_context import ApplicationContext
+
+    old_snapshot = _snapshot().model_copy(update={"content_sha256": "2" * 64})
+    old_pipeline = CorrectnessPipeline(
+        registry=StaticRegistry(old_snapshot),
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+    )
+    candidate_pipeline = _pipeline()
+    candidate_retriever = Mock()
+    candidate_retriever.retriever = Mock()
+    candidate_generator = object()
+    context = ApplicationContext({"few_shot_enabled": True})
+    context._mysql_client = Mock(engine=object())
+    context._mysql_client.get_table_schema.return_value = []
+    context._mysql_client.get_successful_history_for_few_shot.return_value = []
+    context._embedding_factory = Mock()
+    context._knowledge_retriever = object()
+    context._sql_chain = Mock()
+    context._correctness_pipeline = old_pipeline
+    context._semantic_registry = old_pipeline.registry
+    context._build_governance_components = Mock(
+        return_value=(candidate_pipeline.registry, candidate_pipeline)
+    )
+    context._build_sql_generator = Mock(return_value=candidate_generator)
+    monkeypatch.setattr(
+        "core.retrieval.bm25_tfidf.KnowledgeRetriever",
+        Mock(return_value=candidate_retriever),
+    )
+
+    context.reload_governance(semantic_governance_enabled=True)
+
+    context._mysql_client.get_successful_history_for_few_shot.assert_called_once_with(
+        limit=100,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="1" * 64,
+        governance_validated=True,
+    )
+    candidate_retriever.build_few_shot_index.assert_called_once()
+    identity = candidate_retriever.build_few_shot_index.call_args.kwargs[
+        "governance_identity"
+    ]
+    assert identity.content_sha256 == "1" * 64
+    assert context.knowledge_retriever is candidate_retriever
+    assert context.sql_generator is candidate_generator
 
 
 def test_failed_governance_reload_keeps_old_registry_generator_and_config(

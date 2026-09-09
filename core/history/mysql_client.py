@@ -4,6 +4,8 @@ MySQL 数据库客户端
 """
 from typing import Dict, List, Optional, Any
 from contextlib import contextmanager
+import re
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.pool import QueuePool
@@ -14,6 +16,33 @@ from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
 from ..sql.preflight import ExplainDeadlineExceeded, run_with_wall_clock_deadline
 import json
 import uuid
+
+_SEMANTIC_CONTENT_SHA256 = re.compile(r"[0-9a-f]{64}")
+_HISTORY_GOVERNANCE_COLUMNS = (
+    (
+        "semantic_datasource",
+        "VARCHAR(191) NULL COMMENT '语义治理数据源'",
+    ),
+    (
+        "semantic_dialect",
+        "VARCHAR(32) NULL COMMENT '语义治理 SQL 方言'",
+    ),
+    (
+        "semantic_version",
+        "VARCHAR(64) NULL COMMENT '语义模型版本'",
+    ),
+    (
+        "semantic_content_sha256",
+        "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL "
+        "COMMENT '语义快照内容 SHA-256'",
+    ),
+    (
+        "governance_validated",
+        "TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否通过语义治理校验'",
+    ),
+)
+_GOVERNED_FEW_SHOT_INDEX = "idx_governed_few_shot"
+_DUPLICATE_SCHEMA_CHANGE_CODES = frozenset((1060, 1061))
 
 
 class MySQLClient:
@@ -80,6 +109,7 @@ class MySQLClient:
             # 验证连接
             with self.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
+            self._migrate_history_schema()
             logger.info(f"MySQL 连接池初始化成功：{self.host}:{self.port}/{self.database}, "
                        f"pool_size={self.pool_size}, max_overflow={self.max_overflow}")
             return True
@@ -89,6 +119,87 @@ class MySQLClient:
                 self.engine = None
             logger.error(f"MySQL 连接池初始化失败：{e}")
             return False
+
+    def _migrate_history_schema(self) -> None:
+        """Idempotently add governed-history identity columns to an existing table."""
+        column_rows = self.execute_query(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = :database_name
+              AND TABLE_NAME = 'sql_generation_history'
+            """,
+            {"database_name": self.database},
+            raise_on_error=True,
+        )
+        existing_columns = {
+            row.get("column_name") for row in column_rows if row.get("column_name")
+        }
+        for column_name, definition in _HISTORY_GOVERNANCE_COLUMNS:
+            if column_name not in existing_columns:
+                self._apply_history_schema_change(
+                    "ALTER TABLE sql_generation_history "
+                    f"ADD COLUMN {column_name} {definition}",
+                )
+
+        index_rows = self.execute_query(
+            """
+            SELECT DISTINCT INDEX_NAME AS index_name
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = :database_name
+              AND TABLE_NAME = 'sql_generation_history'
+            """,
+            {"database_name": self.database},
+            raise_on_error=True,
+        )
+        existing_indexes = {
+            row.get("index_name") for row in index_rows if row.get("index_name")
+        }
+        if _GOVERNED_FEW_SHOT_INDEX not in existing_indexes:
+            self._apply_history_schema_change(
+                """
+                ALTER TABLE sql_generation_history
+                ADD INDEX idx_governed_few_shot
+                (governance_validated, semantic_datasource, semantic_dialect,
+                 semantic_version, semantic_content_sha256,
+                 validation_status, execution_status, created_at)
+                """,
+            )
+
+    def _apply_history_schema_change(self, query: str) -> None:
+        """Apply a migration DDL statement while tolerating only a concurrent winner."""
+        try:
+            self.execute_update(query, raise_on_error=True)
+        except Exception as exc:
+            if not self._is_duplicate_schema_change(exc):
+                raise
+            logger.info("历史治理迁移已由并发启动完成")
+
+    @staticmethod
+    def _is_duplicate_schema_change(error: Exception) -> bool:
+        """Recognize MySQL's duplicate-column and duplicate-index error codes."""
+        pending = [error]
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            if getattr(current, "errno", None) in _DUPLICATE_SCHEMA_CHANGE_CODES:
+                return True
+            if any(
+                value in _DUPLICATE_SCHEMA_CHANGE_CODES
+                for value in getattr(current, "args", ())
+            ):
+                return True
+            pending.extend(
+                (
+                    getattr(current, "orig", None),
+                    getattr(current, "__cause__", None),
+                    getattr(current, "__context__", None),
+                )
+            )
+        return False
 
     def close(self):
         """关闭连接池"""
@@ -296,7 +407,13 @@ class MySQLClient:
                         matched_knowledge: Optional[List] = None,
                         retrieval_query: Optional[str] = None,
                         validation_status: str = "pending",
-                        validation_error: Optional[str] = None) -> Optional[int]:
+                        validation_error: Optional[str] = None,
+                        *,
+                        semantic_datasource: Optional[str] = None,
+                        semantic_dialect: Optional[str] = None,
+                        semantic_version: Optional[str] = None,
+                        semantic_content_sha256: Optional[str] = None,
+                        governance_validated: bool = False) -> Optional[int]:
         """
         保存 SQL 生成历史
 
@@ -315,12 +432,22 @@ class MySQLClient:
         if not session_id:
             session_id = str(uuid.uuid4())
 
+        self._validate_governance_identity(
+            semantic_datasource=semantic_datasource,
+            semantic_dialect=semantic_dialect,
+            semantic_version=semantic_version,
+            semantic_content_sha256=semantic_content_sha256,
+            governance_validated=governance_validated,
+        )
+
         query = """
         INSERT INTO sql_generation_history
         (session_id, user_query, generated_sql, matched_knowledge, retrieval_query,
-         validation_status, validation_error)
+         validation_status, validation_error, semantic_datasource, semantic_dialect,
+         semantic_version, semantic_content_sha256, governance_validated)
         VALUES (:session_id, :user_query, :generated_sql, :matched_knowledge, :retrieval_query,
-         :validation_status, :validation_error)
+         :validation_status, :validation_error, :semantic_datasource, :semantic_dialect,
+         :semantic_version, :semantic_content_sha256, :governance_validated)
         """
         params = {
             "session_id": session_id,
@@ -329,7 +456,12 @@ class MySQLClient:
             "matched_knowledge": json.dumps(matched_knowledge, ensure_ascii=False) if matched_knowledge else None,
             "retrieval_query": retrieval_query,
             "validation_status": validation_status,
-            "validation_error": validation_error
+            "validation_error": validation_error,
+            "semantic_datasource": semantic_datasource,
+            "semantic_dialect": semantic_dialect,
+            "semantic_version": semantic_version,
+            "semantic_content_sha256": semantic_content_sha256,
+            "governance_validated": governance_validated,
         }
 
         try:
@@ -342,6 +474,36 @@ class MySQLClient:
         except Exception as e:
             logger.error(f"保存 SQL 历史失败：{e}")
             return None
+
+    @staticmethod
+    def _validate_governance_identity(
+        *,
+        semantic_datasource: Optional[str],
+        semantic_dialect: Optional[str],
+        semantic_version: Optional[str],
+        semantic_content_sha256: Optional[str],
+        governance_validated: bool,
+    ) -> None:
+        identity = (
+            semantic_datasource,
+            semantic_dialect,
+            semantic_version,
+            semantic_content_sha256,
+        )
+        if type(governance_validated) is not bool:
+            raise ValueError("governance_validated must be a boolean")
+        if all(value is None for value in identity):
+            if governance_validated:
+                raise ValueError("governed history requires a semantic identity")
+            return
+        if (
+            not all(isinstance(value, str) and value for value in identity)
+            or len(semantic_datasource or "") > 191
+            or len(semantic_dialect or "") > 32
+            or len(semantic_version or "") > 64
+            or _SEMANTIC_CONTENT_SHA256.fullmatch(semantic_content_sha256 or "") is None
+        ):
+            raise ValueError("semantic history identity is invalid")
 
     def _prune_history(self) -> None:
         """保留最新的有限条历史，避免数据表无限增长。"""
@@ -367,7 +529,12 @@ class MySQLClient:
                             generated_sql: Optional[str] = None,
                             require_validation_success: bool = False,
                             *,
-                            expected_user_query: Optional[str] = None) -> bool:
+                            expected_user_query: Optional[str] = None,
+                            expected_semantic_datasource: Optional[str] = None,
+                            expected_semantic_dialect: Optional[str] = None,
+                            expected_semantic_version: Optional[str] = None,
+                            expected_semantic_content_sha256: Optional[str] = None,
+                            require_governance_validated: bool = False) -> bool:
         """
         更新 SQL 执行结果
 
@@ -389,6 +556,32 @@ class MySQLClient:
             predicates.append("user_query = :expected_user_query")
         if require_validation_success:
             predicates.append("validation_status = 'success'")
+        expected_identity = (
+            expected_semantic_datasource,
+            expected_semantic_dialect,
+            expected_semantic_version,
+            expected_semantic_content_sha256,
+        )
+        if any(value is not None for value in expected_identity):
+            self._validate_governance_identity(
+                semantic_datasource=expected_semantic_datasource,
+                semantic_dialect=expected_semantic_dialect,
+                semantic_version=expected_semantic_version,
+                semantic_content_sha256=expected_semantic_content_sha256,
+                governance_validated=require_governance_validated,
+            )
+            predicates.extend(
+                (
+                    "semantic_datasource = :expected_semantic_datasource",
+                    "semantic_dialect = :expected_semantic_dialect",
+                    "semantic_version = :expected_semantic_version",
+                    "semantic_content_sha256 = :expected_semantic_content_sha256",
+                )
+            )
+        elif require_governance_validated:
+            raise ValueError("governed update requires a semantic identity")
+        if require_governance_validated:
+            predicates.append("governance_validated = 1")
         where_clause = " AND ".join(predicates)
         query = f"""
         UPDATE sql_generation_history
@@ -411,6 +604,17 @@ class MySQLClient:
             params["generated_sql"] = generated_sql
         if expected_user_query is not None:
             params["expected_user_query"] = expected_user_query
+        if any(value is not None for value in expected_identity):
+            params.update(
+                {
+                    "expected_semantic_datasource": expected_semantic_datasource,
+                    "expected_semantic_dialect": expected_semantic_dialect,
+                    "expected_semantic_version": expected_semantic_version,
+                    "expected_semantic_content_sha256": (
+                        expected_semantic_content_sha256
+                    ),
+                }
+            )
         result = self.execute_update(query, params)
         return result > 0
 
@@ -455,7 +659,16 @@ class MySQLClient:
 
         return self.execute_query(query, params)
 
-    def get_successful_history_for_few_shot(self, limit: int = 100) -> List[Dict]:
+    def get_successful_history_for_few_shot(
+        self,
+        limit: int = 100,
+        *,
+        semantic_datasource: Optional[str] = None,
+        semantic_dialect: Optional[str] = None,
+        semantic_version: Optional[str] = None,
+        semantic_content_sha256: Optional[str] = None,
+        governance_validated: Optional[bool] = None,
+    ) -> List[Dict]:
         """
         获取成功的历史记录用于 Few-Shot 检索
 
@@ -465,15 +678,59 @@ class MySQLClient:
         Returns:
             List[Dict]: 成功历史记录列表
         """
-        query = """
-        SELECT id, user_query, generated_sql, validation_status, execution_status
+        identity = (
+            semantic_datasource,
+            semantic_dialect,
+            semantic_version,
+            semantic_content_sha256,
+        )
+        governed = governance_validated is not None or any(
+            value is not None for value in identity
+        )
+        conditions = [
+            "validation_status = 'success'",
+            "execution_status = 'success'",
+        ]
+        params = {"limit": limit}
+        if governed:
+            if governance_validated is not True:
+                raise ValueError("governed Few-Shot retrieval requires validation")
+            self._validate_governance_identity(
+                semantic_datasource=semantic_datasource,
+                semantic_dialect=semantic_dialect,
+                semantic_version=semantic_version,
+                semantic_content_sha256=semantic_content_sha256,
+                governance_validated=True,
+            )
+            conditions.extend(
+                (
+                    "governance_validated = :governance_validated",
+                    "semantic_datasource = :semantic_datasource",
+                    "semantic_dialect = :semantic_dialect",
+                    "semantic_version = :semantic_version",
+                    "semantic_content_sha256 = :semantic_content_sha256",
+                )
+            )
+            params.update(
+                {
+                    "semantic_datasource": semantic_datasource,
+                    "semantic_dialect": semantic_dialect,
+                    "semantic_version": semantic_version,
+                    "semantic_content_sha256": semantic_content_sha256,
+                    "governance_validated": True,
+                }
+            )
+        where_clause = " AND ".join(conditions)
+        query = f"""
+        SELECT id, user_query, generated_sql, validation_status, execution_status,
+               semantic_datasource, semantic_dialect, semantic_version,
+               semantic_content_sha256, governance_validated
         FROM sql_generation_history
-        WHERE validation_status = 'success'
-          AND execution_status = 'success'
+        WHERE {where_clause}
         ORDER BY created_at DESC
         LIMIT :limit
         """
-        return self.execute_query(query, {"limit": limit})
+        return self.execute_query(query, params)
 
     def get_history_detail(self, history_id: int) -> Optional[Dict]:
         """

@@ -16,6 +16,7 @@ from loguru import logger
 
 from ..chain.sql_chain import QueryRewriteChain, SQLGenerationChain
 from ..config_validation import RuntimeConfigurationError, validate_history_max_records
+from ..history.identity import GovernedHistoryIdentity
 from ..history.mysql_client import MySQLClient
 from ..retrieval.bm25_tfidf import KnowledgeRetriever
 from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
@@ -38,8 +39,8 @@ class _GovernedHistoryBinding:
     session_sha256: str
     generated_sql_sha256: str
     user_query_sha256: str
-    semantic_version: str | None
-    content_sha256: str | None
+    identity: GovernedHistoryIdentity
+    validation_succeeded: bool
     expires_at: float
 
 
@@ -149,8 +150,14 @@ class SQLGenerator:
         logger.info(f"检索到 {len(results)} 个相关知识节点")
         return results
 
-    def _save_history_and_few_shot(self, user_query: str, result: Dict,
-                                     retrieval_query: str, session_id: Optional[str]):
+    def _save_history_and_few_shot(
+        self,
+        user_query: str,
+        result: Dict,
+        retrieval_query: str,
+        session_id: Optional[str],
+        governance_identity: GovernedHistoryIdentity | None = None,
+    ):
         """保存待执行历史；仅执行成功的记录才会进入 Few-Shot。"""
         if not self.mysql_client or not result.get('sql'):
             return
@@ -169,6 +176,22 @@ class SQLGenerator:
         else:
             validation_status = 'pending'
             validation_error = result.get('error')
+        governance_validated = bool(
+            governance_identity is not None
+            and validation_status == 'success'
+            and result.get('executable') is True
+        )
+        identity_fields = (
+            governance_identity.storage_fields(validated=governance_validated)
+            if governance_identity is not None
+            else {
+                'semantic_datasource': None,
+                'semantic_dialect': None,
+                'semantic_version': None,
+                'semantic_content_sha256': None,
+                'governance_validated': False,
+            }
+        )
         history_id = self.mysql_client.save_sql_history(
             user_query=user_query,
             generated_sql=result['sql'],
@@ -177,6 +200,7 @@ class SQLGenerator:
             retrieval_query=retrieval_query,
             validation_status=validation_status,
             validation_error=validation_error,
+            **identity_fields,
         )
         if history_id:
             result['history_id'] = history_id
@@ -188,14 +212,14 @@ class SQLGenerator:
                 and not isinstance(history_id, bool)
                 and isinstance(session_id, str)
                 and session_id
+                and isinstance(governance_identity, GovernedHistoryIdentity)
             ):
                 self._remember_governed_history_binding(
                     history_id,
                     session_id=session_id,
                     generated_sql=result['sql'],
                     user_query=user_query,
-                    semantic_version=result.get('semantic_version'),
-                    content_sha256=result.get('content_sha256'),
+                    identity=governance_identity,
                 )
 
     def _identity_digest(self, domain: str, value: str) -> str:
@@ -220,8 +244,7 @@ class SQLGenerator:
         session_id: str,
         generated_sql: str,
         user_query: str,
-        semantic_version: str | None,
-        content_sha256: str | None,
+        identity: GovernedHistoryIdentity,
     ) -> None:
         canonical_sql = self._canonical_sql(generated_sql)
         if canonical_sql is None:
@@ -231,8 +254,8 @@ class SQLGenerator:
             session_sha256=self._identity_digest("session", session_id),
             generated_sql_sha256=self._identity_digest("sql", canonical_sql),
             user_query_sha256=self._identity_digest("question", user_query),
-            semantic_version=semantic_version,
-            content_sha256=content_sha256,
+            identity=identity,
+            validation_succeeded=True,
             expires_at=now + self._governed_history_binding_ttl_seconds,
         )
         with self._governed_history_lock:
@@ -263,7 +286,9 @@ class SQLGenerator:
         user_query: str | None,
         semantic_version: str | None,
         content_sha256: str | None,
-    ) -> bool:
+        governance_identity: GovernedHistoryIdentity,
+    ) -> bool | None:
+        """Consume a matching local capability, or return ``None`` after restart."""
         canonical_sql = self._canonical_sql(sql)
         if canonical_sql is None or not isinstance(user_query, str):
             return False
@@ -274,13 +299,16 @@ class SQLGenerator:
         with self._governed_history_lock:
             self._prune_governed_history_bindings_locked(now)
             binding = self._governed_history_bindings.get(history_id)
+            if binding is None:
+                return None
             if (
-                binding is None
+                not binding.validation_succeeded
                 or not compare_digest(binding.session_sha256, expected_session)
                 or not compare_digest(binding.generated_sql_sha256, expected_sql)
                 or not compare_digest(binding.user_query_sha256, expected_question)
-                or binding.semantic_version != semantic_version
-                or binding.content_sha256 != content_sha256
+                or binding.identity != governance_identity
+                or binding.identity.semantic_version != semantic_version
+                or binding.identity.content_sha256 != content_sha256
             ):
                 return False
             self._governed_history_bindings.pop(history_id, None)
@@ -291,6 +319,7 @@ class SQLGenerator:
         history_id: int,
         *,
         expected_history: Mapping[str, Any],
+        governance_identity: GovernedHistoryIdentity | None,
     ) -> None:
         """将真实执行成功的历史记录加入 Few-Shot 索引。"""
         history = self.mysql_client.get_history_detail(history_id)
@@ -305,8 +334,18 @@ class SQLGenerator:
             )
             and history.get('validation_status') == 'success'
             and history.get('execution_status') == 'success'
+            and (
+                governance_identity is None
+                or governance_identity.matches(history)
+            )
         ):
-            self.knowledge_retriever.add_history_record(history)
+            if governance_identity is None:
+                self.knowledge_retriever.add_history_record(history)
+            else:
+                self.knowledge_retriever.add_history_record(
+                    history,
+                    governance_identity=governance_identity,
+                )
 
     def _bound_history(
         self,
@@ -317,35 +356,50 @@ class SQLGenerator:
         user_query: str | None,
         semantic_version: str | None,
         content_sha256: str | None,
-    ) -> tuple[Mapping[str, Any] | None, str | None]:
+        governance_identity: GovernedHistoryIdentity | None = None,
+    ) -> tuple[
+        Mapping[str, Any] | None,
+        GovernedHistoryIdentity | None,
+        str | None,
+    ]:
         """Resolve a history row only when all execution identity fields match."""
         if not session_id:
-            return None, '执行历史与当前会话或 SQL 不匹配'
+            return None, None, '执行历史与当前会话或 SQL 不匹配'
         history = self.mysql_client.get_history_detail(history_id)
         if not isinstance(history, Mapping):
-            return None, '执行历史与当前会话或 SQL 不匹配'
+            return None, None, '执行历史与当前会话或 SQL 不匹配'
         if history.get('session_id') != session_id:
-            return None, '执行历史与当前会话或 SQL 不匹配'
+            return None, None, '执行历史与当前会话或 SQL 不匹配'
         if history.get('validation_status') != 'success':
-            return None, '执行历史未通过校验'
+            return None, None, '执行历史未通过校验'
         stored_sql = history.get('generated_sql')
         if not isinstance(stored_sql, str) or not self._same_sql(stored_sql, sql):
-            return None, '执行历史与当前会话或 SQL 不匹配'
+            return None, None, '执行历史与当前会话或 SQL 不匹配'
 
+        identity = None
         if self.correctness_pipeline is not None:
+            identity = governance_identity
+            if identity is None:
+                return None, None, '执行历史与当前治理上下文不匹配'
             if (
-                history.get('user_query') != user_query
-                or not self._consume_governed_history_binding(
-                    history_id,
-                    session_id=session_id,
-                    sql=sql,
-                    user_query=user_query,
-                    semantic_version=semantic_version,
-                    content_sha256=content_sha256,
-                )
+                not identity.matches(history)
+                or semantic_version != identity.semantic_version
+                or content_sha256 != identity.content_sha256
+                or history.get('user_query') != user_query
             ):
-                return None, '执行历史与当前治理上下文不匹配'
-        return history, None
+                return None, None, '执行历史与当前治理上下文不匹配'
+            local_binding = self._consume_governed_history_binding(
+                history_id,
+                session_id=session_id,
+                sql=sql,
+                user_query=user_query,
+                semantic_version=semantic_version,
+                content_sha256=content_sha256,
+                governance_identity=identity,
+            )
+            if local_binding is False:
+                return None, None, '执行历史与当前治理上下文不匹配'
+        return history, identity, None
 
     def _same_sql(self, left: str, right: str) -> bool:
         left_canonical = self._canonical_sql(left)
@@ -380,6 +434,17 @@ class SQLGenerator:
         execution_error: str | None = None,
         execution_result: Any = None,
     ) -> bool:
+        identity_fields = {}
+        if self.correctness_pipeline is not None:
+            identity_fields = {
+                'expected_semantic_datasource': history['semantic_datasource'],
+                'expected_semantic_dialect': history['semantic_dialect'],
+                'expected_semantic_version': history['semantic_version'],
+                'expected_semantic_content_sha256': history[
+                    'semantic_content_sha256'
+                ],
+                'require_governance_validated': True,
+            }
         return self.mysql_client.update_sql_execution(
             history_id=history_id,
             execution_status=execution_status,
@@ -389,6 +454,7 @@ class SQLGenerator:
             generated_sql=history['generated_sql'],
             expected_user_query=history.get('user_query'),
             require_validation_success=True,
+            **identity_fields,
         )
 
     def _validate_generation_result(self, result: Dict, dialect: str,
@@ -442,22 +508,39 @@ class SQLGenerator:
 
     def _prepare_governed_context(
         self, user_query: str
-    ) -> tuple[Any | None, str, str | None, str | None, Dict[str, Any] | None]:
+    ) -> tuple[
+        Any | None,
+        str,
+        str | None,
+        str | None,
+        GovernedHistoryIdentity | None,
+        Dict[str, Any] | None,
+    ]:
         """Pin the immutable correctness request before invoking the LLM."""
         if self.correctness_pipeline is None:
-            return None, "", None, None, None
+            return None, "", None, None, None, None
         request = None
         try:
             request = self.correctness_pipeline.prepare_generation(user_query)
             semantic_context, semantic_version, content_sha256 = (
                 self.correctness_pipeline.describe_prepared(request)
             )
-            return request, semantic_context, semantic_version, content_sha256, None
+            identity = self.correctness_pipeline.describe_prepared_history_identity(
+                request
+            )
+            return (
+                request,
+                semantic_context,
+                semantic_version,
+                content_sha256,
+                identity,
+                None,
+            )
         except Exception as exc:
             if request is not None:
                 self._discard_prepared_safely(request)
             log_safe_exception("governed_generation_context", exc)
-            return None, "", None, None, self._governed_error_payload(
+            return None, "", None, None, None, self._governed_error_payload(
                 code="CORRECTNESS_UNAVAILABLE",
                 message="SQL 正确性校验暂时不可用",
                 semantic_version=None,
@@ -697,6 +780,7 @@ class SQLGenerator:
             semantic_context,
             semantic_version,
             content_sha256,
+            governance_identity,
             governance_error,
         ) = self._prepare_governed_context(user_query)
         if governance_error is not None:
@@ -744,7 +828,13 @@ class SQLGenerator:
 
         # 8. 保存历史
         if auto_save_history:
-            self._save_history_and_few_shot(user_query, result, ctx['final_query'], session_id)
+            self._save_history_and_few_shot(
+                user_query,
+                result,
+                ctx['final_query'],
+                session_id,
+                governance_identity,
+            )
 
         return result
 
@@ -772,6 +862,7 @@ class SQLGenerator:
             semantic_context,
             semantic_version,
             content_sha256,
+            governance_identity,
             governance_error,
         ) = self._prepare_governed_context(user_query)
         if governance_error is not None:
@@ -819,7 +910,13 @@ class SQLGenerator:
 
         # 8. 保存历史
         if auto_save_history:
-            self._save_history_and_few_shot(user_query, result, ctx['final_query'], session_id)
+            self._save_history_and_few_shot(
+                user_query,
+                result,
+                ctx['final_query'],
+                session_id,
+                governance_identity,
+            )
 
         return result
 
@@ -982,6 +1079,21 @@ class SQLGenerator:
                     'executable': False,
                 }
                 return public
+            take_identity = getattr(
+                self.correctness_pipeline,
+                'take_authorization_history_identity',
+                None,
+            )
+            candidate_identity = (
+                take_identity(authorization) if callable(take_identity) else None
+            )
+            governance_identity = (
+                candidate_identity
+                if isinstance(candidate_identity, GovernedHistoryIdentity)
+                else None
+            )
+        else:
+            governance_identity = None
 
         if not self.mysql_client:
             return {'status': 'error', 'error': 'MySQL 客户端未连接', 'data': None}
@@ -991,13 +1103,14 @@ class SQLGenerator:
             if self.correctness_pipeline is None and not session_id:
                 logger.warning("history_update_skipped reason=missing_session")
             else:
-                history, history_error = self._bound_history(
+                history, _history_identity, history_error = self._bound_history(
                     history_id,
                     session_id=session_id,
                     sql=sql,
                     user_query=user_query,
                     semantic_version=semantic_version,
                     content_sha256=content_sha256,
+                    governance_identity=governance_identity,
                 )
                 if history_error is not None:
                     return self._history_context_error(
@@ -1052,6 +1165,7 @@ class SQLGenerator:
                 self._promote_history_to_few_shot(
                     history_id,
                     expected_history=history,
+                    governance_identity=_history_identity,
                 )
 
             return {
@@ -1198,10 +1312,24 @@ def create_sql_generator(llm, neo4j_client, mysql_client, config: Optional[Dict]
     # 6. 构建 Few-Shot 索引
     if mysql_client and config.get('few_shot_enabled', True):
         try:
+            governance_identity = None
+            retrieval_fields = {}
+            if correctness_pipeline is not None:
+                governance_identity = GovernedHistoryIdentity.from_snapshot(
+                    correctness_pipeline.registry.get_snapshot()
+                )
+                retrieval_fields = governance_identity.retrieval_fields()
             history_records = mysql_client.get_successful_history_for_few_shot(
-                limit=100
+                limit=100,
+                **retrieval_fields,
             )
-            knowledge_retriever.build_few_shot_index(history_records)
+            if governance_identity is None:
+                knowledge_retriever.build_few_shot_index(history_records)
+            else:
+                knowledge_retriever.build_few_shot_index(
+                    history_records,
+                    governance_identity=governance_identity,
+                )
             logger.info(f"Few-Shot 索引构建完成，共 {len(knowledge_retriever.history_records)} 条成功记录")
         except Exception as e:
             logger.warning(f"构建 Few-Shot 索引失败：{e}")

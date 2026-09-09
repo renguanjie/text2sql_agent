@@ -75,6 +75,13 @@ CREATE TABLE IF NOT EXISTS sql_generation_history (
     user_query TEXT NOT NULL COMMENT '用户自然语言查询',
     generated_sql TEXT COMMENT '生成的 SQL 语句',
     sql_dialect VARCHAR(50) DEFAULT 'mysql' COMMENT 'SQL 方言',
+    semantic_datasource VARCHAR(191) NULL COMMENT '语义治理数据源',
+    semantic_dialect VARCHAR(32) NULL COMMENT '语义治理 SQL 方言',
+    semantic_version VARCHAR(64) NULL COMMENT '语义模型版本',
+    semantic_content_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL
+        COMMENT '语义快照内容 SHA-256',
+    governance_validated TINYINT(1) NOT NULL DEFAULT 0
+        COMMENT '是否通过语义治理校验',
     validation_status VARCHAR(20) DEFAULT 'pending' COMMENT '验证状态：pending/pass/fail',
     validation_error TEXT COMMENT '验证错误信息',
     execution_status VARCHAR(20) DEFAULT 'pending' COMMENT '执行状态：pending/success/fail',
@@ -89,7 +96,12 @@ CREATE TABLE IF NOT EXISTS sql_generation_history (
     INDEX idx_session (session_id),
     INDEX idx_created_at (created_at),
     INDEX idx_validation_status (validation_status),
-    INDEX idx_execution_status (execution_status)
+    INDEX idx_execution_status (execution_status),
+    INDEX idx_governed_few_shot (
+        governance_validated, semantic_datasource, semantic_dialect,
+        semantic_version, semantic_content_sha256,
+        validation_status, execution_status, created_at
+    )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 COMMENT='SQL 生成历史表';
 

@@ -10,6 +10,9 @@ from core.config_validation import RuntimeConfigurationError, validate_runtime_c
 from core.utils.log_sanitizer import log_safe_exception
 
 
+_CURRENT_GOVERNANCE_PIPELINE = object()
+
+
 class ApplicationConfigurationError(ValueError):
     """Stable public error raised for invalid application configuration."""
 
@@ -416,13 +419,24 @@ class ApplicationContext:
 
     def reload_governance(self, **updates: Any) -> None:
         """Candidate-build governance and atomically replace registry/generator."""
+        from core.retrieval.bm25_tfidf import KnowledgeRetriever
+
         candidate_config = {**self.config, **updates}
         candidate_registry, candidate_pipeline = self._build_governance_components(
             candidate_config
         )
+        candidate_retriever = KnowledgeRetriever(
+            config=self._retriever_config(candidate_config),
+            embedding_factory=self._embedding_factory,
+        )
+        self._populate_retriever(
+            candidate_retriever,
+            candidate_config,
+            correctness_pipeline=candidate_pipeline,
+        )
         candidate_generator = self._build_sql_generator(
             llm=self._llm,
-            knowledge_retriever=self._knowledge_retriever,
+            knowledge_retriever=candidate_retriever,
             sql_chain=self._sql_chain,
             config=candidate_config,
             correctness_pipeline=candidate_pipeline,
@@ -431,11 +445,20 @@ class ApplicationContext:
         self.config = candidate_config
         self._semantic_registry = candidate_registry
         self._correctness_pipeline = candidate_pipeline
+        self._knowledge_retriever = candidate_retriever
         self._sql_generator = candidate_generator
         self._initialized = True
 
-    def _populate_retriever(self, retriever, config: Dict[str, Any]) -> None:
+    def _populate_retriever(
+        self,
+        retriever,
+        config: Dict[str, Any],
+        *,
+        correctness_pipeline=_CURRENT_GOVERNANCE_PIPELINE,
+    ) -> None:
         """把当前知识与执行成功历史加载到候选检索器。"""
+        if correctness_pipeline is _CURRENT_GOVERNANCE_PIPELINE:
+            correctness_pipeline = self._correctness_pipeline
         documents = []
         metadata_list = []
         if config.get('neo4j_enabled', False) and getattr(self._neo4j_client, 'driver', None):
@@ -466,8 +489,31 @@ class ApplicationContext:
             and self._mysql_client
             and self._mysql_client.engine
         ):
-            records = self._mysql_client.get_successful_history_for_few_shot(limit=100)
-            retriever.build_few_shot_index(records)
+            identity, retrieval_fields = self._governed_history_retrieval_fields(
+                correctness_pipeline
+            )
+            records = self._mysql_client.get_successful_history_for_few_shot(
+                limit=100,
+                **retrieval_fields,
+            )
+            if identity is None:
+                retriever.build_few_shot_index(records)
+            else:
+                retriever.build_few_shot_index(
+                    records,
+                    governance_identity=identity,
+                )
+
+    @staticmethod
+    def _governed_history_retrieval_fields(correctness_pipeline):
+        if correctness_pipeline is None:
+            return None, {}
+        from core.history.identity import GovernedHistoryIdentity
+
+        identity = GovernedHistoryIdentity.from_snapshot(
+            correctness_pipeline.registry.get_snapshot()
+        )
+        return identity, identity.retrieval_fields()
 
     def _load_knowledge_base(self):
         """加载知识库到检索器；磁盘索引缓存需显式开启以避免读到旧图谱。"""
@@ -539,8 +585,20 @@ class ApplicationContext:
         if not self._mysql_client or not self._mysql_client.engine:
             return
         try:
-            records = self._mysql_client.get_successful_history_for_few_shot(limit=100)
-            self._knowledge_retriever.build_few_shot_index(records)
+            identity, retrieval_fields = self._governed_history_retrieval_fields(
+                self._correctness_pipeline
+            )
+            records = self._mysql_client.get_successful_history_for_few_shot(
+                limit=100,
+                **retrieval_fields,
+            )
+            if identity is None:
+                self._knowledge_retriever.build_few_shot_index(records)
+            else:
+                self._knowledge_retriever.build_few_shot_index(
+                    records,
+                    governance_identity=identity,
+                )
         except Exception as e:
             logger.warning(f"Few-Shot 索引加载失败：{e}")
 
