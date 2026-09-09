@@ -271,12 +271,19 @@ class SQLGenerationChain:
             return {'sql': None, 'status': 'error', 'error': 'SQL 修复服务调用失败'}
 
     def fix_sql_governed(
-        self, sql: str, issues: list[dict], semantic_context: str
+        self,
+        sql: str,
+        issues: list[dict],
+        semantic_context: str,
+        question: str = "",
     ) -> Dict[str, Any]:
         """使用结构化治理问题修复 SQL，且不在此层重试。"""
         try:
             messages = self.prompt_templates.create_governed_fix_messages(
-                sql=sql, issues=issues, semantic_context=semantic_context
+                sql=sql,
+                issues=issues,
+                semantic_context=semantic_context,
+                question=question,
             )
             response = self._invoke_llm_with_retry(messages, max_retries=0)
             return self._process_fix_result(self._extract_sql(response.content))
@@ -285,12 +292,19 @@ class SQLGenerationChain:
             raise
 
     async def fix_sql_governed_async(
-        self, sql: str, issues: list[dict], semantic_context: str
+        self,
+        sql: str,
+        issues: list[dict],
+        semantic_context: str,
+        question: str = "",
     ) -> Dict[str, Any]:
         """异步使用结构化治理问题修复 SQL，且不在此层重试。"""
         try:
             messages = self.prompt_templates.create_governed_fix_messages(
-                sql=sql, issues=issues, semantic_context=semantic_context
+                sql=sql,
+                issues=issues,
+                semantic_context=semantic_context,
+                question=question,
             )
             response = await self._ainvoke_llm_with_retry(messages, max_retries=0)
             return self._process_fix_result(self._extract_sql(response.content))

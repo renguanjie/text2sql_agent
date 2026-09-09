@@ -73,13 +73,35 @@ def validate_query_scope(sql: str, allowed_tables: Optional[List[str]] = None,
 
 def constrain_read_query(sql: str, max_rows: int, timeout_ms: int = 0,
                          dialect: str = "mysql") -> str:
-    """通过 AST 强制外层行数限制，并为 MySQL 添加执行超时提示。"""
+    """只收紧外层行数限制，并为 MySQL 添加执行超时提示。
+
+    A caller's literal ``LIMIT`` at or below ``max_rows`` is already stricter
+    than the runtime boundary and must remain unchanged.  The extra row is
+    requested only for an absent or oversized limit so the executor can report
+    truncation without ever broadening the query authorized by the pipeline.
+    """
     import sqlglot
     from sqlglot import exp
 
     statement = sqlglot.parse_one(sql, read=dialect)
     if max_rows > 0:
-        statement = statement.limit(max_rows + 1)
+        limit = statement.args.get("limit")
+        if limit is None:
+            statement.set(
+                "limit", exp.Limit(expression=exp.Literal.number(max_rows + 1))
+            )
+        else:
+            limit_expression = limit.args.get("expression")
+            raw_limit = (
+                limit_expression.args.get("this")
+                if type(limit_expression).__name__ == "Literal"
+                and limit_expression.args.get("is_string") is False
+                else None
+            )
+            if not isinstance(raw_limit, str) or not raw_limit.isdecimal():
+                raise ValueError("LIMIT 必须是非负整数字面量")
+            if int(raw_limit) > max_rows:
+                limit.set("expression", exp.Literal.number(max_rows + 1))
     if dialect == "mysql" and timeout_ms > 0 and isinstance(statement, exp.Select):
         statement.set(
             "hint",

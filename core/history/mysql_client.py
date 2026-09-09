@@ -16,7 +16,7 @@ from sqlglot import exp, parse_one
 
 from ..config_validation import validate_history_max_records
 from ..sql.preflight import ExplainDeadlineExceeded, run_with_wall_clock_deadline
-from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
+from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
 from .proof import (
     GovernedHistoryFinalization,
     GovernedHistorySave,
@@ -119,14 +119,26 @@ class MySQLClient:
             with self.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
             self._migrate_history_schema()
-            logger.info(f"MySQL 连接池初始化成功：{self.host}:{self.port}/{self.database}, "
-                       f"pool_size={self.pool_size}, max_overflow={self.max_overflow}")
+            logger.info(
+                "MySQL 连接池初始化成功：endpoint_id={}, port={}, "
+                "pool_size={}, max_overflow={}",
+                text_fingerprint(f"{self.host}\0{self.database}"),
+                self.port,
+                self.pool_size,
+                self.max_overflow,
+            )
             return True
-        except Exception as e:
-            if self.engine is not None:
-                self.engine.dispose()
-                self.engine = None
-            logger.error(f"MySQL 连接池初始化失败：{e}")
+        except Exception as exc:
+            log_safe_exception("mysql_connect", exc)
+            failed_engine = self.engine
+            self.engine = None
+            if failed_engine is not None:
+                try:
+                    failed_engine.dispose()
+                except Exception as cleanup_exc:
+                    log_safe_exception(
+                        "mysql_connect_cleanup", cleanup_exc, level="warning"
+                    )
             return False
 
     def _migrate_history_schema(self) -> None:
@@ -180,7 +192,14 @@ class MySQLClient:
         try:
             self.execute_update(query, raise_on_error=True)
         except Exception as exc:
-            if not self._is_duplicate_schema_change(exc):
+            duplicate = self._is_duplicate_schema_change(exc)
+            log_safe_exception(
+                "mysql_history_schema_migration",
+                exc,
+                fingerprint_source=query,
+                level="warning" if duplicate else "error",
+            )
+            if not duplicate:
                 raise
             logger.info("历史治理迁移已由并发启动完成")
 
@@ -233,8 +252,14 @@ class MySQLClient:
         try:
             yield conn
             conn.commit()
-        except Exception:
-            conn.rollback()
+        except Exception as exc:
+            log_safe_exception("mysql_transaction", exc)
+            try:
+                conn.rollback()
+            except Exception as rollback_exc:
+                log_safe_exception(
+                    "mysql_transaction_rollback", rollback_exc, level="warning"
+                )
             raise
         finally:
             conn.close()
@@ -255,9 +280,8 @@ class MySQLClient:
             with self.get_connection() as conn:
                 result = conn.execute(text(query), params or {})
                 return [dict(row._mapping) for row in result]
-        except Exception as e:
-            safe_error = truncate_log(mask_sensitive(str(e)), 160)
-            logger.error(f"MySQL 查询执行失败：{safe_error}, query={sanitize_sql(query)}")
+        except Exception as exc:
+            log_safe_exception("mysql_query", exc, fingerprint_source=query)
             if raise_on_error:
                 raise
             return []
@@ -304,8 +328,10 @@ class MySQLClient:
                 if cancelled.is_set():
                     try:
                         conn.invalidate()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_safe_exception(
+                            "mysql_explain_invalidate", exc, level="warning"
+                        )
                 conn.close()
 
         return run_with_wall_clock_deadline(execute, timeout_ms)
@@ -326,9 +352,8 @@ class MySQLClient:
             with self.get_connection() as conn:
                 result = conn.execute(text(query), params or {})
                 return result.rowcount
-        except Exception as e:
-            safe_error = truncate_log(mask_sensitive(str(e)), 160)
-            logger.error(f"MySQL 更新失败：{safe_error}, query={sanitize_sql(query)}")
+        except Exception as exc:
+            log_safe_exception("mysql_update", exc, fingerprint_source=query)
             if raise_on_error:
                 raise
             return 0
@@ -384,7 +409,7 @@ class MySQLClient:
         table_results = self.execute_query(table_query, {"table_name": table_name})
 
         if not table_results:
-            logger.warning(f"表 {table_name} 不存在")
+            logger.warning("表不存在：table_id={}", text_fingerprint(table_name))
             return False
 
         table_id = table_results[0]['id']
@@ -487,8 +512,10 @@ class MySQLClient:
                 logger.info(f"保存 SQL 历史记录，ID={history_id}")
             self._prune_history()
             return history_id
-        except Exception as e:
-            logger.error(f"保存 SQL 历史失败：{e}")
+        except Exception as exc:
+            log_safe_exception(
+                "mysql_history_save", exc, fingerprint_source=generated_sql
+            )
             return None
 
     def save_governed_sql_history(
@@ -539,8 +566,11 @@ class MySQLClient:
             self._prune_history()
             return history_id
         except Exception as exc:
-            safe_error = truncate_log(mask_sensitive(str(exc)), 160)
-            logger.error("保存受治理 SQL 历史失败：{}", safe_error)
+            log_safe_exception(
+                "mysql_governed_history_save",
+                exc,
+                fingerprint_source=command.generated_sql,
+            )
             return None
 
     def finalize_governed_sql_execution(
@@ -596,7 +626,15 @@ class MySQLClient:
             "semantic_content_sha256": command.semantic_content_sha256,
             "governance_validated": governance_validated,
         }
-        return self.execute_update(query, params) > 0
+        try:
+            return self.execute_update(query, params, raise_on_error=True) > 0
+        except Exception as exc:
+            log_safe_exception(
+                "mysql_governed_history_finalize",
+                exc,
+                fingerprint_source=command.generated_sql,
+            )
+            return False
 
     @staticmethod
     def _validate_governance_identity(

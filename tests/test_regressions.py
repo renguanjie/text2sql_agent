@@ -969,6 +969,87 @@ def test_read_query_constraint_adds_limit_and_mysql_timeout_hint():
     assert "MAX_EXECUTION_TIME(2500)" in constrained
 
 
+@pytest.mark.parametrize(
+    ("sql", "expected_fragment"),
+    [
+        (
+            "SELECT DISTINCT id FROM orders LIMIT 5 OFFSET 9",
+            "SELECT DISTINCT id FROM orders LIMIT 5 OFFSET 9",
+        ),
+        (
+            "WITH recent AS (SELECT id FROM orders LIMIT 2) "
+            "SELECT id FROM recent LIMIT 4 OFFSET 3",
+            "WITH recent AS (SELECT id FROM orders LIMIT 2) "
+            "SELECT id FROM recent LIMIT 4 OFFSET 3",
+        ),
+        (
+            "SELECT id FROM orders UNION SELECT id FROM archived_orders "
+            "LIMIT 3 OFFSET 8",
+            "SELECT id FROM orders UNION SELECT id FROM archived_orders "
+            "LIMIT 3 OFFSET 8",
+        ),
+        ("SELECT id FROM orders LIMIT 50", "SELECT id FROM orders LIMIT 50"),
+    ],
+    ids=["distinct-offset", "cte-inner-limit", "union-offset", "equal-cap"],
+)
+def test_read_query_constraint_preserves_user_literal_limit_at_or_below_cap(
+    sql: str, expected_fragment: str
+):
+    """Break caught: row governance expanding an already tighter user query."""
+    from core.sql.validator import constrain_read_query
+
+    constrained = constrain_read_query(sql, max_rows=50)
+
+    assert constrained == expected_fragment
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_fragment"),
+    [
+        ("SELECT DISTINCT id FROM orders", "LIMIT 51"),
+        ("SELECT id FROM orders LIMIT 999 OFFSET 7", "LIMIT 51 OFFSET 7"),
+        (
+            "WITH recent AS (SELECT id FROM orders LIMIT 2) "
+            "SELECT id FROM recent LIMIT 999 OFFSET 6",
+            "SELECT id FROM recent LIMIT 51 OFFSET 6",
+        ),
+        (
+            "SELECT id FROM orders UNION SELECT id FROM archived_orders LIMIT 999",
+            "archived_orders LIMIT 51",
+        ),
+    ],
+    ids=["missing", "over-cap-offset", "cte-outer-over-cap", "union-over-cap"],
+)
+def test_read_query_constraint_adds_only_the_truncation_probe_upper_bound(
+    sql: str, expected_fragment: str
+):
+    """Break caught: absent or oversized outer limits bypassing the one-row probe."""
+    from core.sql.validator import constrain_read_query
+
+    constrained = constrain_read_query(sql, max_rows=50)
+
+    assert expected_fragment in constrained
+    assert "LIMIT 52" not in constrained
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id FROM orders LIMIT :runtime_limit",
+        "SELECT id FROM orders LIMIT 1 + 1",
+        "SELECT id FROM orders LIMIT -1",
+        "SELECT id FROM orders LIMIT unknown_limit",
+    ],
+    ids=["placeholder", "expression", "negative", "identifier"],
+)
+def test_read_query_constraint_rejects_nonliteral_or_negative_outer_limit(sql: str):
+    """Break caught: replacing an unknowable small limit with a larger fixed limit."""
+    from core.sql.validator import constrain_read_query
+
+    with pytest.raises(ValueError, match="LIMIT"):
+        constrain_read_query(sql, max_rows=50)
+
+
 def test_mysql_query_can_raise_for_business_layer():
     from core.history.mysql_client import MySQLClient
 

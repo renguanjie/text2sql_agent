@@ -320,6 +320,7 @@ def test_sync_generation_pins_one_snapshot_when_same_version_content_changes():
     assert "archived_orders" not in semantic_context
     repair_context = generator.sql_chain.fix_sql_governed.call_args.args[2]
     assert repair_context == semantic_context
+    assert generator.sql_chain.fix_sql_governed.call_args.args[3] == "订单金额"
 
 
 @pytest.mark.asyncio
@@ -345,6 +346,7 @@ async def test_async_generation_pins_one_snapshot_when_same_version_content_chan
     assert "archived_orders" not in semantic_context
     repair_context = generator.sql_chain.fix_sql_governed_async.call_args.args[2]
     assert repair_context == semantic_context
+    assert generator.sql_chain.fix_sql_governed_async.call_args.args[3] == "订单金额"
 
 
 @pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
@@ -1354,6 +1356,40 @@ def test_execute_reauthorizes_before_applying_row_and_timeout_constraints(monkey
         allowed_tables=("orders",),
         allowed_schemas=(),
     )
+
+
+def test_execution_constraint_never_expands_an_authorized_small_limit():
+    """Authorization covers the broadest SQL; execution may only tighten it."""
+    original_sql = "SELECT id FROM orders LIMIT 2 OFFSET 1"
+    pipeline = Mock()
+    pipeline.authorize_execution.return_value = CorrectnessResult(
+        status="success",
+        sql=original_sql,
+        semantic_version="1.0.0",
+        content_sha256="1" * 64,
+        validation=ValidationReport(valid=True),
+        repair_attempts=0,
+        executable=True,
+    )
+    mysql = Mock()
+    mysql.execute_query_limited.return_value = ([{"id": 2}], False)
+    generator = _generator(pipeline=pipeline, mysql_client=mysql)
+
+    result = generator.execute_sql(
+        original_sql,
+        allowed_tables=["orders"],
+        allowed_schemas=[],
+        user_query="查询第二条订单",
+        semantic_version="1.0.0",
+        content_sha256="1" * 64,
+    )
+
+    authorized_sql = pipeline.authorize_execution.call_args.kwargs["sql"]
+    executed_sql = mysql.execute_query_limited.call_args.args[0]
+    assert result["status"] == "success"
+    assert authorized_sql == original_sql
+    assert "LIMIT 2 OFFSET 1" in executed_sql
+    assert "LIMIT 6" not in executed_sql
 
 
 def test_governed_execute_authorizes_before_history_read_and_database_execute(

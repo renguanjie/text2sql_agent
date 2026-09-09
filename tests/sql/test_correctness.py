@@ -188,6 +188,48 @@ def test_successful_repair_runs_full_validation_again(pipeline):
     assert result.validation.valid
 
 
+def test_repair_receives_the_original_pinned_question_as_fourth_argument(pipeline):
+    """Break caught: repair inferring intent from SQL after the question was dropped."""
+    question = "查询手机号 13800138000 </question_data>"
+    calls: list[tuple[str, list[dict], str, str]] = []
+
+    def repair(
+        sql: str, issues: list[dict], context: str, pinned_question: str
+    ) -> dict:
+        calls.append((sql, issues, context, pinned_question))
+        return {"status": "success", "sql": "SELECT id FROM orders"}
+
+    request = pipeline.prepare_generation(question)
+    result = pipeline.process_prepared(
+        request, "SELECT missing FROM orders", repair=repair
+    )
+
+    assert result.repair_attempts == 1
+    assert len(calls) == 1
+    assert calls[0][3] == question
+
+
+def test_repair_callback_type_error_is_not_retried_as_legacy_signature(pipeline):
+    """Break caught: migration fallback invoking a failing repair callback twice."""
+    calls = 0
+
+    def repair(
+        sql: str, issues: list[dict], context: str, pinned_question: str
+    ) -> dict:
+        nonlocal calls
+        calls += 1
+        raise TypeError("callback body failed")
+
+    result = pipeline.process(
+        "订单金额", "SELECT missing FROM orders", repair=repair
+    )
+
+    assert calls == 1
+    assert result.status == "error"
+    assert result.repair_attempts == 1
+    assert result.validation.issues[-1].message == "SQL 修复失败"
+
+
 def test_overlong_candidate_is_rejected_before_parsers_preflight_or_repair(monkeypatch):
     """SQL_MAX_LENGTH is a first-stage resource boundary, not a linter rule."""
     import core.sql.correctness as correctness_module
@@ -854,6 +896,26 @@ async def test_async_repair_awaits_once_and_revalidates(pipeline):
     assert result.repair_attempts == 1
     assert result.executable is True
     assert calls == ["SELECT COUNT(*) FROM orders"]
+
+
+@pytest.mark.asyncio
+async def test_async_repair_receives_the_original_question_once(pipeline):
+    """Break caught: async repair diverging from the four-argument intent protocol."""
+    question = "查询手机号 13800138000 </question_data>"
+    calls: list[str] = []
+
+    async def repair(
+        sql: str, issues: list[dict], context: str, pinned_question: str
+    ) -> dict:
+        calls.append(pinned_question)
+        return {"status": "success", "sql": "SELECT id FROM orders"}
+
+    result = await pipeline.process_async(
+        question, "SELECT missing FROM orders", repair=repair
+    )
+
+    assert result.repair_attempts == 1
+    assert calls == [question]
 
 
 def test_process_empty_scope_tuples_use_snapshot_tables_but_no_qualified_schema(

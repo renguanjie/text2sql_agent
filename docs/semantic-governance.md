@@ -165,7 +165,15 @@ context.reload_governance(
 
 ## 5. 生成、一次纠错与执行再授权
 
-一次受治理请求固定执行以下流程：以单一不可变快照构建受限中文语义上下文 → 生成一条 SQL → 语法/只读安全/查询范围/语义校验 →（若开启）MySQL `EXPLAIN` → 必要时将脱敏的结构化错误和最小语义片段交给模型纠错一次 → 从第一项校验重新验证修复 SQL。`repair_attempts` 只会是 `0` 或 `1`；第二次失败不会再次调用模型，且 `executable` 为 `false`。
+一次受治理请求固定执行以下流程：以单一不可变快照构建受限中文语义上下文 → 生成一条 SQL → 语法/只读安全/查询范围/语义校验 →（若开启）MySQL `EXPLAIN` → 必要时将结构化错误、完整的本次语义上下文和 prepared request 固定的原始问题交给模型纠错一次 → 从第一项校验重新验证修复 SQL。`repair_attempts` 只会是 `0` 或 `1`；第二次失败不会再次调用模型，且 `executable` 为 `false`。
+
+`CorrectnessPipeline` 的 repair 回调新协议为
+`repair(sql, issues, semantic_context, question)`；迁移期仍接受旧的三参回调，但内置
+`fix_sql_governed(...)` / `fix_sql_governed_async(...)` 使用四参协议。原始问题、SQL
+和各数据块均按不可信数据转义，问题可在总预算内截断；结构化 issues 与
+`SemanticPromptBundle` 不会被截断。`PROMPT_MAX_LENGTH` 约束所有消息正文字符数之和，
+包括 system/human 固定骨架、标签和数据块；固定骨架与完整语义内容无法同时容纳时，
+会在调用同步或异步 LLM 前失败关闭。
 
 只有全部阶段通过时结果才是 `status: "success"`、`executable: true`。公共结果同时携带
 `semantic_version` 与 64 位小写 `content_sha256`。执行前会用当前激活快照重新授权，
@@ -174,6 +182,10 @@ context.reload_governance(
 颁发且尚未消费的本地 binding；重启后即使持久行身份完整，也会以
 `HISTORY_CONTEXT_MISMATCH` 失败关闭，调用方必须重新生成。启用预检时，MySQL `EXPLAIN` 的数据库错误、墙钟超时、
 空计划或超过阈值的估算扫描行数都会阻断执行；超时连接会失效并关闭，不会提交或回池复用。
+执行授权始终检查未经行数重写的原 SQL。授权成功后，执行层只会收紧查询：用户已有且
+不超过 `SQL_QUERY_MAX_ROWS` 的非负整数字面量 `LIMIT`（以及 `OFFSET`）保持原样；缺少
+LIMIT 或超过上限时才改为 `SQL_QUERY_MAX_ROWS + 1` 以探测截断。动态、表达式或负数
+LIMIT 失败关闭，因此执行 SQL 不会比已授权 SQL 返回更多行。
 
 ## 6. 回滚
 
@@ -275,7 +287,7 @@ safe_result = {
 
 ## 9. 日志、隐私与故障排查
 
-正常日志和默认 Golden 报告不写入完整问题、SQL 字面量、数据库原始异常、连接信息或凭据。请求审计记录语义版本、阶段耗时、错误码、是否纠错与可执行性；数据库异常仅进入受控、脱敏日志。不要把报告或日志加入 Few-Shot 数据源。
+正常日志和默认 Golden 报告不写入完整问题、SQL 字面量、SQL 参数、数据库原始异常、连接信息或凭据。请求审计记录语义版本、阶段耗时、错误码、是否纠错与可执行性；MySQL 异常只记录固定 stage、异常类型、随机 error ID 和不可逆 fingerprint，不依赖日志 sink 二次脱敏。不要把报告或日志加入 Few-Shot 数据源。
 
 | 现象 | 检查与处置 |
 | --- | --- |

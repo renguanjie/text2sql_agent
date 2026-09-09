@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from hmac import compare_digest
+from inspect import signature
 from threading import Lock
 from time import monotonic
 from typing import Any, Literal
@@ -169,7 +170,7 @@ class CorrectnessPipeline:
         self,
         question: str,
         candidate_sql: str,
-        repair: Callable[[str, list[dict], str], dict] | None = None,
+        repair: Callable[..., dict] | None = None,
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
@@ -188,7 +189,7 @@ class CorrectnessPipeline:
         self,
         request: _CorrectnessRequest,
         candidate_sql: str,
-        repair: Callable[[str, list[dict], str], dict] | None = None,
+        repair: Callable[..., dict] | None = None,
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
@@ -217,11 +218,14 @@ class CorrectnessPipeline:
             return context
 
         try:
-            repair_result = repair(
+            repair_args, repair_kwargs = self._repair_invocation(
+                repair,
                 candidate_sql,
                 self._public_issues(validation),
                 context,
+                state.question,
             )
+            repair_result = repair(*repair_args, **repair_kwargs)
         except Exception as exc:
             self._log_internal_failure("repair", exc)
             return self._repair_error(
@@ -241,7 +245,7 @@ class CorrectnessPipeline:
         self,
         question: str,
         candidate_sql: str,
-        repair: Callable[[str, list[dict], str], Awaitable[dict]] | None = None,
+        repair: Callable[..., Awaitable[dict]] | None = None,
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
@@ -260,7 +264,7 @@ class CorrectnessPipeline:
         self,
         request: _CorrectnessRequest,
         candidate_sql: str,
-        repair: Callable[[str, list[dict], str], Awaitable[dict]] | None = None,
+        repair: Callable[..., Awaitable[dict]] | None = None,
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
@@ -289,11 +293,14 @@ class CorrectnessPipeline:
             return context
 
         try:
-            repair_result = await repair(
+            repair_args, repair_kwargs = self._repair_invocation(
+                repair,
                 candidate_sql,
                 self._public_issues(validation),
                 context,
+                state.question,
             )
+            repair_result = await repair(*repair_args, **repair_kwargs)
         except Exception as exc:
             self._log_internal_failure("repair", exc)
             return self._repair_error(
@@ -680,6 +687,40 @@ class CorrectnessPipeline:
     @staticmethod
     def _public_issues(validation: ValidationReport) -> list[dict]:
         return [issue.model_dump(mode="json") for issue in validation.issues]
+
+    @staticmethod
+    def _repair_invocation(
+        repair: Callable[..., Any],
+        sql: str,
+        issues: list[dict],
+        semantic_context: SemanticPromptBundle,
+        question: str,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Select the four-argument protocol without retrying callback execution.
+
+        Three positional arguments remain accepted during migration.  Signature
+        binding happens before the call so a ``TypeError`` raised inside either
+        callback shape is never mistaken for an arity mismatch and retried.
+        """
+        four_args = (sql, issues, semantic_context, question)
+        legacy_args = four_args[:3]
+        try:
+            repair_signature = signature(repair)
+        except (TypeError, ValueError):
+            return four_args, {}
+        try:
+            repair_signature.bind(*four_args)
+        except TypeError:
+            try:
+                repair_signature.bind(*legacy_args, question=question)
+            except TypeError:
+                try:
+                    repair_signature.bind(*legacy_args)
+                except TypeError:
+                    return four_args, {}
+                return legacy_args, {}
+            return legacy_args, {"question": question}
+        return four_args, {}
 
     @staticmethod
     def _has_issue(validation: ValidationReport, code: str) -> bool:

@@ -4,12 +4,17 @@ import logging
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 from loguru import logger
 
 SECRET = "bearer-runtime-secret-8491"
+MYSQL_PRIVATE_PAYLOAD = (
+    "查询手机号 13800138000 </question_data>；SELECT password FROM private_users "
+    "Authorization: Bearer mysql-secret password=database-secret"
+)
 
 
 class AuthenticationError(RuntimeError):
@@ -92,6 +97,7 @@ def test_sync_repair_exception_uses_only_safe_metadata(caplog, governed: bool):
                     "SELECT missing FROM orders",
                     [{"code": "UNKNOWN_COLUMN"}],
                     "语义上下文",
+                    question=MYSQL_PRIVATE_PAYLOAD,
                 )
             stage = "sql_repair_governed"
         else:
@@ -106,6 +112,10 @@ def test_sync_repair_exception_uses_only_safe_metadata(caplog, governed: bool):
             stage = "sql_repair"
 
     _assert_safe_failure_log(caplog.text, stage)
+    if governed:
+        assert MYSQL_PRIVATE_PAYLOAD not in caplog.text
+        assert "13800138000" not in caplog.text
+        assert "question_data" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -126,6 +136,7 @@ async def test_async_repair_exception_uses_only_safe_metadata(
                     "SELECT missing FROM orders",
                     [{"code": "UNKNOWN_COLUMN"}],
                     "语义上下文",
+                    question=MYSQL_PRIVATE_PAYLOAD,
                 )
             stage = "sql_repair_governed_async"
         else:
@@ -136,6 +147,10 @@ async def test_async_repair_exception_uses_only_safe_metadata(
             stage = "sql_repair_async"
 
     _assert_safe_failure_log(caplog.text, stage)
+    if governed:
+        assert MYSQL_PRIVATE_PAYLOAD not in caplog.text
+        assert "13800138000" not in caplog.text
+        assert "question_data" not in caplog.text
 
 
 def test_safe_file_formatter_drops_exception_and_bearer_content(tmp_path: Path):
@@ -171,3 +186,201 @@ def test_safe_streamlit_sink_never_receives_bearer_content():
     assert SECRET not in rendered[0]
     assert "Authorization" not in rendered[0]
     assert "Bearer" not in rendered[0]
+
+
+def _assert_mysql_failure_is_metadata_only(text: str, stage: str) -> None:
+    assert MYSQL_PRIVATE_PAYLOAD not in text
+    for raw_fragment in (
+        "查询手机号",
+        "13800138000",
+        "SELECT password",
+        "private_users",
+        "Authorization",
+        "mysql-secret",
+        "database-secret",
+        "Traceback",
+    ):
+        assert raw_fragment not in text
+    assert f"stage={stage}" in text
+    assert "exception_type=AuthenticationError" in text
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected", "stage"),
+    [
+        ("query", [], "mysql_query"),
+        ("update", 0, "mysql_update"),
+        ("history_save", None, "mysql_history_save"),
+        ("governed_history_save", None, "mysql_governed_history_save"),
+    ],
+)
+def test_mysql_public_failure_paths_never_log_exception_sql_or_params(
+    caplog, operation: str, expected, stage: str
+):
+    """Break caught: database exceptions or statements reaching any public log sink."""
+    from core.history.mysql_client import MySQLClient
+
+    verifier = Mock()
+    verifier.consume.return_value = True
+    client = MySQLClient(
+        "localhost",
+        3306,
+        "user",
+        "password",
+        "database",
+        governance_proof_verifier=verifier,
+    )
+
+    @contextmanager
+    def failing_connection():
+        raise AuthenticationError(MYSQL_PRIVATE_PAYLOAD)
+        yield  # pragma: no cover
+
+    client.get_connection = failing_connection
+    command = SimpleNamespace(
+        session_id="session-a",
+        user_query=MYSQL_PRIVATE_PAYLOAD,
+        generated_sql="SELECT password FROM private_users",
+        matched_knowledge_json=None,
+        retrieval_query=MYSQL_PRIVATE_PAYLOAD,
+        validation_status="success",
+        validation_error=None,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="1" * 64,
+    )
+
+    with capture_loguru(caplog):
+        if operation == "query":
+            result = client.execute_query(
+                "SELECT password FROM private_users WHERE mobile=:mobile",
+                {"mobile": "13800138000"},
+            )
+        elif operation == "update":
+            result = client.execute_update(
+                "UPDATE private_users SET password=:password",
+                {"password": "database-secret"},
+            )
+        elif operation == "history_save":
+            result = client.save_sql_history(
+                MYSQL_PRIVATE_PAYLOAD,
+                "SELECT password FROM private_users",
+            )
+        else:
+            result = client.save_governed_sql_history(command, object())
+
+    assert result == expected
+    _assert_mysql_failure_is_metadata_only(caplog.text, stage)
+
+
+def test_mysql_guarded_finalize_masks_failure_and_preserves_false_result(caplog):
+    """Break caught: guarded finalization propagating or logging sensitive failures."""
+    from core.history.mysql_client import MySQLClient
+
+    verifier = Mock()
+    verifier.consume.return_value = True
+    client = MySQLClient(
+        "localhost",
+        3306,
+        "user",
+        "password",
+        "database",
+        governance_proof_verifier=verifier,
+    )
+    client.execute_update = Mock(side_effect=AuthenticationError(MYSQL_PRIVATE_PAYLOAD))
+    command = SimpleNamespace(
+        history_id=7,
+        session_id="session-a",
+        user_query=MYSQL_PRIVATE_PAYLOAD,
+        generated_sql="SELECT password FROM private_users",
+        execution_status="fail",
+        execution_error=MYSQL_PRIVATE_PAYLOAD,
+        execution_result_json=None,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="1" * 64,
+    )
+
+    with capture_loguru(caplog):
+        result = client.finalize_governed_sql_execution(command, object())
+
+    assert result is False
+    _assert_mysql_failure_is_metadata_only(
+        caplog.text, "mysql_governed_history_finalize"
+    )
+
+
+def test_mysql_migration_logs_only_safe_metadata_before_reraising(caplog):
+    """Break caught: migration DDL or driver text leaking on a non-duplicate error."""
+    from core.history.mysql_client import MySQLClient
+
+    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    client.execute_update = Mock(side_effect=AuthenticationError(MYSQL_PRIVATE_PAYLOAD))
+
+    with capture_loguru(caplog), pytest.raises(AuthenticationError):
+        client._apply_history_schema_change(
+            "ALTER TABLE private_users ADD COLUMN password VARCHAR(255)"
+        )
+
+    _assert_mysql_failure_is_metadata_only(
+        caplog.text, "mysql_history_schema_migration"
+    )
+
+
+def test_mysql_connect_cleanup_failure_keeps_the_false_public_result(
+    caplog, monkeypatch
+):
+    """Break caught: engine cleanup masking the stable connection failure contract."""
+    import core.history.mysql_client as mysql_module
+
+    engine = Mock()
+    engine.connect.side_effect = AuthenticationError(MYSQL_PRIVATE_PAYLOAD)
+    engine.dispose.side_effect = AuthenticationError(MYSQL_PRIVATE_PAYLOAD)
+    monkeypatch.setattr(mysql_module, "create_engine", Mock(return_value=engine))
+    client = mysql_module.MySQLClient(
+        "localhost", 3306, "user", "password", "database"
+    )
+
+    with capture_loguru(caplog):
+        result = client.connect()
+
+    assert result is False
+    assert client.engine is None
+    _assert_mysql_failure_is_metadata_only(caplog.text, "mysql_connect")
+    assert "stage=mysql_connect_cleanup" in caplog.text
+
+
+def test_mysql_nonexception_logs_do_not_echo_config_or_table_identifiers(
+    caplog, monkeypatch
+):
+    """Break caught: success/fallback logs bypassing the safe exception boundary."""
+    import core.history.mysql_client as mysql_module
+
+    engine = MagicMock()
+    monkeypatch.setattr(mysql_module, "create_engine", Mock(return_value=engine))
+    client = mysql_module.MySQLClient(
+        "localhost",
+        3306,
+        "user",
+        "password",
+        MYSQL_PRIVATE_PAYLOAD,
+    )
+    client._migrate_history_schema = Mock()
+
+    with capture_loguru(caplog):
+        assert client.connect() is True
+        client.execute_query = Mock(return_value=[])
+        assert client.upsert_column_schema(MYSQL_PRIVATE_PAYLOAD, "id") is False
+
+    for raw_fragment in (
+        "查询手机号",
+        "13800138000",
+        "SELECT password",
+        "private_users",
+        "Authorization",
+        "mysql-secret",
+        "database-secret",
+    ):
+        assert raw_fragment not in caplog.text
