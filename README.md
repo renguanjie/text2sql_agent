@@ -249,6 +249,7 @@ SQL_EXPLAIN_ENABLED=false
 | **MYSQL_POOL_SIZE** | ✨ MySQL 连接池大小 | 10 |
 | **MYSQL_MAX_OVERFLOW** | ✨ 最大溢出连接数 | 20 |
 | **MYSQL_POOL_TIMEOUT** | ✨ 获取连接超时（秒） | 30 |
+| HISTORY_MAX_RECORDS | SQL 历史保留上限（必须为 1–10000） | 1000 |
 | TEXT2SQL_RUN_DB_TESTS | 是否运行真实数据库集成测试 | 0 |
 
 #### Neo4j 配置

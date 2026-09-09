@@ -97,6 +97,12 @@ python -m streamlit run app.py
 
 现有进程可由拥有 `ApplicationContext` 的运维代码调用 `reload_governance(...)`。它会先候选构建（编译、加载、校验、新生成器），成功后一次替换注册表/管线/生成器；失败时旧的不可变对象图继续服务。
 
+生成阶段的 prepared capability 默认最多保留 256 个、120 秒，并在消费或放弃时
+原子删除；达到上限会稳定地拒绝新请求。受治理历史 binding 默认 900 秒过期，
+容量不超过 `HISTORY_MAX_RECORDS`（并有 4096 的进程内硬上限），只保存带进程随机密钥
+的会话、问题和规范化 SQL 摘要，不保留这些字段的明文。binding 在一次匹配的执行尝试
+开始时即消费；数据库历史本身按 `HISTORY_MAX_RECORDS`（1–10000，默认 1000）持续裁剪。
+
 ```python
 context.reload_governance(
     semantic_governance_enabled=True,

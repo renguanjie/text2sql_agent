@@ -11,6 +11,9 @@ class RuntimeConfigurationError(ValueError):
     """Configuration error whose message contains keys, never supplied values."""
 
 
+MAX_HISTORY_RECORDS = 10_000
+
+
 _BOOLEAN_CONFIG_KEYS = {
     "neo4j_enabled": "NEO4J_ENABLED",
     "faiss_enabled": "FAISS_ENABLED",
@@ -53,6 +56,22 @@ def validate_runtime_config(config: Mapping[str, Any]) -> None:
                 f"{public_key} 必须使用布尔值 true 或 false"
             )
 
+    if "history_max_records" in config:
+        validate_history_max_records(
+            config["history_max_records"], key="HISTORY_MAX_RECORDS"
+        )
+
+    if "governed_history_binding_ttl_seconds" in config:
+        ttl = config["governed_history_binding_ttl_seconds"]
+        if (
+            isinstance(ttl, bool)
+            or not isinstance(ttl, (int, float))
+            or not 0 < ttl <= 3600
+        ):
+            raise RuntimeConfigurationError(
+                "governed_history_binding_ttl_seconds 必须大于 0 且不超过 3600"
+            )
+
     governance_enabled = config.get("semantic_governance_enabled", False)
     explain_enabled = config.get("sql_explain_enabled", False)
     if explain_enabled and not governance_enabled:
@@ -74,8 +93,22 @@ def validate_runtime_config(config: Mapping[str, Any]) -> None:
         )
 
 
+def validate_history_max_records(value: Any, *, key: str) -> int:
+    """Require DB pruning to remain enabled with a defensible upper bound."""
+    if (
+        type(value) is not int
+        or not 1 <= value <= MAX_HISTORY_RECORDS
+    ):
+        raise RuntimeConfigurationError(
+            f"{key} 必须是 1 到 {MAX_HISTORY_RECORDS} 的整数"
+        )
+    return value
+
+
 __all__ = [
     "RuntimeConfigurationError",
+    "MAX_HISTORY_RECORDS",
     "parse_env_bool",
+    "validate_history_max_records",
     "validate_runtime_config",
 ]

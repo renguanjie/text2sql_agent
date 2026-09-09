@@ -9,6 +9,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.pool import QueuePool
 from loguru import logger
 from sqlglot import exp, parse_one
+from ..config_validation import validate_history_max_records
 from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
 from ..sql.preflight import ExplainDeadlineExceeded, run_with_wall_clock_deadline
 import json
@@ -44,7 +45,9 @@ class MySQLClient:
         self.pool_size = pool_size
         self.max_overflow = max_overflow
         self.pool_timeout = pool_timeout
-        self.history_max_records = history_max_records
+        self.history_max_records = validate_history_max_records(
+            history_max_records, key="history_max_records"
+        )
         self.engine = None
 
     def connect(self) -> bool:
@@ -342,8 +345,6 @@ class MySQLClient:
 
     def _prune_history(self) -> None:
         """保留最新的有限条历史，避免数据表无限增长。"""
-        if self.history_max_records <= 0:
-            return
         self.execute_update(
             """
             DELETE h FROM sql_generation_history AS h

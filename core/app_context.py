@@ -219,6 +219,10 @@ class ApplicationContext:
             'sql_scope_enforcement': config.get('sql_scope_enforcement', True),
             'sql_blocked_tables': config.get('sql_blocked_tables'),
             'prompt_max_length': config.get('prompt_max_length', 4000),
+            'history_max_records': config.get('history_max_records', 1000),
+            'governed_history_binding_ttl_seconds': config.get(
+                'governed_history_binding_ttl_seconds', 900
+            ),
         }
 
     def _init_sql_chain(self):

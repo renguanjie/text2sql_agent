@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from hmac import compare_digest
 from threading import Lock
+from time import monotonic
 from typing import Any, Literal
 
 from ..semantic.context import SemanticContextBuilder, SemanticPromptBundle
@@ -51,11 +53,16 @@ class _CorrectnessRequest:
     __slots__ = ()
 
 
+class PreparedRequestCapacityError(RuntimeError):
+    """Raised when no bounded prepared-capability slot is available."""
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedState:
     question: str = field(repr=False)
     snapshot: SemanticSnapshot = field(repr=False)
     semantic_context: SemanticPromptBundle | None = field(repr=False)
+    expires_at: float = field(repr=False)
 
 
 class CorrectnessPipeline:
@@ -70,11 +77,29 @@ class CorrectnessPipeline:
         max_repair_attempts: Literal[0, 1] = 1,
         blocked_tables: tuple[str, ...] = (),
         max_sql_length: int = 2000,
+        max_prepared_requests: int = 256,
+        prepared_request_ttl_seconds: float = 120.0,
+        clock: Callable[[], float] = monotonic,
     ):
         if type(max_repair_attempts) is not int or max_repair_attempts not in (0, 1):
             raise ValueError("max_repair_attempts 必须是 0 或 1")
         if type(max_sql_length) is not int or max_sql_length <= 0:
             raise ValueError("max_sql_length 必须是正整数")
+        if (
+            type(max_prepared_requests) is not int
+            or not 1 <= max_prepared_requests <= 4096
+        ):
+            raise ValueError("max_prepared_requests 必须是 1 到 4096 的整数")
+        if (
+            isinstance(prepared_request_ttl_seconds, bool)
+            or not isinstance(prepared_request_ttl_seconds, (int, float))
+            or not 0 < prepared_request_ttl_seconds <= 3600
+        ):
+            raise ValueError(
+                "prepared_request_ttl_seconds 必须大于 0 且不超过 3600"
+            )
+        if not callable(clock):
+            raise TypeError("clock 必须可调用")
         self.registry = registry
         self.context_builder = context_builder
         self.semantic_validator = semantic_validator
@@ -82,7 +107,12 @@ class CorrectnessPipeline:
         self.max_repair_attempts = max_repair_attempts
         self.blocked_tables = blocked_tables
         self.max_sql_length = max_sql_length
-        self._prepared_requests: dict[_CorrectnessRequest, _PreparedState] = {}
+        self.max_prepared_requests = max_prepared_requests
+        self.prepared_request_ttl_seconds = float(prepared_request_ttl_seconds)
+        self._clock = clock
+        self._prepared_requests: OrderedDict[
+            _CorrectnessRequest, _PreparedState
+        ] = OrderedDict()
         self._prepared_lock = Lock()
 
     def prepare_generation(self, question: str) -> _CorrectnessRequest:
@@ -100,6 +130,7 @@ class CorrectnessPipeline:
         if not isinstance(request, _CorrectnessRequest):
             return False
         with self._prepared_lock:
+            self._prune_prepared_locked(self._clock())
             return self._prepared_requests.pop(request, None) is not None
 
     def describe_prepared(self, request: Any) -> tuple[str, str, str]:
@@ -107,6 +138,7 @@ class CorrectnessPipeline:
         if not isinstance(request, _CorrectnessRequest):
             raise ValueError("prepared correctness request is invalid or expired")
         with self._prepared_lock:
+            self._prune_prepared_locked(self._clock())
             state = self._prepared_requests.get(request)
         if state is None:
             raise ValueError("prepared correctness request is invalid or expired")
@@ -328,11 +360,17 @@ class CorrectnessPipeline:
         except Exception as exc:
             self._log_internal_failure("snapshot", exc)
             return self._error_result("", None, 0)
-        return self._issue_request(
-            question,
-            snapshot,
-            semantic_context=None,
-        )
+        try:
+            return self._issue_request(
+                question,
+                snapshot,
+                semantic_context=None,
+            )
+        except Exception as exc:
+            self._log_internal_failure("prepared_request", exc)
+            return self._error_result(
+                "", snapshot.model_version, 0, snapshot.content_sha256
+            )
 
     def _issue_request(
         self,
@@ -346,15 +384,31 @@ class CorrectnessPipeline:
             question=question,
             snapshot=snapshot,
             semantic_context=semantic_context,
+            expires_at=self._clock() + self.prepared_request_ttl_seconds,
         )
         with self._prepared_lock:
+            self._prune_prepared_locked(self._clock())
+            if len(self._prepared_requests) >= self.max_prepared_requests:
+                raise PreparedRequestCapacityError(
+                    "prepared correctness request capacity exceeded"
+                )
             self._prepared_requests[request] = state
         return request
+
+    def _prune_prepared_locked(self, now: float) -> None:
+        expired = [
+            request
+            for request, state in self._prepared_requests.items()
+            if state.expires_at <= now
+        ]
+        for request in expired:
+            self._prepared_requests.pop(request, None)
 
     def _consume_request(self, request: Any) -> _PreparedState | None:
         if not isinstance(request, _CorrectnessRequest):
             return None
         with self._prepared_lock:
+            self._prune_prepared_locked(self._clock())
             return self._prepared_requests.pop(request, None)
 
     def _initial_validation(

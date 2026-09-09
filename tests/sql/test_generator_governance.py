@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
 import logging
@@ -102,12 +103,15 @@ def _snapshot(version: str = "1.0.0") -> SemanticSnapshot:
     )
 
 
-def _pipeline(*, max_repair_attempts: int = 1) -> CorrectnessPipeline:
+def _pipeline(
+    *, max_repair_attempts: int = 1, **options
+) -> CorrectnessPipeline:
     return CorrectnessPipeline(
         registry=StaticRegistry(_snapshot()),
         context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
         semantic_validator=SemanticSQLValidator(),
         max_repair_attempts=max_repair_attempts,
+        **options,
     )
 
 
@@ -137,6 +141,7 @@ def _generator(
     pipeline: CorrectnessPipeline | Mock | None,
     mysql_client=None,
     candidate_sql: str = "SELECT SUM(amount) FROM orders",
+    config_overrides: dict | None = None,
 ):
     from core.sql.generator import SQLGenerator
 
@@ -160,16 +165,18 @@ def _generator(
             "error": None,
         }
     )
+    generator_config = {
+        "sql_dialect": "mysql",
+        "sql_query_max_rows": 5,
+        "sql_query_timeout_ms": 2500,
+    }
+    generator_config.update(config_overrides or {})
     generator = SQLGenerator(
         Mock(),
         retriever,
         chain,
         mysql_client=mysql_client,
-        config={
-            "sql_dialect": "mysql",
-            "sql_query_max_rows": 5,
-            "sql_query_timeout_ms": 2500,
-        },
+        config=generator_config,
         correctness_pipeline=pipeline,
     )
     context = {
@@ -384,6 +391,23 @@ def test_generator_prepare_exception_returns_stable_error_without_leaking(caplog
     assert "stage=sql_generator" in caplog.text
 
 
+def test_generator_prepared_capacity_exhaustion_is_stable_and_fail_closed(caplog):
+    pipeline = _pipeline(max_prepared_requests=1)
+    pipeline.prepare_generation("private outstanding question")
+    generator = _generator(pipeline=pipeline)
+
+    with capture_loguru(caplog):
+        result = generator.generate_sql(
+            "second secret question", auto_save_history=False
+        )
+
+    assert result["status"] == "error"
+    assert result["executable"] is False
+    assert result["validation"]["issues"][0]["code"] == "CORRECTNESS_UNAVAILABLE"
+    assert "private outstanding question" not in caplog.text
+    assert "second secret question" not in caplog.text
+
+
 def test_sync_generator_discards_prepared_request_when_chain_raises(monkeypatch):
     """An exception before correctness processing must not leave a live token."""
     pipeline = _pipeline()
@@ -570,6 +594,151 @@ def test_governed_history_is_saved_after_rejection_with_only_structured_codes():
     assert saved["validation_status"] == "fail"
     assert saved["validation_error"] == "METRIC_MISMATCH"
     generator.knowledge_retriever.add_history_record.assert_not_called()
+    assert not generator._governed_history_bindings
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_governed_history_bindings_are_digest_only_and_lru_bounded():
+    mysql = Mock()
+    mysql.save_sql_history.side_effect = [11, 12, 13]
+    generator = _generator(
+        pipeline=_pipeline(),
+        mysql_client=mysql,
+        config_overrides={"history_max_records": 2},
+    )
+    generator.sql_chain.generate.side_effect = lambda **_kwargs: {
+        "status": "success",
+        "sql": "SELECT SUM(amount) FROM orders",
+        "matched_knowledge": [],
+    }
+
+    results = [
+        generator.generate_sql(f"订单金额 private-{index}", session_id=f"s-{index}")
+        for index in range(3)
+    ]
+
+    assert [result["history_id"] for result in results] == [11, 12, 13]
+    assert list(generator._governed_history_bindings) == [12, 13]
+    stored = repr(tuple(generator._governed_history_bindings.values()))
+    assert "SELECT" not in stored
+    assert "订单金额" not in stored
+    assert "private-" not in stored
+    assert "s-" not in stored
+
+
+def test_evicted_governed_history_binding_fails_closed():
+    mysql = Mock()
+    mysql.save_sql_history.side_effect = [11, 12]
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders", session_id="session-a"
+    ) | {"id": 11}
+    generator = _generator(
+        pipeline=_pipeline(),
+        mysql_client=mysql,
+        config_overrides={"history_max_records": 1},
+    )
+    generator.sql_chain.generate.side_effect = lambda **_kwargs: {
+        "status": "success",
+        "sql": "SELECT SUM(amount) FROM orders",
+        "matched_knowledge": [],
+    }
+    first = generator.generate_sql("订单金额", session_id="session-a")
+    generator.generate_sql("订单金额", session_id="session-b")
+    mysql.reset_mock()
+    mysql.get_history_detail.return_value = _successful_history(
+        sql=first["sql"], session_id="session-a"
+    ) | {"id": 11}
+
+    result = generator.execute_sql(
+        first["sql"],
+        history_id=first["history_id"],
+        session_id="session-a",
+        allowed_tables=first["allowed_tables"],
+        allowed_schemas=first["allowed_schemas"],
+        user_query=first["user_query"],
+        semantic_version=first["semantic_version"],
+        content_sha256=first["content_sha256"],
+    )
+
+    assert result["status"] == "error"
+    assert result["validation"]["issues"][0]["code"] == "HISTORY_CONTEXT_MISMATCH"
+    mysql.execute_query_limited.assert_not_called()
+
+
+def test_expired_governed_history_binding_is_pruned_and_fails_closed():
+    clock = FakeClock()
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    generator = _generator(
+        pipeline=_pipeline(),
+        mysql_client=mysql,
+        config_overrides={"governed_history_binding_ttl_seconds": 2},
+    )
+    generator._clock = clock
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    clock.advance(2.1)
+    mysql.reset_mock()
+    mysql.get_history_detail.return_value = _successful_history(sql=generated["sql"])
+
+    result = generator.execute_sql(
+        generated["sql"],
+        history_id=generated["history_id"],
+        session_id="session-a",
+        allowed_tables=generated["allowed_tables"],
+        allowed_schemas=generated["allowed_schemas"],
+        user_query=generated["user_query"],
+        semantic_version=generated["semantic_version"],
+        content_sha256=generated["content_sha256"],
+    )
+
+    assert result["status"] == "error"
+    assert not generator._governed_history_bindings
+    mysql.execute_query_limited.assert_not_called()
+
+
+def test_concurrent_governed_history_execution_consumes_binding_once():
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    )
+    mysql.update_sql_execution.return_value = True
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+    generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    mysql.reset_mock()
+    mysql.get_history_detail.return_value = _successful_history(sql=generated["sql"])
+    mysql.update_sql_execution.return_value = True
+    mysql.execute_query_limited.return_value = ([{"total": 10}], False)
+
+    def execute(_index: int):
+        return generator.execute_sql(
+            generated["sql"],
+            history_id=generated["history_id"],
+            session_id="session-a",
+            allowed_tables=generated["allowed_tables"],
+            allowed_schemas=generated["allowed_schemas"],
+            user_query=generated["user_query"],
+            semantic_version=generated["semantic_version"],
+            content_sha256=generated["content_sha256"],
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(execute, range(16)))
+
+    assert sum(result["status"] == "success" for result in results) == 1
+    assert mysql.execute_query_limited.call_count == 1
+    assert mysql.update_sql_execution.call_count == 1
 
 
 def _successful_history(*, sql: str, session_id: str = "session-a") -> dict:

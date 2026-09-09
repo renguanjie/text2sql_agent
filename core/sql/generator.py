@@ -3,13 +3,19 @@ SQL 生成器模块
 整合检索、链式处理，提供统一的 SQL 生成接口（支持异步）
 支持多数据库方言动态检测
 """
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hmac import compare_digest, digest as hmac_digest
+from secrets import token_bytes
+from threading import Lock
+from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
 from ..chain.sql_chain import QueryRewriteChain, SQLGenerationChain
+from ..config_validation import validate_history_max_records
 from ..history.mysql_client import MySQLClient
 from ..retrieval.bm25_tfidf import KnowledgeRetriever
 from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
@@ -27,14 +33,14 @@ from .validator import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _GovernedHistoryBinding:
-    session_id: str | None
-    generated_sql: str
-    user_query: str
+    session_sha256: str
+    generated_sql_sha256: str
+    user_query_sha256: str
     semantic_version: str | None
     content_sha256: str | None
-    validation_succeeded: bool
+    expires_at: float
 
 
 class SQLGenerator:
@@ -53,7 +59,29 @@ class SQLGenerator:
         self.config = config or {}
         self.neo4j_client = neo4j_client
         self.correctness_pipeline = correctness_pipeline
-        self._governed_history_bindings: dict[int, _GovernedHistoryBinding] = {}
+        history_capacity = validate_history_max_records(
+            self.config.get('history_max_records', 1000),
+            key="history_max_records",
+        )
+        binding_ttl = self.config.get(
+            'governed_history_binding_ttl_seconds', 900
+        )
+        if (
+            isinstance(binding_ttl, bool)
+            or not isinstance(binding_ttl, (int, float))
+            or not 0 < binding_ttl <= 3600
+        ):
+            raise ValueError(
+                "governed_history_binding_ttl_seconds 必须大于 0 且不超过 3600"
+            )
+        self._governed_history_binding_capacity = min(history_capacity, 4096)
+        self._governed_history_binding_ttl_seconds = float(binding_ttl)
+        self._governed_history_digest_key = token_bytes(32)
+        self._clock = monotonic
+        self._governed_history_bindings: OrderedDict[
+            int, _GovernedHistoryBinding
+        ] = OrderedDict()
+        self._governed_history_lock = Lock()
 
         self.rewrite_chain = QueryRewriteChain(
             llm, prompt_max_length=self.config.get('prompt_max_length', 4000)
@@ -143,22 +171,81 @@ class SQLGenerator:
         )
         if history_id:
             result['history_id'] = history_id
-            if self.correctness_pipeline is not None:
-                self._governed_history_bindings[history_id] = (
-                    _GovernedHistoryBinding(
-                        session_id=session_id,
-                        generated_sql=result['sql'],
-                        user_query=user_query,
-                        semantic_version=result.get('semantic_version'),
-                        content_sha256=result.get('content_sha256'),
-                        validation_succeeded=(
-                            validation_status == 'success'
-                            and result.get('executable') is True
-                        ),
-                    )
+            if (
+                self.correctness_pipeline is not None
+                and validation_status == 'success'
+                and result.get('executable') is True
+                and isinstance(history_id, int)
+                and not isinstance(history_id, bool)
+                and isinstance(session_id, str)
+                and session_id
+            ):
+                self._remember_governed_history_binding(
+                    history_id,
+                    session_id=session_id,
+                    generated_sql=result['sql'],
+                    user_query=user_query,
+                    semantic_version=result.get('semantic_version'),
+                    content_sha256=result.get('content_sha256'),
                 )
 
-    def _promote_history_to_few_shot(
+    def _identity_digest(self, domain: str, value: str) -> str:
+        payload = f"{domain}\0{value}".encode("utf-8")
+        return hmac_digest(
+            self._governed_history_digest_key, payload, "sha256"
+        ).hex()
+
+    def _canonical_sql(self, sql: str) -> str | None:
+        try:
+            import sqlglot
+
+            dialect = self.sql_chain.dialect
+            return sqlglot.parse_one(sql, read=dialect).sql(dialect=dialect)
+        except Exception:
+            return None
+
+    def _remember_governed_history_binding(
+        self,
+        history_id: int,
+        *,
+        session_id: str,
+        generated_sql: str,
+        user_query: str,
+        semantic_version: str | None,
+        content_sha256: str | None,
+    ) -> None:
+        canonical_sql = self._canonical_sql(generated_sql)
+        if canonical_sql is None:
+            return
+        now = self._clock()
+        binding = _GovernedHistoryBinding(
+            session_sha256=self._identity_digest("session", session_id),
+            generated_sql_sha256=self._identity_digest("sql", canonical_sql),
+            user_query_sha256=self._identity_digest("question", user_query),
+            semantic_version=semantic_version,
+            content_sha256=content_sha256,
+            expires_at=now + self._governed_history_binding_ttl_seconds,
+        )
+        with self._governed_history_lock:
+            self._prune_governed_history_bindings_locked(now)
+            self._governed_history_bindings.pop(history_id, None)
+            while (
+                len(self._governed_history_bindings)
+                >= self._governed_history_binding_capacity
+            ):
+                self._governed_history_bindings.popitem(last=False)
+            self._governed_history_bindings[history_id] = binding
+
+    def _prune_governed_history_bindings_locked(self, now: float) -> None:
+        expired = [
+            history_id
+            for history_id, binding in self._governed_history_bindings.items()
+            if binding.expires_at <= now
+        ]
+        for history_id in expired:
+            self._governed_history_bindings.pop(history_id, None)
+
+    def _consume_governed_history_binding(
         self,
         history_id: int,
         *,
@@ -167,19 +254,46 @@ class SQLGenerator:
         user_query: str | None,
         semantic_version: str | None,
         content_sha256: str | None,
+    ) -> bool:
+        canonical_sql = self._canonical_sql(sql)
+        if canonical_sql is None or not isinstance(user_query, str):
+            return False
+        expected_session = self._identity_digest("session", session_id)
+        expected_sql = self._identity_digest("sql", canonical_sql)
+        expected_question = self._identity_digest("question", user_query)
+        now = self._clock()
+        with self._governed_history_lock:
+            self._prune_governed_history_bindings_locked(now)
+            binding = self._governed_history_bindings.get(history_id)
+            if (
+                binding is None
+                or not compare_digest(binding.session_sha256, expected_session)
+                or not compare_digest(binding.generated_sql_sha256, expected_sql)
+                or not compare_digest(binding.user_query_sha256, expected_question)
+                or binding.semantic_version != semantic_version
+                or binding.content_sha256 != content_sha256
+            ):
+                return False
+            self._governed_history_bindings.pop(history_id, None)
+            return True
+
+    def _promote_history_to_few_shot(
+        self,
+        history_id: int,
+        *,
+        expected_history: Mapping[str, Any],
     ) -> None:
         """将真实执行成功的历史记录加入 Few-Shot 索引。"""
-        history, error = self._bound_history(
-            history_id,
-            session_id=session_id,
-            sql=sql,
-            user_query=user_query,
-            semantic_version=semantic_version,
-            content_sha256=content_sha256,
-        )
+        history = self.mysql_client.get_history_detail(history_id)
         if (
-            error is None
-            and history
+            isinstance(history, Mapping)
+            and history.get('session_id') == expected_history.get('session_id')
+            and history.get('user_query') == expected_history.get('user_query')
+            and isinstance(history.get('generated_sql'), str)
+            and isinstance(expected_history.get('generated_sql'), str)
+            and self._same_sql(
+                history['generated_sql'], expected_history['generated_sql']
+            )
             and history.get('validation_status') == 'success'
             and history.get('execution_status') == 'success'
         ):
@@ -210,31 +324,24 @@ class SQLGenerator:
             return None, '执行历史与当前会话或 SQL 不匹配'
 
         if self.correctness_pipeline is not None:
-            binding = self._governed_history_bindings.get(history_id)
             if (
-                binding is None
-                or not binding.validation_succeeded
-                or binding.session_id != session_id
-                or not self._same_sql(binding.generated_sql, sql)
-                or binding.user_query != user_query
-                or binding.semantic_version != semantic_version
-                or binding.content_sha256 != content_sha256
-                or history.get('user_query') != user_query
+                history.get('user_query') != user_query
+                or not self._consume_governed_history_binding(
+                    history_id,
+                    session_id=session_id,
+                    sql=sql,
+                    user_query=user_query,
+                    semantic_version=semantic_version,
+                    content_sha256=content_sha256,
+                )
             ):
                 return None, '执行历史与当前治理上下文不匹配'
         return history, None
 
     def _same_sql(self, left: str, right: str) -> bool:
-        try:
-            import sqlglot
-
-            dialect = self.sql_chain.dialect
-            return (
-                sqlglot.parse_one(left, read=dialect).sql(dialect=dialect)
-                == sqlglot.parse_one(right, read=dialect).sql(dialect=dialect)
-            )
-        except Exception:
-            return False
+        left_canonical = self._canonical_sql(left)
+        right_canonical = self._canonical_sql(right)
+        return left_canonical is not None and left_canonical == right_canonical
 
     def _history_context_error(
         self,
@@ -927,11 +1034,7 @@ class SQLGenerator:
                     }
                 self._promote_history_to_few_shot(
                     history_id,
-                    session_id=session_id,
-                    sql=sql,
-                    user_query=user_query,
-                    semantic_version=semantic_version,
-                    content_sha256=content_sha256,
+                    expected_history=history,
                 )
 
             return {

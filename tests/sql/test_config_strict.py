@@ -180,3 +180,27 @@ def test_runtime_reload_rejects_non_mysql_governance_with_safe_error():
     assert "SEMANTIC_GOVERNANCE_ENABLED" in message
     assert "postgres-secret-value" not in message
     assert context.config["semantic_governance_enabled"] is False
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "10001"])
+def test_history_capacity_environment_cannot_disable_or_exceed_pruning(raw: str):
+    result = _run_config_script("import config", HISTORY_MAX_RECORDS=raw)
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "HISTORY_MAX_RECORDS" in output
+
+
+@pytest.mark.parametrize("limit", [0, -1, 10_001, True])
+def test_mysql_client_rejects_unbounded_history_configuration(limit):
+    from core.history.mysql_client import MySQLClient
+
+    with pytest.raises(ValueError, match="history_max_records"):
+        MySQLClient(
+            host="localhost",
+            port=3306,
+            user="user",
+            password="password",
+            database="database",
+            history_max_records=limit,
+        )

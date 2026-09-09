@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -125,14 +127,26 @@ def pipeline(registry: MutableRegistry):
     )
 
 
-def _make_pipeline():
+def _make_pipeline(**options):
     from core.sql.correctness import CorrectnessPipeline
 
     return CorrectnessPipeline(
         registry=MutableRegistry(_snapshot()),
         context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
         semantic_validator=SemanticSQLValidator(),
+        **options,
     )
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 def test_repairs_once_then_rejects(pipeline):
@@ -441,6 +455,90 @@ def test_discarded_prepared_request_cannot_be_used():
 
     assert result.status == "error"
     assert result.executable is False
+
+
+def test_prepared_request_capacity_fails_closed_without_leaking_question():
+    clock = FakeClock()
+    pipeline = _make_pipeline(
+        max_prepared_requests=1,
+        prepared_request_ttl_seconds=5,
+        clock=clock,
+    )
+    pipeline.prepare_generation("first private question")
+
+    with pytest.raises(RuntimeError) as error:
+        pipeline.prepare_generation("second secret question")
+
+    message = str(error.value)
+    assert "prepared correctness request capacity exceeded" in message
+    assert "first private question" not in message
+    assert "second secret question" not in message
+    result = pipeline.process(
+        "third secret question", "SELECT SUM(amount) FROM orders"
+    )
+    assert result.status == "error"
+    assert result.executable is False
+    assert result.validation.issues[0].code == "CORRECTNESS_UNAVAILABLE"
+
+
+def test_expired_prepared_requests_are_pruned_before_capacity_check():
+    clock = FakeClock()
+    pipeline = _make_pipeline(
+        max_prepared_requests=2,
+        prepared_request_ttl_seconds=5,
+        clock=clock,
+    )
+    first = pipeline.prepare_generation("订单金额")
+    second = pipeline.prepare_generation("订单数量")
+
+    clock.advance(5.1)
+    replacement = pipeline.prepare_generation("订单趋势")
+
+    with pytest.raises(ValueError, match="invalid or expired"):
+        pipeline.describe_prepared(first)
+    assert pipeline.discard_prepared(second) is False
+    assert pipeline.describe_prepared(replacement)[1:] == ("1.0.0", "1" * 64)
+
+
+def test_concurrent_prepared_consumers_preserve_one_shot_semantics():
+    pipeline = _make_pipeline()
+    request = pipeline.prepare_generation("订单金额")
+
+    def consume(_index: int):
+        return pipeline.process_prepared(
+            request, "SELECT SUM(amount) FROM orders"
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(consume, range(24)))
+
+    assert sum(result.status == "success" for result in results) == 1
+    assert sum(result.status == "error" for result in results) == 23
+    assert all(result.executable is False for result in results if result.status == "error")
+
+
+def test_concurrent_discard_and_consume_have_one_atomic_winner():
+    pipeline = _make_pipeline()
+    request = pipeline.prepare_generation("订单金额")
+    barrier = Barrier(2)
+
+    def discard():
+        barrier.wait()
+        return pipeline.discard_prepared(request)
+
+    def consume():
+        barrier.wait()
+        return pipeline.process_prepared(
+            request, "SELECT SUM(amount) FROM orders"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        discard_future = executor.submit(discard)
+        consume_future = executor.submit(consume)
+        discarded = discard_future.result()
+        result = consume_future.result()
+
+    assert (discarded, result.status) in {(True, "error"), (False, "success")}
 
 
 def test_original_and_repaired_candidates_both_run_preflight(registry: MutableRegistry):

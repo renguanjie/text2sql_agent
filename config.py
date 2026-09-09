@@ -227,6 +227,7 @@ def validate_config():
             "sql_explain_enabled": SQL_EXPLAIN_ENABLED,
             "streamlit_head": STREAMLIT_HEAD,
             "history_auto_save": HISTORY_AUTO_SAVE,
+            "history_max_records": HISTORY_MAX_RECORDS,
             "sql_dialect": SQL_DIALECT,
         }
     )
