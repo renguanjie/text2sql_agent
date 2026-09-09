@@ -33,6 +33,7 @@ class _GovernedHistoryBinding:
     generated_sql: str
     user_query: str
     semantic_version: str | None
+    content_sha256: str | None
     validation_succeeded: bool
 
 
@@ -149,6 +150,7 @@ class SQLGenerator:
                         generated_sql=result['sql'],
                         user_query=user_query,
                         semantic_version=result.get('semantic_version'),
+                        content_sha256=result.get('content_sha256'),
                         validation_succeeded=(
                             validation_status == 'success'
                             and result.get('executable') is True
@@ -164,6 +166,7 @@ class SQLGenerator:
         sql: str,
         user_query: str | None,
         semantic_version: str | None,
+        content_sha256: str | None,
     ) -> None:
         """将真实执行成功的历史记录加入 Few-Shot 索引。"""
         history, error = self._bound_history(
@@ -172,6 +175,7 @@ class SQLGenerator:
             sql=sql,
             user_query=user_query,
             semantic_version=semantic_version,
+            content_sha256=content_sha256,
         )
         if (
             error is None
@@ -189,6 +193,7 @@ class SQLGenerator:
         sql: str,
         user_query: str | None,
         semantic_version: str | None,
+        content_sha256: str | None,
     ) -> tuple[Mapping[str, Any] | None, str | None]:
         """Resolve a history row only when all execution identity fields match."""
         if not session_id:
@@ -213,6 +218,7 @@ class SQLGenerator:
                 or not self._same_sql(binding.generated_sql, sql)
                 or binding.user_query != user_query
                 or binding.semantic_version != semantic_version
+                or binding.content_sha256 != content_sha256
                 or history.get('user_query') != user_query
             ):
                 return None, '执行历史与当前治理上下文不匹配'
@@ -231,13 +237,19 @@ class SQLGenerator:
             return False
 
     def _history_context_error(
-        self, message: str, *, sql: str, semantic_version: str | None
+        self,
+        message: str,
+        *,
+        sql: str,
+        semantic_version: str | None,
+        content_sha256: str | None,
     ) -> Dict[str, Any]:
         if self.correctness_pipeline is not None:
             return self._governed_error_payload(
                 code=HISTORY_CONTEXT_MISMATCH,
                 message=message,
                 semantic_version=semantic_version,
+                content_sha256=content_sha256,
                 sql=sql,
                 stage='safety',
             ) | {'data': None}
@@ -314,25 +326,26 @@ class SQLGenerator:
 
     def _prepare_governed_context(
         self, user_query: str
-    ) -> tuple[Any | None, str, str | None, Dict[str, Any] | None]:
+    ) -> tuple[Any | None, str, str | None, str | None, Dict[str, Any] | None]:
         """Pin the immutable correctness request before invoking the LLM."""
         if self.correctness_pipeline is None:
-            return None, "", None, None
+            return None, "", None, None, None
         request = None
         try:
             request = self.correctness_pipeline.prepare_generation(user_query)
-            semantic_context, semantic_version, _content_sha256 = (
+            semantic_context, semantic_version, content_sha256 = (
                 self.correctness_pipeline.describe_prepared(request)
             )
-            return request, semantic_context, semantic_version, None
+            return request, semantic_context, semantic_version, content_sha256, None
         except Exception as exc:
             if request is not None:
                 self.correctness_pipeline.discard_prepared(request)
             log_safe_exception("governed_generation_context", exc)
-            return None, "", None, self._governed_error_payload(
+            return None, "", None, None, self._governed_error_payload(
                 code="CORRECTNESS_UNAVAILABLE",
                 message="SQL 正确性校验暂时不可用",
                 semantic_version=None,
+                content_sha256=None,
                 sql=None,
             )
 
@@ -342,6 +355,7 @@ class SQLGenerator:
         code: str,
         message: str,
         semantic_version: str | None,
+        content_sha256: str | None = None,
         sql: str | None,
         stage: str = "semantic",
     ) -> Dict[str, Any]:
@@ -350,6 +364,7 @@ class SQLGenerator:
             'status': 'error',
             'error': message,
             'semantic_version': semantic_version,
+            'content_sha256': content_sha256,
             'validation': {
                 'valid': False,
                 'issues': [{
@@ -371,6 +386,7 @@ class SQLGenerator:
             'sql': correctness.sql,
             'status': correctness.status,
             'semantic_version': correctness.semantic_version,
+            'content_sha256': correctness.content_sha256,
             'validation': correctness.validation.model_dump(mode='json'),
             'repair_attempts': correctness.repair_attempts,
             'executable': correctness.executable,
@@ -390,12 +406,14 @@ class SQLGenerator:
         user_query: str,
         request: Any,
         semantic_version: str,
+        content_sha256: str,
     ) -> None:
         if result.get('status') != 'success' or not result.get('sql'):
             failure = self._governed_error_payload(
                 code=GENERATION_FAILED,
                 message='未生成可供正确性校验的 SQL',
                 semantic_version=semantic_version,
+                content_sha256=content_sha256,
                 sql=result.get('sql'),
                 stage='syntax',
             )
@@ -418,12 +436,14 @@ class SQLGenerator:
         user_query: str,
         request: Any,
         semantic_version: str,
+        content_sha256: str,
     ) -> None:
         if result.get('status') != 'success' or not result.get('sql'):
             failure = self._governed_error_payload(
                 code=GENERATION_FAILED,
                 message='未生成可供正确性校验的 SQL',
                 semantic_version=semantic_version,
+                content_sha256=content_sha256,
                 sql=result.get('sql'),
                 stage='syntax',
             )
@@ -513,6 +533,7 @@ class SQLGenerator:
             correctness_request,
             semantic_context,
             semantic_version,
+            content_sha256,
             governance_error,
         ) = self._prepare_governed_context(user_query)
         if governance_error is not None:
@@ -538,6 +559,7 @@ class SQLGenerator:
                     user_query,
                     correctness_request,
                     semantic_version or '',
+                    content_sha256 or '',
                 )
             else:
                 self._validate_generation_result(
@@ -574,6 +596,7 @@ class SQLGenerator:
             correctness_request,
             semantic_context,
             semantic_version,
+            content_sha256,
             governance_error,
         ) = self._prepare_governed_context(user_query)
         if governance_error is not None:
@@ -599,6 +622,7 @@ class SQLGenerator:
                     user_query,
                     correctness_request,
                     semantic_version or '',
+                    content_sha256 or '',
                 )
             else:
                 self._validate_generation_result(
@@ -739,20 +763,23 @@ class SQLGenerator:
                     allowed_schemas: Optional[List[str]] = None,
                     user_query: Optional[str] = None,
                     semantic_version: Optional[str] = None,
-                    session_id: Optional[str] = None) -> Dict[str, Any]:
+                    session_id: Optional[str] = None,
+                    content_sha256: Optional[str] = None) -> Dict[str, Any]:
         """执行 SQL"""
         if self.correctness_pipeline is not None:
-            if not user_query or not semantic_version:
+            if not user_query or not semantic_version or not content_sha256:
                 return self._governed_error_payload(
                     code=EXECUTION_CONTEXT_REQUIRED,
                     message='执行前需要原问题和语义版本',
                     semantic_version=semantic_version,
+                    content_sha256=content_sha256,
                     sql=sql,
                 ) | {'data': None}
             authorization = self.correctness_pipeline.authorize_execution(
                 question=user_query,
                 sql=sql,
                 expected_semantic_version=semantic_version,
+                expected_content_sha256=content_sha256,
                 allowed_tables=tuple(allowed_tables or ()),
                 allowed_schemas=tuple(allowed_schemas or ()),
             )
@@ -767,6 +794,7 @@ class SQLGenerator:
                     'data': None,
                     'sql': authorization.sql,
                     'semantic_version': authorization.semantic_version,
+                    'content_sha256': authorization.content_sha256,
                     'validation': authorization.validation.model_dump(mode='json'),
                     'repair_attempts': authorization.repair_attempts,
                     'executable': False,
@@ -787,12 +815,14 @@ class SQLGenerator:
                     sql=sql,
                     user_query=user_query,
                     semantic_version=semantic_version,
+                    content_sha256=content_sha256,
                 )
                 if history_error is not None:
                     return self._history_context_error(
                         history_error,
                         sql=sql,
                         semantic_version=semantic_version,
+                        content_sha256=content_sha256,
                     )
 
         logger.info("准备执行 SQL：sql_id={}", text_fingerprint(sql))
@@ -843,6 +873,7 @@ class SQLGenerator:
                     sql=sql,
                     user_query=user_query,
                     semantic_version=semantic_version,
+                    content_sha256=content_sha256,
                 )
 
             return {

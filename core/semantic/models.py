@@ -166,6 +166,14 @@ class CorrectnessResult(FrozenModel):
     status: Literal["success", "rejected", "error"]
     sql: str | None
     semantic_version: str | None
+    content_sha256: StrictStr | None = None
     validation: ValidationReport
     repair_attempts: Literal[0, 1]
     executable: StrictBool
+
+    @field_validator("content_sha256")
+    @classmethod
+    def validate_content_sha256(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("content_sha256 必须是小写 SHA-256")
+        return value

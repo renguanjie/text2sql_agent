@@ -970,6 +970,7 @@ with tab1:
                     'sql': result['sql'],
                     'status': result.get('status'),
                     'semantic_version': result.get('semantic_version'),
+                    'content_sha256': result.get('content_sha256'),
                     'validation': result.get('validation'),
                     'executable': result.get('executable'),
                     'allowed_tables': result.get('allowed_tables'),
@@ -1030,6 +1031,9 @@ with tab1:
                 user_query=(st.session_state.last_result or {}).get('user_query'),
                 semantic_version=(st.session_state.last_result or {}).get(
                     'semantic_version'
+                ),
+                content_sha256=(st.session_state.last_result or {}).get(
+                    'content_sha256'
                 ),
                 session_id=st.session_state.session_id,
             )

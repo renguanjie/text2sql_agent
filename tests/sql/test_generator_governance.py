@@ -261,6 +261,7 @@ def test_generator_returns_governed_result_and_injects_the_same_semantic_context
     result = generator.generate_sql("订单金额", auto_save_history=False)
 
     assert result["semantic_version"] == "1.0.0"
+    assert result["content_sha256"] == "1" * 64
     assert result["repair_attempts"] == 0
     assert result["executable"] is True
     assert result["validation"] == {"valid": True, "issues": []}
@@ -608,6 +609,7 @@ def test_governed_execute_rejects_unbound_history_without_mutating_it(
         "allowed_schemas": generated["allowed_schemas"],
         "user_query": generated["user_query"],
         "semantic_version": generated["semantic_version"],
+        "content_sha256": generated["content_sha256"],
     }
     arguments.update(execute_overrides)
     if execute_overrides.get("semantic_version") == "9.9.9":
@@ -646,6 +648,7 @@ def test_governed_success_updates_and_promotes_only_the_bound_history():
         allowed_schemas=generated["allowed_schemas"],
         user_query=generated["user_query"],
         semantic_version=generated["semantic_version"],
+        content_sha256=generated["content_sha256"],
     )
 
     assert result["status"] == "success"
@@ -682,6 +685,7 @@ def test_history_question_changed_after_read_cannot_be_updated_or_promoted():
         allowed_schemas=generated["allowed_schemas"],
         user_query=generated["user_query"],
         semantic_version=generated["semantic_version"],
+        content_sha256=generated["content_sha256"],
     )
 
     assert result == {
@@ -710,6 +714,7 @@ def test_restarted_generator_fails_closed_for_old_governed_history_id():
         allowed_schemas=[],
         user_query="订单金额",
         semantic_version="1.0.0",
+        content_sha256="1" * 64,
     )
 
     assert result["status"] == "error"
@@ -745,6 +750,53 @@ def test_governed_execute_requires_original_question_and_semantic_version():
     assert result["status"] == "error"
     assert "原问题和语义版本" in result["error"]
     assert result["validation"]["issues"][0]["code"] == "EXECUTION_CONTEXT_REQUIRED"
+    mysql.execute_query_limited.assert_not_called()
+
+
+def test_governed_execute_requires_generation_content_hash():
+    """The optional compatibility argument must fail closed when governance is active."""
+    mysql = Mock()
+    generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
+
+    result = generator.execute_sql(
+        "SELECT SUM(amount) FROM orders",
+        user_query="订单金额",
+        semantic_version="1.0.0",
+    )
+
+    assert result["status"] == "error"
+    assert result["executable"] is False
+    assert result["validation"]["issues"][0]["code"] == "EXECUTION_CONTEXT_REQUIRED"
+    mysql.execute_query_limited.assert_not_called()
+
+
+def test_governed_history_binding_rejects_content_hash_substitution():
+    mysql = Mock()
+    mysql.save_sql_history.return_value = 17
+    mysql.get_history_detail.return_value = _successful_history(
+        sql="SELECT SUM(amount) FROM orders"
+    )
+    generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
+    generated = generator.generate_sql("订单金额", session_id="session-a")
+    mysql.reset_mock()
+
+    result = generator.execute_sql(
+        generated["sql"],
+        history_id=generated["history_id"],
+        session_id="session-a",
+        allowed_tables=generated["allowed_tables"],
+        allowed_schemas=generated["allowed_schemas"],
+        user_query=generated["user_query"],
+        semantic_version=generated["semantic_version"],
+        content_sha256="2" * 64,
+    )
+
+    assert result["status"] == "error"
+    assert result["executable"] is False
+    assert result["validation"]["issues"][0]["code"] in {
+        "SEMANTIC_CONTENT_MISMATCH",
+        "HISTORY_CONTEXT_MISMATCH",
+    }
     mysql.execute_query_limited.assert_not_called()
 
 
@@ -785,6 +837,7 @@ def test_execute_reauthorizes_before_applying_row_and_timeout_constraints(monkey
         allowed_schemas=[],
         user_query="订单金额",
         semantic_version="1.0.0",
+        content_sha256="1" * 64,
     )
 
     assert result["status"] == "success"
@@ -793,6 +846,7 @@ def test_execute_reauthorizes_before_applying_row_and_timeout_constraints(monkey
         question="订单金额",
         sql="SELECT SUM(amount) FROM orders",
         expected_semantic_version="1.0.0",
+        expected_content_sha256="1" * 64,
         allowed_tables=("orders",),
         allowed_schemas=(),
     )
@@ -835,6 +889,7 @@ def test_governed_execute_authorizes_before_history_read_and_database_execute(
         allowed_schemas=generated["allowed_schemas"],
         user_query=generated["user_query"],
         semantic_version=generated["semantic_version"],
+        content_sha256=generated["content_sha256"],
     )
 
     assert result["status"] == "success"
@@ -884,6 +939,7 @@ def test_failed_authorization_never_reads_or_updates_history(monkeypatch):
         allowed_schemas=generated["allowed_schemas"],
         user_query=generated["user_query"],
         semantic_version=generated["semantic_version"],
+        content_sha256=generated["content_sha256"],
     )
 
     assert result["status"] == "error"
@@ -919,6 +975,7 @@ def test_failed_reauthorization_returns_structured_issues_without_database_acces
         "SELECT SUM(amount) FROM orders",
         user_query="订单金额",
         semantic_version="1.0.0",
+        content_sha256="1" * 64,
     )
 
     assert result["status"] == "error"

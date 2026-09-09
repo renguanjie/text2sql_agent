@@ -363,6 +363,7 @@ class GoldenGeneratedResult(FrozenModel):
     executable: StrictBool
     validation: GeneratedValidation
     semantic_version: StrictStr | None = None
+    content_sha256: StrictStr | None = None
     repair_attempts: Literal[0, 1] | None = None
     user_query: StrictStr | None = Field(default=None, repr=False)
     error: StrictStr | None = Field(default=None, repr=False)
@@ -379,6 +380,13 @@ class GoldenGeneratedResult(FrozenModel):
     def validate_result_semantic_version(cls, value: str | None) -> str | None:
         if value is not None and not _SEMVER.fullmatch(value):
             raise ValueError("invalid semantic version")
+        return value
+
+    @field_validator("content_sha256")
+    @classmethod
+    def validate_result_content_sha256(cls, value: str | None) -> str | None:
+        if value is not None and not _FINGERPRINT.fullmatch(value):
+            raise ValueError("invalid semantic content hash")
         return value
 
     @model_validator(mode="after")

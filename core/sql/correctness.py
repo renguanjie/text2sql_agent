@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from hmac import compare_digest
 from threading import Lock
 from typing import Any, Literal
 
@@ -251,6 +252,7 @@ class CorrectnessPipeline:
         question: str,
         sql: str,
         expected_semantic_version: str,
+        expected_content_sha256: str | None = None,
         allowed_tables: tuple[str, ...] = (),
         allowed_schemas: tuple[str, ...] = (),
     ) -> CorrectnessResult:
@@ -273,6 +275,22 @@ class CorrectnessPipeline:
             )
             return self._result(sql, snapshot, validation, 0)
 
+        if (
+            not isinstance(expected_content_sha256, str)
+            or not compare_digest(snapshot.content_sha256, expected_content_sha256)
+        ):
+            validation = ValidationReport(
+                valid=False,
+                issues=(
+                    ValidationIssue(
+                        code="SEMANTIC_CONTENT_MISMATCH",
+                        message="SQL 生成内容与当前语义内容不一致",
+                        stage="semantic",
+                    ),
+                ),
+            )
+            return self._result(sql, snapshot, validation, 0)
+
         try:
             validation = self._validate_once(
                 question,
@@ -284,7 +302,9 @@ class CorrectnessPipeline:
             )
         except Exception as exc:
             self._log_internal_failure("authorization", exc)
-            return self._error_result(sql, snapshot.model_version, 0)
+            return self._error_result(
+                sql, snapshot.model_version, 0, snapshot.content_sha256
+            )
         return self._result(sql, snapshot, validation, 0)
 
     def _pin_request(
@@ -343,7 +363,9 @@ class CorrectnessPipeline:
             )
         except Exception as exc:
             self._log_internal_failure("validation", exc)
-            return self._error_result(candidate_sql, snapshot.model_version, 0)
+            return self._error_result(
+                candidate_sql, snapshot.model_version, 0, snapshot.content_sha256
+            )
         return snapshot, validation
 
     def _build_repair_context(
@@ -389,7 +411,9 @@ class CorrectnessPipeline:
             )
         except Exception as exc:
             self._log_internal_failure("repair_validation", exc)
-            return self._error_result(repaired_sql, snapshot.model_version, 1)
+            return self._error_result(
+                repaired_sql, snapshot.model_version, 1, snapshot.content_sha256
+            )
         return self._result(repaired_sql, snapshot, validation, 1)
 
     def _validate_once(
@@ -560,6 +584,7 @@ class CorrectnessPipeline:
             status="success" if executable else "rejected",
             sql=sql,
             semantic_version=snapshot.model_version,
+            content_sha256=snapshot.content_sha256,
             validation=validation,
             repair_attempts=repair_attempts,
             executable=executable,
@@ -570,11 +595,13 @@ class CorrectnessPipeline:
         sql: str,
         semantic_version: str | None,
         repair_attempts: Literal[0, 1],
+        content_sha256: str | None = None,
     ) -> CorrectnessResult:
         return CorrectnessResult(
             status="error",
             sql=sql,
             semantic_version=semantic_version,
+            content_sha256=content_sha256,
             validation=ValidationReport(
                 valid=False,
                 issues=(_CORRECTNESS_UNAVAILABLE,),
@@ -595,6 +622,7 @@ class CorrectnessPipeline:
             status="error",
             sql=sql,
             semantic_version=snapshot.model_version,
+            content_sha256=snapshot.content_sha256,
             validation=ValidationReport(
                 valid=False,
                 issues=(*validation.issues, issue),

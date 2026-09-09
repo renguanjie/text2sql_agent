@@ -522,6 +522,7 @@ def test_version_change_rejects_execution_without_validation_or_repair(tmp_path:
         question="订单金额",
         sql=generated.sql or "",
         expected_semantic_version=generated.semantic_version or "",
+        expected_content_sha256=generated.content_sha256,
     )
 
     assert authorized.status == "rejected"
@@ -529,6 +530,39 @@ def test_version_change_rejects_execution_without_validation_or_repair(tmp_path:
     assert authorized.repair_attempts == 0
     assert authorized.executable is False
     assert authorized.validation.issues[0].code == "SEMANTIC_VERSION_MISMATCH"
+    assert preflight.sql == []
+
+
+def test_same_version_content_change_rejects_execution_before_validation(
+    registry: MutableRegistry,
+):
+    """A semantic version label alone cannot authorize different model content."""
+    from core.sql.correctness import CorrectnessPipeline
+
+    preflight = SequencedPreflight()
+    pipeline = CorrectnessPipeline(
+        registry=registry,
+        context_builder=SemanticContextBuilder(max_chars=2400, max_items=24),
+        semantic_validator=SemanticSQLValidator(),
+        preflight=preflight,
+    )
+    generated = pipeline.process("订单金额", "SELECT SUM(amount) FROM orders")
+    registry.snapshot = registry.snapshot.model_copy(
+        update={"content_sha256": "2" * 64}
+    )
+    preflight.sql.clear()
+
+    authorized = pipeline.authorize_execution(
+        question="订单金额",
+        sql=generated.sql or "",
+        expected_semantic_version=generated.semantic_version or "",
+        expected_content_sha256=generated.content_sha256 or "",
+    )
+
+    assert generated.content_sha256 == "1" * 64
+    assert authorized.status == "rejected"
+    assert authorized.content_sha256 == "2" * 64
+    assert authorized.validation.issues[0].code == "SEMANTIC_CONTENT_MISMATCH"
     assert preflight.sql == []
 
 
@@ -551,6 +585,7 @@ def test_authorize_execution_reloads_current_snapshot_and_runs_preflight(
         question="订单金额",
         sql="SELECT SUM(amount) FROM orders",
         expected_semantic_version="1.0.0",
+        expected_content_sha256="1" * 64,
     )
 
     assert result.status == "success"
@@ -654,11 +689,13 @@ def test_authorize_execution_requires_explicit_permission_for_qualified_schema(
         question="查询订单",
         sql="SELECT id FROM private.orders",
         expected_semantic_version="1.0.0",
+        expected_content_sha256="1" * 64,
     )
     allowed = pipeline.authorize_execution(
         question="查询订单",
         sql="SELECT id FROM private.orders",
         expected_semantic_version="1.0.0",
+        expected_content_sha256="1" * 64,
         allowed_schemas=("private",),
     )
 

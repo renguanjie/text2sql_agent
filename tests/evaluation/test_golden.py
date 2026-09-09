@@ -1262,6 +1262,7 @@ def test_governed_generator_public_payload_can_be_loaded_without_unsafe_extras(
                         "sql": "SELECT id FROM example_orders",
                         "status": "success",
                         "semantic_version": "1.0.0",
+                        "content_sha256": "2" * 64,
                         "validation": {"valid": True, "issues": []},
                         "repair_attempts": 0,
                         "executable": True,
@@ -1272,6 +1273,7 @@ def test_governed_generator_public_payload_can_be_loaded_without_unsafe_extras(
                         "sql": None,
                         "status": "error",
                         "semantic_version": "1.0.0",
+                        "content_sha256": "2" * 64,
                         "validation": {
                             "valid": False,
                             "issues": [{"code": "GENERATION_FAILED"}],
@@ -1291,6 +1293,7 @@ def test_governed_generator_public_payload_can_be_loaded_without_unsafe_extras(
     loaded = load_golden_results(path)
 
     assert tuple(result.status for result in loaded.results) == ("success", "error")
+    assert {result.content_sha256 for result in loaded.results} == {"2" * 64}
 
 
 def test_generator_and_evaluator_share_the_public_error_code_allowlist():
