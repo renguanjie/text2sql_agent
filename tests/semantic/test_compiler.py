@@ -1,6 +1,7 @@
 import json
-from pathlib import Path
+import os
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -274,6 +275,53 @@ def test_compile_rejects_symlinked_output_component_before_writing(tmp_path: Pat
     assert list(outside.iterdir()) == []
 
 
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+def test_compile_rejects_symlinked_output_ancestor_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: bool
+):
+    """Break caught: validation starting at output_root misses an earlier symlink."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+    output_root = (
+        Path("link/deeper/compiled")
+        if relative
+        else tmp_path / "link/deeper/compiled"
+    )
+    if relative:
+        monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SemanticCompileError, match="符号链接"):
+        _compile_yaml(tmp_path, _rich_model(), output_root=output_root)
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        ".compiled/sales/1.0.0.json",
+        ".compiled/manifest.json",
+        "schema/semantic-model.schema.json",
+    ],
+    ids=["artifact", "manifest", "schema"],
+)
+def test_compile_rejects_symlinked_storage_file_before_any_write(
+    tmp_path: Path, target_name: str
+):
+    """Break caught: any semantic output target following a pre-existing link."""
+    outside = tmp_path / "outside-file"
+    outside.write_text("unchanged", encoding="utf-8")
+    target = tmp_path / target_name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.symlink_to(outside)
+
+    with pytest.raises(SemanticCompileError, match="符号链接"):
+        _compile_yaml(tmp_path, _rich_model())
+
+    assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
 def test_compile_rejects_changed_content_at_same_version_without_any_write(
     tmp_path: Path,
 ):
@@ -332,3 +380,125 @@ def test_compile_validates_every_destination_type_before_any_write(tmp_path: Pat
 
     assert not (output_root / "sales/1.0.0.json").exists()
     assert not (output_root / "manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("attacked_name", "parent_parts"),
+    [
+        ("1.0.0.json", (".compiled", "sales")),
+        ("semantic-model.schema.json", ("schema",)),
+        ("manifest.json", (".compiled",)),
+    ],
+    ids=["artifact", "schema", "manifest"],
+)
+def test_compile_rejects_parent_replaced_by_symlink_at_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attacked_name: str,
+    parent_parts: tuple[str, ...],
+):
+    """Break caught: a checked destination parent being swapped before replace."""
+    outside = tmp_path / f"outside-{attacked_name}"
+    outside.mkdir()
+    parent = tmp_path.joinpath(*parent_parts)
+    parked = tmp_path / f"parked-{attacked_name}"
+    real_replace = os.replace
+    attacked = False
+
+    def replace_after_parent_swap(source, destination, *args, **kwargs):
+        nonlocal attacked
+        if not attacked and Path(destination).name == attacked_name:
+            parent.rename(parked)
+            parent.symlink_to(outside, target_is_directory=True)
+            attacked = True
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr("core.semantic.storage.os.replace", replace_after_parent_swap)
+
+    with pytest.raises(SemanticCompileError, match="语义存储|符号链接"):
+        _compile_yaml(tmp_path, _rich_model())
+
+    assert attacked is True
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("target_name", "parse_number"),
+    [("manifest.json", 1), ("sales/1.0.0.json", 2)],
+    ids=["manifest", "artifact"],
+)
+def test_compile_rejects_existing_file_replaced_by_symlink_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+    parse_number: int,
+):
+    """Break caught: compile decisions using a file replaced after its read."""
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+    target = tmp_path / ".compiled" / target_name
+    outside = tmp_path / f"outside-read-{target.name}"
+    outside.write_bytes(target.read_bytes())
+    parked = tmp_path / f"parked-read-{target.name}"
+    real_loads = json.loads
+    parse_count = 0
+
+    def loads_then_replace(value, *args, **kwargs):
+        nonlocal parse_count
+        parsed = real_loads(value, *args, **kwargs)
+        parse_count += 1
+        if parse_count == parse_number:
+            target.rename(parked)
+            target.symlink_to(outside)
+        return parsed
+
+    monkeypatch.setattr("core.semantic.compiler.json.loads", loads_then_replace)
+
+    with pytest.raises(SemanticCompileError):
+        _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+
+    assert target.is_symlink()
+
+
+def test_compile_revalidates_existing_artifact_before_return(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: an existing artifact being swapped after plan validation."""
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+    artifact = tmp_path / ".compiled/sales/1.0.0.json"
+    outside = tmp_path / "outside-late-artifact.json"
+    outside.write_bytes(artifact.read_bytes())
+    parked = tmp_path / "parked-late-artifact.json"
+    real_replace = os.replace
+    attacked = False
+
+    def replace_schema_then_swap_artifact(source, destination, *args, **kwargs):
+        nonlocal attacked
+        result = real_replace(source, destination, *args, **kwargs)
+        if not attacked and Path(destination).name == "semantic-model.schema.json":
+            artifact.rename(parked)
+            artifact.symlink_to(outside)
+            attacked = True
+        return result
+
+    monkeypatch.setattr(
+        "core.semantic.storage.os.replace",
+        replace_schema_then_swap_artifact,
+    )
+
+    with pytest.raises(SemanticCompileError):
+        _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+
+    assert attacked is True
+    assert artifact.is_symlink()
+
+
+def test_compile_fails_closed_without_dirfd_no_follow_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: unsupported platforms falling back to path-following writes."""
+    monkeypatch.setattr("core.semantic.storage.os.supports_dir_fd", set())
+
+    with pytest.raises(SemanticCompileError, match="no-follow"):
+        _compile_yaml(tmp_path, _rich_model())

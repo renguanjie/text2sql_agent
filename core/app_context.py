@@ -240,10 +240,16 @@ class ApplicationContext:
 
     @staticmethod
     def _resolve_semantic_model_dir(config: Dict[str, Any]) -> Path:
+        from core.semantic.storage import lexical_absolute, validate_no_symlink_path
+
         model_dir = Path(config.get('semantic_model_dir', 'semantic_models'))
         if model_dir.is_absolute():
-            return model_dir
-        return Path(__file__).resolve().parents[1] / model_dir
+            return validate_no_symlink_path(model_dir)
+        project_root = lexical_absolute(Path(__file__).parents[1])
+        return validate_no_symlink_path(
+            project_root / model_dir,
+            anchor=project_root,
+        )
 
     @staticmethod
     def _validate_candidate_config(config: Dict[str, Any]) -> None:

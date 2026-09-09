@@ -1,4 +1,5 @@
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -124,3 +125,203 @@ def test_registry_rejects_symlinked_compiled_root(compiled_model_dir: Path, tmp_
 
     with pytest.raises(SemanticRegistryError, match="符号链接"):
         SemanticRegistry(linked_root, "sales").load_active()
+
+
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+def test_registry_rejects_symlinked_compiled_root_ancestor(
+    compiled_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+):
+    """Break caught: checking only compiled_root misses a symlinked ancestor."""
+    linked_parent = compiled_model_dir.parent / "linked-parent"
+    linked_parent.symlink_to(compiled_model_dir.parent, target_is_directory=True)
+    compiled_root = (
+        Path("linked-parent/.compiled")
+        if relative
+        else linked_parent / compiled_model_dir.name
+    )
+    if relative:
+        monkeypatch.chdir(compiled_model_dir.parent)
+
+    with pytest.raises(SemanticRegistryError, match="符号链接"):
+        SemanticRegistry(compiled_root, "sales").load_active()
+
+
+@pytest.mark.parametrize(
+    "target_name", ["manifest.json", "sales/1.0.0.json"], ids=["manifest", "artifact"]
+)
+def test_registry_rejects_symlinked_storage_file(
+    compiled_model_dir: Path, tmp_path: Path, target_name: str
+):
+    """Break caught: manifest or artifact reads following a symlink."""
+    target = compiled_model_dir / target_name
+    outside = tmp_path / f"outside-{target.name}"
+    target.rename(outside)
+    target.symlink_to(outside)
+
+    with pytest.raises(SemanticRegistryError, match="符号链接"):
+        SemanticRegistry(compiled_model_dir, "sales").load_active()
+
+
+@pytest.mark.parametrize(
+    ("target_name", "parse_number"),
+    [("manifest.json", 1), ("sales/1.0.0.json", 2)],
+    ids=["manifest", "artifact"],
+)
+def test_registry_rejects_file_replaced_by_symlink_during_load(
+    compiled_model_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_name: str,
+    parse_number: int,
+):
+    """Break caught: a checked file being swapped after its bytes were read."""
+    target = compiled_model_dir / target_name
+    outside = tmp_path / f"outside-race-{target.name}"
+    outside.write_bytes(target.read_bytes())
+    parked = tmp_path / f"parked-{target.name}"
+    real_loads = json.loads
+    parse_count = 0
+
+    def loads_then_replace(value, *args, **kwargs):
+        nonlocal parse_count
+        parsed = real_loads(value, *args, **kwargs)
+        parse_count += 1
+        if parse_count == parse_number:
+            target.rename(parked)
+            target.symlink_to(outside)
+        return parsed
+
+    monkeypatch.setattr("core.semantic.registry.json.loads", loads_then_replace)
+
+    with pytest.raises(SemanticRegistryError, match="替换|符号链接"):
+        SemanticRegistry(compiled_model_dir, "sales").load_active()
+
+    assert target.is_symlink()
+
+
+@pytest.mark.parametrize(
+    "directory_name", [".", "sales"], ids=["compiled-root", "datasource"]
+)
+def test_registry_rejects_directory_replaced_by_symlink_during_load(
+    compiled_model_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    directory_name: str,
+):
+    """Break caught: a pinned snapshot parent being replaced during parsing."""
+    target = (
+        compiled_model_dir
+        if directory_name == "."
+        else compiled_model_dir / directory_name
+    )
+    outside = tmp_path / f"outside-directory-{target.name}"
+    outside.mkdir()
+    parked = tmp_path / f"parked-directory-{target.name}"
+    real_loads = json.loads
+    parse_count = 0
+
+    def loads_then_replace(value, *args, **kwargs):
+        nonlocal parse_count
+        parsed = real_loads(value, *args, **kwargs)
+        parse_count += 1
+        if parse_count == 2:
+            target.rename(parked)
+            target.symlink_to(outside, target_is_directory=True)
+        return parsed
+
+    monkeypatch.setattr("core.semantic.registry.json.loads", loads_then_replace)
+
+    with pytest.raises(SemanticRegistryError, match="替换|符号链接"):
+        SemanticRegistry(compiled_model_dir, "sales").load_active()
+
+    assert target.is_symlink()
+
+
+def test_registry_does_not_resolve_datasource_symlink_created_after_check(
+    compiled_model_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Break caught: resolve following an in-root symlink created after its check."""
+    datasource_dir = compiled_model_dir / "sales"
+    alternate = compiled_model_dir / "alternate"
+    parked = compiled_model_dir / "parked-sales"
+    real_reject = SemanticRegistry._reject_symlink
+    attacked = False
+
+    def reject_then_replace(path: Path, label: str):
+        nonlocal attacked
+        real_reject(path, label)
+        if not attacked and path == datasource_dir:
+            datasource_dir.rename(parked)
+            alternate.mkdir()
+            (alternate / "1.0.0.json").write_bytes(
+                (parked / "1.0.0.json").read_bytes()
+            )
+            datasource_dir.symlink_to(alternate, target_is_directory=True)
+            attacked = True
+
+    monkeypatch.setattr(
+        SemanticRegistry,
+        "_reject_symlink",
+        staticmethod(reject_then_replace),
+    )
+
+    with pytest.raises(SemanticRegistryError, match="符号链接"):
+        SemanticRegistry(compiled_model_dir, "sales").load_active()
+
+    assert attacked is True
+
+
+def test_compiler_and_registry_accept_normal_nested_absolute_root(tmp_path: Path):
+    """Break caught: anchoring all public roots to the repository working tree."""
+    source = tmp_path / "models/sales.yaml"
+    source.parent.mkdir()
+    source.write_text(
+        """
+schema_version: 1
+model_version: 1.0.0
+datasource: sales
+dialect: mysql
+entities:
+  - name: orders
+    name_cn: 订单
+    fields:
+      - {name: id, name_cn: 订单号, data_type: bigint, role: identifier}
+""",
+        encoding="utf-8",
+    )
+    compiled_root = tmp_path / "nested/deeper/.compiled"
+
+    SemanticCompiler().compile_file(source, compiled_root)
+    snapshot = SemanticRegistry(compiled_root, "sales").load_active()
+
+    assert snapshot.datasource == "sales"
+
+
+def test_compiler_and_registry_accept_platform_temp_absolute_root():
+    """Break caught: macOS /var temp aliases being mistaken for user symlinks."""
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "sales.yaml"
+        source.write_text(
+            """
+schema_version: 1
+model_version: 1.0.0
+datasource: sales
+dialect: mysql
+entities:
+  - name: orders
+    name_cn: 订单
+    fields:
+      - {name: id, name_cn: 订单号, data_type: bigint, role: identifier}
+""",
+            encoding="utf-8",
+        )
+        compiled_root = root / "nested/.compiled"
+
+        SemanticCompiler().compile_file(source, compiled_root)
+        snapshot = SemanticRegistry(compiled_root, "sales").load_active()
+
+        assert snapshot.datasource == "sales"

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -28,7 +26,13 @@ from .models import (
     SemanticSnapshot,
     SemanticTerm,
 )
-
+from .storage import (
+    SemanticStorageError,
+    VerifiedRead,
+    atomic_write_bytes,
+    read_bytes_no_follow,
+    validate_no_symlink_path,
+)
 
 COMPILER_VERSION = "2"
 _ALLOWED_AGGREGATIONS = frozenset({"sum", "count", "avg", "min", "max"})
@@ -66,6 +70,8 @@ class _WritePlan:
     schema_path: Path
     manifest: dict[str, Any]
     existing_snapshot: SemanticSnapshot | None
+    manifest_read: VerifiedRead | None
+    artifact_read: VerifiedRead | None
 
 
 class SemanticCompiler:
@@ -84,10 +90,18 @@ class SemanticCompiler:
         output_root = Path(output_root)
         self._validate_source_path(source)
         try:
-            raw_bytes = source.read_bytes()
+            source_read = read_bytes_no_follow(source)
+            raw_bytes = source_read.content
             payload = yaml.safe_load(raw_bytes.decode("utf-8"))
             parsed_model = SemanticModel.model_validate(payload)
-        except (OSError, UnicodeDecodeError, yaml.YAMLError, ValidationError) as exc:
+            source_read.verify()
+        except (
+            OSError,
+            UnicodeDecodeError,
+            yaml.YAMLError,
+            ValidationError,
+            SemanticStorageError,
+        ) as exc:
             raise SemanticCompileError(str(exc)) from exc
 
         expected = expected_datasource if expected_datasource is not None else source.stem
@@ -112,11 +126,17 @@ class SemanticCompiler:
 
         # Read and validate every existing destination before mkdir or replace.
         plan = self._prepare_write(candidate, output_root)
+        self._verify_plan_reads(plan)
         snapshot = plan.existing_snapshot or candidate
+        artifact_read = plan.artifact_read
         if plan.existing_snapshot is None:
             self._write_json_atomically(snapshot.model_dump(mode="json"), plan.artifact)
+            artifact_read = self._read_verified(plan.artifact)
+        self._verify_plan_reads(plan, artifact_read=artifact_read)
         self._write_json_schema(plan.schema_path)
+        self._verify_plan_reads(plan, artifact_read=artifact_read)
         self._write_json_atomically(plan.manifest, plan.manifest_path)
+        self._verify_read(artifact_read)
         return snapshot
 
     def _normalize_and_validate(self, model: SemanticModel) -> SemanticModel:
@@ -561,12 +581,14 @@ class SemanticCompiler:
         self._validate_output_path(output_root.parent, schema_path)
 
         manifest: dict[str, Any] = {"active": {}}
+        manifest_read = None
         if manifest_path.exists():
-            manifest = self._read_manifest(manifest_path)
+            manifest, manifest_read = self._read_manifest(manifest_path)
 
         existing_snapshot = None
+        artifact_read = None
         if artifact.exists():
-            existing_snapshot = self._read_existing_snapshot(artifact)
+            existing_snapshot, artifact_read = self._read_existing_snapshot(artifact)
             if (
                 existing_snapshot.datasource != snapshot.datasource
                 or existing_snapshot.model_version != snapshot.model_version
@@ -590,13 +612,22 @@ class SemanticCompiler:
             schema_path=schema_path,
             manifest=next_manifest,
             existing_snapshot=existing_snapshot,
+            manifest_read=manifest_read,
+            artifact_read=artifact_read,
         )
 
     @staticmethod
-    def _read_manifest(path: Path) -> dict[str, Any]:
+    def _read_manifest(path: Path) -> tuple[dict[str, Any], VerifiedRead]:
         try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            read = read_bytes_no_follow(path)
+            manifest = json.loads(read.content.decode("utf-8"))
+            read.verify()
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            SemanticStorageError,
+        ) as exc:
             raise SemanticCompileError(f"无法读取现有清单: {exc}") from exc
         if not isinstance(manifest, dict) or not isinstance(
             manifest.get("active"), dict
@@ -607,11 +638,15 @@ class SemanticCompiler:
             for name, version in manifest["active"].items()
         ):
             raise SemanticCompileError("现有清单格式无效")
-        return manifest
+        return manifest, read
 
-    def _read_existing_snapshot(self, path: Path) -> SemanticSnapshot:
+    def _read_existing_snapshot(
+        self, path: Path
+    ) -> tuple[SemanticSnapshot, VerifiedRead]:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            read = read_bytes_no_follow(path)
+            payload = json.loads(read.content.decode("utf-8"))
+            read.verify()
             jsonschema.validate(payload, SemanticSnapshot.model_json_schema())
             snapshot = SemanticSnapshot.model_validate(payload)
         except (
@@ -620,6 +655,7 @@ class SemanticCompiler:
             json.JSONDecodeError,
             jsonschema.ValidationError,
             ValidationError,
+            SemanticStorageError,
         ) as exc:
             raise SemanticCompileError(
                 "现有版本 artifact 格式无效，拒绝覆盖"
@@ -637,7 +673,33 @@ class SemanticCompiler:
             or _SHA256_HEX.fullmatch(snapshot.source_sha256) is None
         ):
             raise SemanticCompileError("现有版本 artifact 摘要无效，拒绝覆盖")
-        return snapshot
+        return snapshot, read
+
+    @staticmethod
+    def _read_verified(path: Path) -> VerifiedRead:
+        try:
+            return read_bytes_no_follow(path)
+        except SemanticStorageError as exc:
+            raise SemanticCompileError(str(exc)) from None
+
+    @staticmethod
+    def _verify_read(read: VerifiedRead | None) -> None:
+        if read is None:
+            return
+        try:
+            read.verify()
+        except SemanticStorageError as exc:
+            raise SemanticCompileError(str(exc)) from None
+
+    @classmethod
+    def _verify_plan_reads(
+        cls,
+        plan: _WritePlan,
+        *,
+        artifact_read: VerifiedRead | None = None,
+    ) -> None:
+        cls._verify_read(plan.manifest_read)
+        cls._verify_read(artifact_read or plan.artifact_read)
 
     @staticmethod
     def _validate_source_path(source: Path) -> None:
@@ -654,6 +716,10 @@ class SemanticCompiler:
     @staticmethod
     def _validate_output_path(boundary: Path, destination: Path) -> None:
         boundary_absolute = boundary.absolute()
+        try:
+            validate_no_symlink_path(boundary_absolute)
+        except SemanticStorageError as exc:
+            raise SemanticCompileError(str(exc)) from None
         if boundary_absolute.is_symlink():
             raise SemanticCompileError(f"编译输出路径不得包含符号链接: {boundary}")
         if boundary_absolute.exists() and not boundary_absolute.is_dir():
@@ -698,26 +764,13 @@ class SemanticCompiler:
 
     @staticmethod
     def _write_json_atomically(payload: Any, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
         encoded = (
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode(
                 "utf-8"
             )
             + b"\n"
         )
-        temporary_name: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                dir=destination.parent,
-                prefix=f".{destination.name}.",
-                delete=False,
-            ) as temporary:
-                temporary_name = temporary.name
-                temporary.write(encoded)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_name, destination)
-        finally:
-            if temporary_name is not None and os.path.exists(temporary_name):
-                os.unlink(temporary_name)
+            atomic_write_bytes(destination, encoded)
+        except SemanticStorageError as exc:
+            raise SemanticCompileError(str(exc)) from None

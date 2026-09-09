@@ -1727,6 +1727,106 @@ def test_failed_governance_reload_keeps_old_registry_generator_and_config(
     assert context.sql_generator is old_generator
 
 
+def test_governance_rejects_relative_model_dir_outside_project_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: relative traversal publishing .compiled outside the project root."""
+    import core.app_context as app_context
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _write_model(outside / "sales.yaml")
+    monkeypatch.setattr(
+        app_context,
+        "__file__",
+        str(project_root / "core/app_context.py"),
+    )
+    context = ApplicationContext({"semantic_governance_enabled": False})
+
+    with pytest.raises(ApplicationConfigurationError, match="语义治理配置无效"):
+        context._build_governance_components(
+            _governance_config(Path("../outside"))
+        )
+
+    assert not (outside / ".compiled").exists()
+
+
+def test_governance_rejects_symlinked_model_dir_inside_project_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: a relative model root symlink redirecting governance writes."""
+    import core.app_context as app_context
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside = tmp_path / "outside-models"
+    outside.mkdir()
+    _write_model(outside / "sales.yaml")
+    (project_root / "models").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(
+        app_context,
+        "__file__",
+        str(project_root / "core/app_context.py"),
+    )
+
+    with pytest.raises(ApplicationConfigurationError, match="语义治理配置无效"):
+        ApplicationContext({})._build_governance_components(
+            _governance_config(Path("models"))
+        )
+
+    assert not (outside / ".compiled").exists()
+
+
+def test_governance_rejects_symlinked_compiled_dir_under_absolute_model_root(
+    tmp_path: Path,
+):
+    """Break caught: a trusted model root allowing .compiled to redirect writes."""
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    model_root = tmp_path / "models"
+    model_root.mkdir()
+    _write_model(model_root / "sales.yaml")
+    outside = tmp_path / "outside-compiled"
+    outside.mkdir()
+    (model_root / ".compiled").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ApplicationConfigurationError, match="语义治理配置无效"):
+        ApplicationContext({})._build_governance_components(
+            _governance_config(model_root)
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_governance_accepts_nested_model_dir_inside_project_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Break caught: project anchoring rejecting an ordinary nested model root."""
+    import core.app_context as app_context
+    from core.app_context import ApplicationContext
+
+    project_root = tmp_path / "project"
+    model_root = project_root / "config/semantic/models"
+    model_root.mkdir(parents=True)
+    _write_model(model_root / "sales.yaml")
+    monkeypatch.setattr(
+        app_context,
+        "__file__",
+        str(project_root / "core/app_context.py"),
+    )
+
+    registry, pipeline = ApplicationContext({})._build_governance_components(
+        _governance_config(Path("config/semantic/models"))
+    )
+
+    assert registry.compiled_root == model_root / ".compiled"
+    assert pipeline.registry is registry
+
+
 def test_reload_rejects_explain_without_governance_and_keeps_live_components():
     from core.app_context import ApplicationConfigurationError, ApplicationContext
 

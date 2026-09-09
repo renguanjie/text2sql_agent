@@ -13,7 +13,12 @@ import jsonschema
 from pydantic import ValidationError
 
 from .models import SemanticModel, SemanticSnapshot
-
+from .storage import (
+    SemanticStorageError,
+    VerifiedRead,
+    read_bytes_no_follow,
+    validate_no_symlink_path,
+)
 
 _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 _DATASOURCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
@@ -29,9 +34,10 @@ class SemanticRegistry:
         if not isinstance(datasource, str) or _DATASOURCE.fullmatch(datasource) is None:
             raise SemanticRegistryError("数据源不是安全标识符")
         compiled_root = Path(compiled_root)
-        if compiled_root.is_symlink():
-            raise SemanticRegistryError("编译目录不得是符号链接")
-        self._compiled_root = compiled_root
+        try:
+            self._compiled_root = validate_no_symlink_path(compiled_root)
+        except SemanticStorageError as exc:
+            raise SemanticRegistryError(str(exc)) from None
         self._datasource = datasource
         self._lock = threading.RLock()
         self._snapshot: SemanticSnapshot | None = None
@@ -55,12 +61,15 @@ class SemanticRegistry:
         return self._compiled_root
 
     def _read_active_candidate(self) -> SemanticSnapshot:
+        try:
+            validate_no_symlink_path(self._compiled_root)
+        except SemanticStorageError as exc:
+            raise SemanticRegistryError(str(exc)) from None
         manifest_path = self._compiled_root / "manifest.json"
-        self._reject_symlink(manifest_path, "清单")
-        manifest = self._read_json(manifest_path, "清单")
+        manifest, manifest_read = self._read_json(manifest_path, "清单")
         version = self._active_version(manifest)
         path = self._snapshot_path(version)
-        payload = self._read_json(path, "快照")
+        payload, snapshot_read = self._read_json(path, "快照")
         snapshot = self._parse_snapshot(payload)
 
         if snapshot.datasource != self._datasource:
@@ -73,6 +82,12 @@ class SemanticRegistry:
             raise SemanticRegistryError("source_sha256 格式无效")
         if snapshot.content_sha256 != self._content_sha256(snapshot):
             raise SemanticRegistryError("content_sha256 校验失败")
+        try:
+            manifest_read.verify()
+            snapshot_read.verify()
+            validate_no_symlink_path(self._compiled_root)
+        except SemanticStorageError as exc:
+            raise SemanticRegistryError(str(exc)) from None
         return snapshot
 
     def _active_version(self, manifest: Any) -> str:
@@ -87,36 +102,35 @@ class SemanticRegistry:
         return version
 
     def _snapshot_path(self, version: str) -> Path:
-        root_path = self._compiled_root.absolute()
+        root_path = self._compiled_root
         datasource_path = root_path / self._datasource
         snapshot_path = datasource_path / f"{version}.json"
         self._reject_symlink(root_path, "编译目录")
         self._reject_symlink(datasource_path, "数据源目录")
         self._reject_symlink(snapshot_path, "快照")
-        root = root_path.resolve(strict=False)
-        datasource_dir = datasource_path.resolve(strict=False)
-        path = snapshot_path.resolve(strict=False)
         try:
-            datasource_dir.relative_to(root)
-            path.relative_to(datasource_dir)
-        except ValueError:
-            raise SemanticRegistryError("清单中的数据源或版本不是安全的快照位置")
-        if path.parent != datasource_dir:
-            raise SemanticRegistryError("清单中的数据源或版本不是安全的快照位置")
-        if not path.is_file():
-            raise SemanticRegistryError(f"活动快照不存在: {path}")
-        return path
+            validate_no_symlink_path(snapshot_path, anchor=root_path)
+        except SemanticStorageError as exc:
+            raise SemanticRegistryError(str(exc)) from None
+        return snapshot_path
 
     @staticmethod
     def _reject_symlink(path: Path, label: str) -> None:
         if path.is_symlink():
             raise SemanticRegistryError(f"{label}不得是符号链接")
 
-    @staticmethod
-    def _read_json(path: Path, label: str) -> Any:
+    def _read_json(self, path: Path, label: str) -> tuple[Any, VerifiedRead]:
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            read = read_bytes_no_follow(path, anchor=self._compiled_root)
+            payload = json.loads(read.content.decode("utf-8"))
+            read.verify()
+            return payload, read
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            SemanticStorageError,
+        ) as exc:
             raise SemanticRegistryError(f"无法读取{label}: {exc}") from exc
 
     @staticmethod
