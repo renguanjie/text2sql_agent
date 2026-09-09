@@ -2,20 +2,21 @@
 MySQL 数据库客户端
 负责元数据存储、历史记录管理
 """
-from typing import Dict, List, Optional, Any
-from contextlib import contextmanager
+import json
 import re
+import uuid
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional
 
+from loguru import logger
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 from sqlalchemy.pool import QueuePool
-from loguru import logger
 from sqlglot import exp, parse_one
+
 from ..config_validation import validate_history_max_records
-from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
 from ..sql.preflight import ExplainDeadlineExceeded, run_with_wall_clock_deadline
-import json
-import uuid
+from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
 
 _SEMANTIC_CONTENT_SHA256 = re.compile(r"[0-9a-f]{64}")
 _HISTORY_GOVERNANCE_COLUMNS = (

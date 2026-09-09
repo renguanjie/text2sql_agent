@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -1703,7 +1703,7 @@ def test_failed_governance_reload_keeps_old_registry_generator_and_config(
     tmp_path: Path,
 ):
     """Catches a failed candidate reload corrupting the live governance pair."""
-    from core.app_context import ApplicationContext, ApplicationConfigurationError
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
 
     (tmp_path / "sales.yaml").write_text(
         "password=secret invalid yaml: [", encoding="utf-8"
@@ -1727,7 +1727,7 @@ def test_failed_governance_reload_keeps_old_registry_generator_and_config(
 
 
 def test_reload_rejects_explain_without_governance_and_keeps_live_components():
-    from core.app_context import ApplicationContext, ApplicationConfigurationError
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
 
     context = ApplicationContext({"semantic_governance_enabled": False})
     old_registry = object()

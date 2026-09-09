@@ -3,12 +3,12 @@
 替代原有的全局单例模式
 """
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict
+
 from loguru import logger
 
 from core.config_validation import RuntimeConfigurationError, validate_runtime_config
 from core.utils.log_sanitizer import log_safe_exception
-
 
 _CURRENT_GOVERNANCE_PIPELINE = object()
 

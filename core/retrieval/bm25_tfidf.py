@@ -3,11 +3,12 @@
 实现 BM25 + FAISS 向量检索的两路混合检索算法
 支持真实 Embedding 模型和动态 Few-Shot 检索
 """
-from typing import Dict, List, Optional, Tuple
 import re
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 from loguru import logger
 from rank_bm25 import BM25Okapi
-import numpy as np
 
 try:
     import faiss
@@ -419,8 +420,8 @@ class HybridRetriever:
         Returns:
             bool: 是否成功
         """
-        import os
         import json
+        import os
 
         try:
             os.makedirs(directory, exist_ok=True)
@@ -447,8 +448,8 @@ class HybridRetriever:
         Returns:
             bool: 是否成功加载
         """
-        import os
         import json
+        import os
 
         try:
             docs_path = os.path.join(directory, "documents.json")

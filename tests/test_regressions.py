@@ -1,9 +1,9 @@
 """已修复逻辑缺陷的回归测试。"""
-from contextlib import contextmanager
 import logging
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -1258,8 +1258,8 @@ def test_semantic_concept_cleanup_is_scoped_away_from_other_datasources():
 
 def test_neo4j_connect_installs_unique_constraints_for_actual_import_keys(monkeypatch):
     """Break caught: MERGE keys having no database-level uniqueness guarantees."""
-    from core.knowledge.neo4j_client import Neo4jClient
     import core.knowledge.neo4j_client as module
+    from core.knowledge.neo4j_client import Neo4jClient
 
     transaction = Mock()
     transaction.run.return_value.consume.return_value = None
