@@ -6,7 +6,8 @@ SQL 生成器模块
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
-from hmac import compare_digest, digest as hmac_digest
+from hmac import compare_digest
+from hmac import digest as hmac_digest
 from secrets import token_bytes
 from threading import Lock
 from time import monotonic
@@ -82,6 +83,9 @@ class SQLGenerator:
         self._governed_history_bindings: OrderedDict[
             int, _GovernedHistoryBinding
         ] = OrderedDict()
+        self._unavailable_governed_history_ids: OrderedDict[int, None] = (
+            OrderedDict()
+        )
         self._governed_history_lock = Lock()
 
         self.rewrite_chain = QueryRewriteChain(
@@ -261,12 +265,22 @@ class SQLGenerator:
         with self._governed_history_lock:
             self._prune_governed_history_bindings_locked(now)
             self._governed_history_bindings.pop(history_id, None)
+            self._unavailable_governed_history_ids.pop(history_id, None)
             while (
                 len(self._governed_history_bindings)
                 >= self._governed_history_binding_capacity
             ):
-                self._governed_history_bindings.popitem(last=False)
+                evicted_history_id, _binding = (
+                    self._governed_history_bindings.popitem(last=False)
+                )
+                self._mark_governed_history_unavailable_locked(evicted_history_id)
             self._governed_history_bindings[history_id] = binding
+
+    def _mark_governed_history_unavailable_locked(self, history_id: int) -> None:
+        self._unavailable_governed_history_ids.pop(history_id, None)
+        self._unavailable_governed_history_ids[history_id] = None
+        while len(self._unavailable_governed_history_ids) > 4096:
+            self._unavailable_governed_history_ids.popitem(last=False)
 
     def _prune_governed_history_bindings_locked(self, now: float) -> None:
         expired = [
@@ -276,6 +290,7 @@ class SQLGenerator:
         ]
         for history_id in expired:
             self._governed_history_bindings.pop(history_id, None)
+            self._mark_governed_history_unavailable_locked(history_id)
 
     def _consume_governed_history_binding(
         self,
@@ -300,7 +315,11 @@ class SQLGenerator:
             self._prune_governed_history_bindings_locked(now)
             binding = self._governed_history_bindings.get(history_id)
             if binding is None:
-                return None
+                return (
+                    False
+                    if history_id in self._unavailable_governed_history_ids
+                    else None
+                )
             if (
                 not binding.validation_succeeded
                 or not compare_digest(binding.session_sha256, expected_session)
@@ -312,6 +331,7 @@ class SQLGenerator:
             ):
                 return False
             self._governed_history_bindings.pop(history_id, None)
+            self._mark_governed_history_unavailable_locked(history_id)
             return True
 
     def _promote_history_to_few_shot(

@@ -935,6 +935,7 @@ def test_governed_execute_rejects_unbound_history_without_mutating_it(
     mysql.execute_query_limited.assert_not_called()
     mysql.update_sql_execution.assert_not_called()
     generator.knowledge_retriever.add_history_record.assert_not_called()
+    assert generated["history_id"] in generator._governed_history_bindings
 
 
 def test_governed_success_updates_and_promotes_only_the_bound_history():
