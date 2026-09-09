@@ -85,7 +85,8 @@ SQL_EXPLAIN_ENABLED=false \
 python -m streamlit run app.py
 ```
 
-启用 MySQL `EXPLAIN` 预检时，使用同一只读连接和超时限制；它必须依赖已启用的治理：
+启用 MySQL `EXPLAIN` 预检时，使用独立、短生命周期的连接，并同时施加数据库侧提示与
+进程侧墙钟截止时间；它必须依赖已启用的治理：
 
 ```bash
 SEMANTIC_GOVERNANCE_ENABLED=true \
@@ -123,7 +124,11 @@ context.reload_governance(
 
 一次受治理请求固定执行以下流程：以单一不可变快照构建受限中文语义上下文 → 生成一条 SQL → 语法/只读安全/查询范围/语义校验 →（若开启）MySQL `EXPLAIN` → 必要时将脱敏的结构化错误和最小语义片段交给模型纠错一次 → 从第一项校验重新验证修复 SQL。`repair_attempts` 只会是 `0` 或 `1`；第二次失败不会再次调用模型，且 `executable` 为 `false`。
 
-只有全部阶段通过时结果才是 `status: "success"`、`executable: true`。执行前还会用当前激活快照重新授权，并要求生成时绑定的原问题与 `semantic_version`；版本改变、上下文缺失或 SQL 重新校验失败都会拒绝执行。启用预检时，MySQL `EXPLAIN` 的数据库错误、超时、空计划或超过阈值的估算扫描行数都会阻断执行。
+只有全部阶段通过时结果才是 `status: "success"`、`executable: true`。公共结果同时携带
+`semantic_version` 与 64 位小写 `content_sha256`。执行前会用当前激活快照重新授权，
+并同时核对生成时绑定的原问题、版本和内容摘要；任一身份变化、上下文缺失或 SQL
+重新校验失败都会拒绝执行。启用预检时，MySQL `EXPLAIN` 的数据库错误、墙钟超时、
+空计划或超过阈值的估算扫描行数都会阻断执行；超时连接会失效并关闭，不会提交或回池复用。
 
 ## 6. 回滚
 
@@ -168,7 +173,7 @@ python scripts/evaluate_golden.py \
 
 真实评测应调用启用治理的 `SQLGenerator.generate_sql(...)` 或 `await SQLGenerator.generate_sql_async(...)`，并把其**公共结果映射**转换为严格的离线输入。当前代码没有结果导出 CLI；请在调用方使用受限序列化器，而不是把完整运行时对象、日志或历史记录写入文件。
 
-外层 JSON 只允许 `schema_version`（固定 `1`）、`datasource`、`dialect`（`mysql`）、`semantic_version` 和 `results`。每个 `results` 项只允许 `id`（Golden case ID）、`sql`、`status`、`executable`、`semantic_version`、`repair_attempts` 和 `validation`；`validation` 只允许 `valid` 与 `issues`，每个 issue 只保留稳定 `code`。不要复制 `user_query`、`error`、issue `message`、原始数据库异常、日志、连接信息、凭据或任何未知字段。
+外层 JSON 只允许 `schema_version`（固定 `1`）、`datasource`、`dialect`（`mysql`）、`semantic_version` 和 `results`。每个 `results` 项只允许 `id`（Golden case ID）、`sql`、`status`、`executable`、`semantic_version`、可选 `content_sha256`、`repair_attempts` 和 `validation`；`validation` 只允许 `valid` 与 `issues`，每个 issue 只保留稳定 `code`。不要复制 `user_query`、`error`、issue `message`、原始数据库异常、日志、连接信息、凭据或任何未知字段。
 
 例如调用方可对每一个已知 case ID 取治理生成结果，并构造如下最小项（`result` 是上述公共 payload）：
 
@@ -179,6 +184,7 @@ safe_result = {
     "status": result["status"],
     "executable": result["executable"],
     "semantic_version": result.get("semantic_version"),
+    "content_sha256": result.get("content_sha256"),
     "repair_attempts": result.get("repair_attempts"),
     "validation": {
         "valid": result["validation"].get("valid"),
@@ -210,8 +216,10 @@ safe_result = {
 | `POLICY_DENIED` | 引用了禁用对象或不可直接查询的敏感字段。 |
 | `QUERY_SCOPE_DENIED` | 表、schema 或阻止列表不允许该查询范围。 |
 | `REPAIR_FAILED` | 唯一一次纠错未返回有效候选或执行失败。 |
+| `SEMANTIC_CONTENT_MISMATCH` | 生成快照与执行授权快照的语义内容摘要不同。 |
 | `SEMANTIC_VALIDATION_FAILED` | 语义校验失败且没有更具体的问题项。 |
 | `SEMANTIC_VERSION_MISMATCH` | 生成快照与执行授权快照版本不同。 |
+| `SQL_LENGTH_EXCEEDED` | SQL 在解析、修复或预检前超过统一安全长度上限。 |
 | `SQL_VALIDATION_FAILED` | 基础 SQL 校验失败且没有更具体分类。 |
 | `SYNTAX_ERROR` | SQL 解析或语法校验失败。 |
 | `TIME_DIMENSION_REQUIRED` | 时间问题没有使用受治理的时间字段。 |

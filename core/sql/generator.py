@@ -446,7 +446,7 @@ class SQLGenerator:
             return request, semantic_context, semantic_version, content_sha256, None
         except Exception as exc:
             if request is not None:
-                self.correctness_pipeline.discard_prepared(request)
+                self._discard_prepared_safely(request)
             log_safe_exception("governed_generation_context", exc)
             return None, "", None, None, self._governed_error_payload(
                 code="CORRECTNESS_UNAVAILABLE",
@@ -455,6 +455,14 @@ class SQLGenerator:
                 content_sha256=None,
                 sql=None,
             )
+
+    def _discard_prepared_safely(self, request: Any) -> None:
+        if self.correctness_pipeline is None or request is None:
+            return
+        try:
+            self.correctness_pipeline.discard_prepared(request)
+        except Exception as exc:
+            log_safe_exception("prepared_request_discard", exc)
 
     def _generation_failure_payload(
         self,
@@ -481,7 +489,7 @@ class SQLGenerator:
             semantic_version=semantic_version,
             content_sha256=content_sha256,
             sql=None,
-            stage='generation',
+            stage='syntax',
         )
         result['user_query'] = user_query
         return result
@@ -721,8 +729,7 @@ class SQLGenerator:
                 content_sha256=content_sha256,
             )
         finally:
-            if self.correctness_pipeline is not None:
-                self.correctness_pipeline.discard_prepared(correctness_request)
+            self._discard_prepared_safely(correctness_request)
 
         # 8. 保存历史
         if auto_save_history:
@@ -797,8 +804,7 @@ class SQLGenerator:
                 content_sha256=content_sha256,
             )
         finally:
-            if self.correctness_pipeline is not None:
-                self.correctness_pipeline.discard_prepared(correctness_request)
+            self._discard_prepared_safely(correctness_request)
 
         # 8. 保存历史
         if auto_save_history:
@@ -935,7 +941,7 @@ class SQLGenerator:
             if not user_query or not semantic_version or not content_sha256:
                 return self._governed_error_payload(
                     code=EXECUTION_CONTEXT_REQUIRED,
-                    message='执行前需要原问题和语义版本',
+                    message='执行前需要原问题、语义版本和内容摘要',
                     semantic_version=semantic_version,
                     content_sha256=content_sha256,
                     sql=sql,

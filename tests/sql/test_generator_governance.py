@@ -434,6 +434,31 @@ def test_sync_generator_discards_prepared_request_when_chain_raises(monkeypatch)
     assert replay.executable is False
 
 
+def test_generator_cleanup_exception_is_logged_safely_without_escaping(
+    monkeypatch, caplog
+):
+    pipeline = _pipeline()
+    discard = pipeline.discard_prepared
+
+    def discard_then_fail(request):
+        discard(request)
+        raise RuntimeError("Authorization: Bearer cleanup-secret")
+
+    monkeypatch.setattr(pipeline, "discard_prepared", discard_then_fail)
+    generator = _generator(pipeline=pipeline)
+    generator.sql_chain.generate.side_effect = RuntimeError("LLM unavailable")
+
+    with capture_loguru(caplog):
+        result = generator.generate_sql("订单金额", auto_save_history=False)
+
+    assert result["status"] == "error"
+    assert result["executable"] is False
+    assert "cleanup-secret" not in caplog.text
+    assert "Bearer" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "stage=prepared_request_discard" in caplog.text
+
+
 def test_generator_discards_request_when_prepared_description_fails(monkeypatch):
     """Failure between issuance and return must release the server-side state."""
     pipeline = _pipeline()
@@ -932,7 +957,7 @@ def test_disabled_governance_preserves_legacy_result_shape_and_chain_call():
     assert "semantic_context" not in generator.sql_chain.generate.call_args.kwargs
 
 
-def test_governed_execute_requires_original_question_and_semantic_version():
+def test_governed_execute_requires_full_semantic_identity():
     """Catches execution authorization without the generation-time semantic context."""
     mysql = Mock()
     generator = _generator(pipeline=_pipeline(), mysql_client=mysql)
@@ -940,7 +965,7 @@ def test_governed_execute_requires_original_question_and_semantic_version():
     result = generator.execute_sql("SELECT SUM(amount) FROM orders")
 
     assert result["status"] == "error"
-    assert "原问题和语义版本" in result["error"]
+    assert result["error"] == "执行前需要原问题、语义版本和内容摘要"
     assert result["validation"]["issues"][0]["code"] == "EXECUTION_CONTEXT_REQUIRED"
     mysql.execute_query_limited.assert_not_called()
 
