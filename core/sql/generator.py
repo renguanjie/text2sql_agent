@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from ..chain.sql_chain import QueryRewriteChain, SQLGenerationChain
-from ..config_validation import validate_history_max_records
+from ..config_validation import RuntimeConfigurationError, validate_history_max_records
 from ..history.mysql_client import MySQLClient
 from ..retrieval.bm25_tfidf import KnowledgeRetriever
 from ..utils.log_sanitizer import log_safe_exception, text_fingerprint
@@ -112,6 +112,15 @@ class SQLGenerator:
         if self.dialect_detector:
             return self.dialect_detector.detect_from_query(user_query)
         return self.config.get('sql_dialect', 'mysql'), None
+
+    def _validate_governed_dialect(self, dialect: Any) -> str:
+        if self.correctness_pipeline is None:
+            return dialect
+        if not isinstance(dialect, str) or dialect.casefold() != "mysql":
+            raise RuntimeConfigurationError(
+                "SQL_DIALECT 在启用 SEMANTIC_GOVERNANCE_ENABLED 时仅支持 mysql"
+            )
+        return "mysql"
 
     def _switch_dialect_if_needed(self, dialect: str):
         """按需切换方言（避免重建整个 SQLChain）"""
@@ -632,6 +641,7 @@ class SQLGenerator:
         detected_dialect, detected_database_id = self._detect_dialect_and_db(
             user_query, target_dialect, target_database_id
         )
+        detected_dialect = self._validate_governed_dialect(detected_dialect)
         logger.info(f"方言检测结果：dialect={detected_dialect}, database_id={detected_database_id}")
         final_query = self._prepare_query_sync(user_query)
         if self.rewrite_chain:
@@ -651,6 +661,7 @@ class SQLGenerator:
         detected_dialect, detected_database_id = self._detect_dialect_and_db(
             user_query, target_dialect, target_database_id
         )
+        detected_dialect = self._validate_governed_dialect(detected_dialect)
         logger.info(f"方言检测结果：dialect={detected_dialect}, database_id={detected_database_id}")
         final_query = await self._prepare_query_async(user_query)
         if self.rewrite_chain:

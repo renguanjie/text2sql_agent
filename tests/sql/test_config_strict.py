@@ -110,6 +110,17 @@ def test_postgres_remains_valid_when_governance_and_explain_are_disabled():
     assert result.stdout.strip() == "postgres"
 
 
+def test_governance_dialect_literal_does_not_accept_hidden_whitespace():
+    result = _run_config_script(
+        "import config",
+        SQL_DIALECT=" mysql ",
+        SEMANTIC_GOVERNANCE_ENABLED="true",
+    )
+
+    assert result.returncode != 0
+    assert "SQL_DIALECT" in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "flag",
     ["SEMANTIC_GOVERNANCE_ENABLED", "SQL_EXPLAIN_ENABLED"],

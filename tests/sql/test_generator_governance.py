@@ -408,6 +408,39 @@ def test_generator_prepared_capacity_exhaustion_is_stable_and_fail_closed(caplog
     assert "second secret question" not in caplog.text
 
 
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.asyncio
+async def test_governed_generator_rejects_runtime_non_mysql_override(use_async: bool):
+    from core.sql.generator import SQLGenerator
+
+    generator = _generator(pipeline=_pipeline())
+    generator.knowledge_retriever.retrieve_all.return_value = []
+    generator._prepare_pipeline = SQLGenerator._prepare_pipeline.__get__(generator)
+    generator._prepare_pipeline_async = SQLGenerator._prepare_pipeline_async.__get__(
+        generator
+    )
+
+    if use_async:
+        result = await generator.generate_sql_async(
+            "订单金额",
+            target_dialect="postgres",
+            auto_save_history=False,
+        )
+    else:
+        result = generator.generate_sql(
+            "订单金额",
+            target_dialect="postgres",
+            auto_save_history=False,
+        )
+
+    assert result["status"] == "error"
+    assert result["executable"] is False
+    assert result["validation"]["issues"][0]["code"] == "GENERATION_FAILED"
+    assert generator.sql_chain.dialect == "mysql"
+    generator.sql_chain.generate.assert_not_called()
+    generator.sql_chain.generate_async.assert_not_awaited()
+
+
 def test_sync_generator_discards_prepared_request_when_chain_raises(monkeypatch):
     """An exception before correctness processing must not leave a live token."""
     pipeline = _pipeline()

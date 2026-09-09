@@ -84,7 +84,7 @@ def validate_runtime_config(config: Mapping[str, Any]) -> None:
         return
 
     dialect = config.get("sql_dialect", "mysql")
-    if not isinstance(dialect, str) or dialect.strip().casefold() != "mysql":
+    if not isinstance(dialect, str) or dialect.casefold() != "mysql":
         enabled_keys = ["SEMANTIC_GOVERNANCE_ENABLED"]
         if explain_enabled:
             enabled_keys.append("SQL_EXPLAIN_ENABLED")
