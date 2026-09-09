@@ -20,6 +20,19 @@ _write_collector: ContextVar[Optional[List[tuple[str, Dict[str, Any]]]]] = Conte
     "neo4j_write_collector", default=None
 )
 
+_GRAPH_IDENTITY_CONSTRAINTS = (
+    "CREATE CONSTRAINT text2sql_database_id_unique IF NOT EXISTS "
+    "FOR (n:Database) REQUIRE n.database_id IS UNIQUE",
+    "CREATE CONSTRAINT text2sql_database_name_unique IF NOT EXISTS "
+    "FOR (n:Database) REQUIRE n.name IS UNIQUE",
+    "CREATE CONSTRAINT text2sql_table_identity_unique IF NOT EXISTS "
+    "FOR (n:Table) REQUIRE (n.database_id, n.name) IS UNIQUE",
+    "CREATE CONSTRAINT text2sql_column_identity_unique IF NOT EXISTS "
+    "FOR (n:Column) REQUIRE (n.database_id, n.table_name, n.name) IS UNIQUE",
+    "CREATE CONSTRAINT text2sql_concept_name_unique IF NOT EXISTS "
+    "FOR (n:BusinessConcept) REQUIRE n.name IS UNIQUE",
+)
+
 
 class Neo4jClient:
     """Neo4j 图数据库客户端 - 支持连接池和异步查询"""
@@ -69,6 +82,7 @@ class Neo4jClient:
             )
             # 验证连接
             self.driver.verify_connectivity()
+            self._ensure_graph_identity_constraints()
 
             # 异步驱动（用于高并发场景）
             try:
@@ -97,6 +111,12 @@ class Neo4jClient:
             self.close()
             logger.error(f"Neo4j 连接失败：{e}")
             return False
+
+    def _ensure_graph_identity_constraints(self) -> None:
+        """Install idempotent database guarantees for every importer MERGE key."""
+        self._execute_write_batch(
+            [(statement, {}) for statement in _GRAPH_IDENTITY_CONSTRAINTS]
+        )
 
     def close(self):
         """关闭连接池"""
@@ -874,8 +894,26 @@ class Neo4jClient:
             """, ref)
             total["nodes"] += result[0].get("deleted_nodes", 0) if result else 0
 
-        concept_names = self._concept_names_from_import(import_data)
-        if concept_names:
+        semantic_datasources = self._semantic_datasources_from_import(import_data)
+        if semantic_datasources:
+            result = self._execute_write("""
+            MATCH (c:BusinessConcept)
+            WHERE c.source = 'git_semantic_model'
+              AND (
+                c.datasource IN $datasources
+                OR any(datasource IN $datasources WHERE
+                    c.name STARTS WITH 'metric:' + datasource + ':'
+                    OR c.name STARTS WITH 'term:' + datasource + ':'
+                )
+              )
+            DETACH DELETE c
+            RETURN count(c) as deleted_nodes
+            """, {"datasources": semantic_datasources})
+            total["nodes"] += result[0].get("deleted_nodes", 0) if result else 0
+        else:
+            concept_names = self._concept_names_from_import(import_data)
+            if not concept_names:
+                return total
             result = self._execute_write("""
             MATCH (c:BusinessConcept)
             WHERE c.name IN $concept_names AND NOT (c)--()
@@ -884,6 +922,22 @@ class Neo4jClient:
             """, {"concept_names": concept_names})
             total["nodes"] += result[0].get("deleted_nodes", 0) if result else 0
         return total
+
+    @staticmethod
+    def _semantic_datasources_from_import(import_data: Dict[str, Any]) -> List[str]:
+        datasources = {
+            properties.get("datasource")
+            for node in import_data.get("nodes", []) or []
+            if isinstance(node, dict)
+            and isinstance((properties := node.get("properties")), dict)
+            and properties.get("source") == "git_semantic_model"
+            and isinstance(properties.get("datasource"), str)
+            and properties.get("datasource")
+        }
+        top_level = import_data.get("datasource")
+        if isinstance(top_level, str) and top_level:
+            datasources.add(top_level)
+        return sorted(datasources)
 
     def _export_graph_nodes(self) -> List[Dict[str, Any]]:
         records = self.execute_query("""

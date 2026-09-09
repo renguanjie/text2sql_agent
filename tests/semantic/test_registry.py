@@ -109,3 +109,18 @@ def test_registry_does_not_expose_sensitive_invalid_value_in_validation_error(
         SemanticRegistry(compiled_model_dir, "sales").load_active()
 
     assert sensitive_value not in str(exc_info.value)
+
+
+def test_registry_rejects_unsafe_datasource_before_path_resolution(tmp_path: Path):
+    """Break caught: registry datasource traversal being interpreted as a filesystem path."""
+    with pytest.raises(SemanticRegistryError, match="数据源"):
+        SemanticRegistry(tmp_path, "../escaped")
+
+
+def test_registry_rejects_symlinked_compiled_root(compiled_model_dir: Path, tmp_path: Path):
+    """Break caught: trusting snapshots reached through a symlinked registry root."""
+    linked_root = tmp_path / "linked-compiled"
+    linked_root.symlink_to(compiled_model_dir, target_is_directory=True)
+
+    with pytest.raises(SemanticRegistryError, match="符号链接"):
+        SemanticRegistry(linked_root, "sales").load_active()

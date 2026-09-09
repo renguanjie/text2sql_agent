@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -14,35 +15,30 @@ from typing import Any
 import jsonschema
 import yaml
 from pydantic import ValidationError
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError
 
-from .models import SemanticModel, SemanticSnapshot
-
-
-COMPILER_VERSION = "1"
-_ALLOWED_AGGREGATIONS = frozenset({"sum", "count", "avg", "min", "max"})
-_SQL_KEYWORDS = frozenset(
-    {
-        "and",
-        "as",
-        "case",
-        "else",
-        "end",
-        "false",
-        "if",
-        "in",
-        "is",
-        "not",
-        "null",
-        "or",
-        "then",
-        "true",
-        "when",
-    }
+from .models import (
+    SemanticEntity,
+    SemanticField,
+    SemanticMetric,
+    SemanticModel,
+    SemanticPolicies,
+    SemanticRelationship,
+    SemanticSnapshot,
+    SemanticTerm,
 )
-_QUALIFIED_FIELD = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
-_IDENTIFIER = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
-_FUNCTION_CALL = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-_SINGLE_QUOTED_LITERAL = re.compile(r"'(?:''|[^'])*'")
+
+
+COMPILER_VERSION = "2"
+_ALLOWED_AGGREGATIONS = frozenset({"sum", "count", "avg", "min", "max"})
+_DATASOURCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_QUERY_EXPRESSION_TYPES = tuple(
+    expression_type
+    for name in ("Query", "Select", "SetOperation", "Subquery")
+    if isinstance((expression_type := getattr(exp, name, None)), type)
+)
 
 
 class SemanticCompileError(ValueError):
@@ -54,224 +50,668 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+@dataclass(frozen=True)
+class _Indexes:
+    entities: dict[str, SemanticEntity]
+    fields: dict[str, dict[str, SemanticField]]
+    fields_by_name: dict[str, tuple[tuple[SemanticEntity, SemanticField], ...]]
+    metrics: dict[str, SemanticMetric]
+    relationships: dict[str, SemanticRelationship]
+
+
+@dataclass(frozen=True)
+class _WritePlan:
+    artifact: Path
+    manifest_path: Path
+    schema_path: Path
+    manifest: dict[str, Any]
+    existing_snapshot: SemanticSnapshot | None
+
+
 class SemanticCompiler:
     def __init__(self, clock=None):
         self._clock = clock or utc_now_iso
 
-    def compile_file(self, source: Path, output_root: Path) -> SemanticSnapshot:
-        raw_bytes = source.read_bytes()
+    def compile_file(
+        self,
+        source: Path,
+        output_root: Path,
+        *,
+        expected_datasource: str | None = None,
+    ) -> SemanticSnapshot:
+        """Validate completely, then publish one immutable version and its manifest."""
+        source = Path(source)
+        output_root = Path(output_root)
+        self._validate_source_path(source)
         try:
+            raw_bytes = source.read_bytes()
             payload = yaml.safe_load(raw_bytes.decode("utf-8"))
-            model = SemanticModel.model_validate(payload)
-            self._validate_references(model)
-        except (UnicodeDecodeError, yaml.YAMLError, ValidationError, SemanticCompileError) as exc:
+            parsed_model = SemanticModel.model_validate(payload)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, ValidationError) as exc:
             raise SemanticCompileError(str(exc)) from exc
 
+        expected = expected_datasource if expected_datasource is not None else source.stem
+        self._validate_expected_datasource(expected)
+        if parsed_model.datasource != expected:
+            qualifier = (
+                "显式 expected_datasource" if expected_datasource is not None else "源文件名"
+            )
+            raise SemanticCompileError(
+                f"语义模型 datasource {parsed_model.datasource} 与{qualifier} {expected} 不一致"
+            )
+
+        model = self._normalize_and_validate(parsed_model)
         semantic_payload = model.model_dump(mode="json")
-        canonical = json.dumps(
-            semantic_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        snapshot = SemanticSnapshot(
+        candidate = SemanticSnapshot(
             **semantic_payload,
             source_sha256=sha256(raw_bytes).hexdigest(),
-            content_sha256=sha256(canonical).hexdigest(),
+            content_sha256=sha256(self._canonical_bytes(semantic_payload)).hexdigest(),
             compiler_version=COMPILER_VERSION,
             compiled_at=self._clock(),
         )
-        self._write_snapshot_atomically(snapshot, output_root)
-        self._write_manifest_atomically(snapshot, output_root)
-        self._write_json_schema(output_root.parent / "schema/semantic-model.schema.json")
+
+        # Read and validate every existing destination before mkdir or replace.
+        plan = self._prepare_write(candidate, output_root)
+        snapshot = plan.existing_snapshot or candidate
+        if plan.existing_snapshot is None:
+            self._write_json_atomically(snapshot.model_dump(mode="json"), plan.artifact)
+        self._write_json_schema(plan.schema_path)
+        self._write_json_atomically(plan.manifest, plan.manifest_path)
         return snapshot
 
-    def _validate_references(self, model: SemanticModel) -> None:
-        entities: dict[str, Any] = {}
-        fields: dict[str, dict[str, Any]] = {}
-        fields_by_name: dict[str, list[str]] = {}
+    def _normalize_and_validate(self, model: SemanticModel) -> SemanticModel:
+        indexes = self._build_indexes(model)
+        relationships = tuple(
+            self._normalize_relationship(item, indexes, model.dialect)
+            for item in model.relationships
+        )
+        metrics = tuple(
+            self._normalize_metric(item, indexes, model.dialect)
+            for item in model.metrics
+        )
+        terms = tuple(
+            self._normalize_term(item, indexes, model.dialect) for item in model.terms
+        )
+        self._validate_term_uniqueness(terms)
+        denied_entities = tuple(
+            self._require_entity(item, indexes, "策略引用了不存在的实体").name
+            for item in model.policies.denied_entities
+        )
+        denied_fields = tuple(
+            self._canonical_field(item, indexes, "策略引用了不存在的字段")[0]
+            for item in model.policies.denied_fields
+        )
+        return SemanticModel(
+            schema_version=model.schema_version,
+            model_version=model.model_version,
+            datasource=model.datasource,
+            dialect=model.dialect,
+            entities=model.entities,
+            relationships=relationships,
+            metrics=metrics,
+            terms=terms,
+            policies=SemanticPolicies(
+                denied_entities=denied_entities,
+                denied_fields=denied_fields,
+            ),
+        )
 
+    def _build_indexes(self, model: SemanticModel) -> _Indexes:
+        entities: dict[str, SemanticEntity] = {}
+        fields: dict[str, dict[str, SemanticField]] = {}
+        fields_by_name: dict[str, list[tuple[SemanticEntity, SemanticField]]] = {}
         for entity in model.entities:
-            entity_key = entity.name.casefold()
-            self._add_unique(entities, entity_key, entity.name, "实体")
-            fields[entity_key] = {}
-            for field in entity.fields:
-                field_key = field.name.casefold()
-                self._add_unique(fields[entity_key], field_key, field.name, f"实体 {entity.name} 的字段")
-                fields_by_name.setdefault(field_key, []).append(f"{entity.name}.{field.name}")
-                if field.sensitivity == "restricted" and field.directly_queryable:
+            key = entity.name.casefold()
+            self._add_unique(entities, key, entity, "实体")
+            fields[key] = {}
+            for semantic_field in entity.fields:
+                field_key = semantic_field.name.casefold()
+                self._add_unique(
+                    fields[key],
+                    field_key,
+                    semantic_field,
+                    f"实体 {entity.name} 的字段",
+                )
+                fields_by_name.setdefault(field_key, []).append((entity, semantic_field))
+                if (
+                    semantic_field.sensitivity == "restricted"
+                    and semantic_field.directly_queryable
+                ):
                     raise SemanticCompileError(
-                        f"受限字段 {entity.name}.{field.name} 不可直接查询"
+                        f"受限字段 {entity.name}.{semantic_field.name} 不可直接查询"
                     )
 
-        metrics: dict[str, Any] = {}
+        metrics: dict[str, SemanticMetric] = {}
         for metric in model.metrics:
-            self._add_unique(metrics, metric.name.casefold(), metric.name, "指标")
-            self._validate_metric(metric, entities, fields, fields_by_name)
-
-        terms: dict[str, list[Any]] = {}
-        seen_terms: set[tuple[str, str | None]] = set()
-        for term in model.terms:
-            key = term.term.casefold()
-            signature = (key, term.when.casefold() if term.when else None)
-            if signature in seen_terms:
-                raise SemanticCompileError(f"重复术语: {term.term}")
-            seen_terms.add(signature)
-            terms.setdefault(key, []).append(term)
-        for name, definitions in terms.items():
-            if len(definitions) > 1 and any(term.when is None for term in definitions):
-                raise SemanticCompileError(f"术语 {name} 存在无消歧条件的歧义")
-
+            self._add_unique(metrics, metric.name.casefold(), metric, "指标")
+        relationships: dict[str, SemanticRelationship] = {}
         for relationship in model.relationships:
-            self._require_field(
-                relationship.from_entity,
-                relationship.from_field,
-                entities,
-                fields,
-                f"关系 {relationship.name} 的起点",
+            self._add_unique(
+                relationships, relationship.name.casefold(), relationship, "关系"
             )
-            self._require_field(
-                relationship.to_entity,
-                relationship.to_field,
-                entities,
-                fields,
-                f"关系 {relationship.name} 的终点",
-            )
+        return _Indexes(
+            entities=entities,
+            fields=fields,
+            fields_by_name={
+                name: tuple(values) for name, values in fields_by_name.items()
+            },
+            metrics=metrics,
+            relationships=relationships,
+        )
 
-        for entity_name in model.policies.denied_entities:
-            if entity_name.casefold() not in entities:
-                raise SemanticCompileError(f"策略引用了不存在的实体: {entity_name}")
-        for field_ref in model.policies.denied_fields:
-            self._resolve_field_reference(
-                field_ref, entities, fields, fields_by_name, "策略引用了不存在的字段"
-            )
-
-    def _validate_metric(
+    def _normalize_relationship(
         self,
-        metric: Any,
-        entities: dict[str, Any],
-        fields: dict[str, dict[str, Any]],
-        fields_by_name: dict[str, list[str]],
-    ) -> None:
-        expression = _SINGLE_QUOTED_LITERAL.sub("", metric.expression)
-        functions = {match.group(1).casefold() for match in _FUNCTION_CALL.finditer(expression)}
-        unknown_functions = functions - _ALLOWED_AGGREGATIONS
-        if unknown_functions:
-            raise SemanticCompileError(
-                f"指标 {metric.name} 使用未允许的聚合: {', '.join(sorted(unknown_functions))}"
+        relationship: SemanticRelationship,
+        indexes: _Indexes,
+        dialect: str,
+    ) -> SemanticRelationship:
+        from_entity = self._require_entity(
+            relationship.from_entity, indexes, f"关系 {relationship.name} 的起点"
+        )
+        to_entity = self._require_entity(
+            relationship.to_entity, indexes, f"关系 {relationship.name} 的终点"
+        )
+        from_field = self._require_field(
+            from_entity.name,
+            relationship.from_field,
+            indexes,
+            f"关系 {relationship.name} 的起点",
+        )
+        to_field = self._require_field(
+            to_entity.name,
+            relationship.to_field,
+            indexes,
+            f"关系 {relationship.name} 的终点",
+        )
+        condition = None
+        if relationship.extra_condition is not None:
+            condition = self._canonical_boolean_expression(
+                relationship.extra_condition,
+                indexes,
+                dialect,
+                f"关系 {relationship.name} 的 extra_condition",
+                allowed_entities={
+                    from_entity.name.casefold(),
+                    to_entity.name.casefold(),
+                },
             )
-        if not functions:
+        return SemanticRelationship(
+            name=relationship.name,
+            from_entity=from_entity.name,
+            from_field=from_field.name,
+            to_entity=to_entity.name,
+            to_field=to_field.name,
+            join_type=relationship.join_type,
+            extra_condition=condition,
+        )
+
+    def _normalize_metric(
+        self,
+        metric: SemanticMetric,
+        indexes: _Indexes,
+        dialect: str,
+    ) -> SemanticMetric:
+        expression = self._parse_single_expression(
+            metric.expression, dialect, f"指标 {metric.name} 的表达式"
+        )
+        nodes = tuple(self._walk_nodes(expression))
+        if isinstance(expression, (exp.Alias, *_QUERY_EXPRESSION_TYPES)) or any(
+            isinstance(node, _QUERY_EXPRESSION_TYPES) for node in nodes
+        ):
+            raise SemanticCompileError(f"指标 {metric.name} 必须是单个聚合表达式")
+
+        aggregate_nodes = tuple(node for node in nodes if isinstance(node, exp.AggFunc))
+        if not aggregate_nodes:
             raise SemanticCompileError(f"指标 {metric.name} 必须使用允许的聚合")
+        for function in (node for node in nodes if isinstance(node, exp.Func)):
+            function_name = type(function).__name__.casefold()
+            if function_name not in _ALLOWED_AGGREGATIONS:
+                raise SemanticCompileError(
+                    f"指标 {metric.name} 使用未允许的聚合: {function_name}"
+                )
 
-        qualified_spans: list[tuple[int, int]] = []
-        for match in _QUALIFIED_FIELD.finditer(expression):
-            qualified_spans.append(match.span())
-            self._require_field(
-                match.group(1), match.group(2), entities, fields, f"指标 {metric.name}"
-            )
-        for match in _IDENTIFIER.finditer(expression):
-            if any(start <= match.start() and match.end() <= end for start, end in qualified_spans):
-                continue
-            identifier = match.group(0)
-            identifier_key = identifier.casefold()
-            following = expression[match.end() :].lstrip()
-            if identifier_key in _SQL_KEYWORDS or following.startswith("("):
-                continue
-            self._resolve_field_reference(
-                identifier, entities, fields, fields_by_name, f"指标 {metric.name} 引用了不存在的字段"
-            )
+        self._canonicalize_columns(expression, indexes, f"指标 {metric.name}")
+        for column in expression.find_all(exp.Column):
+            parent = column.parent
+            while parent is not None:
+                if isinstance(parent, exp.AggFunc):
+                    break
+                parent = parent.parent
+            if parent is None:
+                raise SemanticCompileError(
+                    f"指标 {metric.name} 的字段必须位于允许的聚合内"
+                )
 
-        for dimension in metric.allowed_dimensions:
-            self._resolve_field_reference(
-                dimension, entities, fields, fields_by_name, f"指标 {metric.name} 引用了不存在的维度"
+        allowed_dimensions: list[str] = []
+        for reference in metric.allowed_dimensions:
+            canonical, semantic_field = self._canonical_field(
+                reference, indexes, f"指标 {metric.name} 引用了不存在的维度"
             )
-        for required_filter in metric.required_filters:
-            self._resolve_field_reference(
-                required_filter,
-                entities,
-                fields,
-                fields_by_name,
+            if semantic_field.role not in {"dimension", "time"}:
+                raise SemanticCompileError(
+                    f"指标 {metric.name} 的允许维度 {canonical} 角色不是维度或时间"
+                )
+            allowed_dimensions.append(canonical)
+
+        required_filters = tuple(
+            self._canonical_field(
+                reference,
+                indexes,
                 f"指标 {metric.name} 引用了不存在的过滤字段",
-            )
+            )[0]
+            for reference in metric.required_filters
+        )
+        default_time_field = None
         if metric.default_time_field is not None:
-            self._resolve_field_reference(
+            default_time_field, semantic_field = self._canonical_field(
                 metric.default_time_field,
-                entities,
-                fields,
-                fields_by_name,
+                indexes,
                 f"指标 {metric.name} 引用了不存在的时间字段",
             )
+            if semantic_field.role != "time":
+                raise SemanticCompileError(
+                    f"指标 {metric.name} 的默认时间字段 {default_time_field} 角色不是 time"
+                )
+
+        return SemanticMetric(
+            name=metric.name,
+            name_cn=metric.name_cn,
+            synonyms=metric.synonyms,
+            expression=expression.sql(dialect=dialect),
+            allowed_dimensions=tuple(allowed_dimensions),
+            required_filters=required_filters,
+            default_time_field=default_time_field,
+        )
+
+    def _normalize_term(
+        self,
+        term: SemanticTerm,
+        indexes: _Indexes,
+        dialect: str,
+    ) -> SemanticTerm:
+        return SemanticTerm(
+            term=term.term,
+            target=self._canonical_target(term.target, indexes),
+            when=(
+                self._canonical_boolean_expression(
+                    term.when,
+                    indexes,
+                    dialect,
+                    f"术语 {term.term} 的 when",
+                )
+                if term.when is not None
+                else None
+            ),
+        )
+
+    def _canonical_target(self, target: str, indexes: _Indexes) -> str:
+        prefix, separator, value = target.partition(":")
+        if separator and prefix.casefold() in {
+            "metric",
+            "entity",
+            "field",
+            "relationship",
+        }:
+            kind = prefix.casefold()
+            if kind == "metric":
+                metric = indexes.metrics.get(value.casefold())
+                if metric is None:
+                    raise SemanticCompileError(
+                        f"术语 target 引用了不存在的指标: {target}"
+                    )
+                return f"metric:{metric.name}"
+            if kind == "entity":
+                entity = self._require_entity(
+                    value, indexes, "术语 target 引用了不存在的实体"
+                )
+                return f"entity:{entity.name}"
+            if kind == "relationship":
+                relationship = indexes.relationships.get(value.casefold())
+                if relationship is None:
+                    raise SemanticCompileError(
+                        f"术语 target 引用了不存在的关系: {target}"
+                    )
+                return f"relationship:{relationship.name}"
+            field_ref = self._canonical_field(
+                value, indexes, "术语 target 引用了不存在的字段"
+            )[0]
+            return f"field:{field_ref}"
+
+        candidates: list[str] = []
+        if metric := indexes.metrics.get(target.casefold()):
+            candidates.append(f"metric:{metric.name}")
+        if entity := indexes.entities.get(target.casefold()):
+            candidates.append(f"entity:{entity.name}")
+        if relationship := indexes.relationships.get(target.casefold()):
+            candidates.append(f"relationship:{relationship.name}")
+        try:
+            field_reference, _ = self._canonical_field(
+                target, indexes, "术语 target 引用了不存在的字段"
+            )
+        except SemanticCompileError as exc:
+            if "不明确" in str(exc):
+                raise SemanticCompileError(f"术语 target 不明确: {target}") from None
+        else:
+            candidates.append(f"field:{field_reference}")
+
+        candidates = list(dict.fromkeys(candidates))
+        if not candidates:
+            raise SemanticCompileError(f"术语 target 引用了不存在的对象: {target}")
+        if len(candidates) != 1:
+            raise SemanticCompileError(f"术语 target 不明确: {target}")
+        return candidates[0]
 
     @staticmethod
-    def _add_unique(index: dict[str, Any], key: str, value: str, kind: str) -> None:
+    def _validate_term_uniqueness(terms: tuple[SemanticTerm, ...]) -> None:
+        definitions: dict[str, list[SemanticTerm]] = {}
+        signatures: set[tuple[str, str | None]] = set()
+        for term in terms:
+            key = term.term.casefold()
+            signature = (key, term.when.casefold() if term.when else None)
+            if signature in signatures:
+                raise SemanticCompileError(f"重复术语: {term.term}")
+            signatures.add(signature)
+            definitions.setdefault(key, []).append(term)
+        for name, matches in definitions.items():
+            if len(matches) > 1 and any(term.when is None for term in matches):
+                raise SemanticCompileError(f"术语 {name} 存在无消歧条件的歧义")
+
+    def _canonical_boolean_expression(
+        self,
+        value: str,
+        indexes: _Indexes,
+        dialect: str,
+        context: str,
+        *,
+        allowed_entities: set[str] | None = None,
+    ) -> str:
+        expression = self._parse_single_expression(value, dialect, context)
+        atoms = self._conjunctive_atoms(expression)
+        if (
+            atoms is None
+            or not atoms
+            or not all(isinstance(atom, exp.Predicate) for atom in atoms)
+        ):
+            raise SemanticCompileError(f"{context} 必须是单个确定性布尔条件")
+        self._canonicalize_columns(
+            expression,
+            indexes,
+            context,
+            allowed_entities=allowed_entities,
+        )
+        return expression.sql(dialect=dialect)
+
+    @staticmethod
+    def _parse_single_expression(
+        value: str, dialect: str, context: str
+    ) -> exp.Expression:
+        try:
+            statements = [item for item in parse(value, read=dialect) if item is not None]
+        except ParseError as exc:
+            raise SemanticCompileError(f"{context} 无法完整解析") from exc
+        if len(statements) != 1:
+            raise SemanticCompileError(f"{context} 必须是单个表达式")
+        return statements[0]
+
+    def _canonicalize_columns(
+        self,
+        expression: exp.Expression,
+        indexes: _Indexes,
+        context: str,
+        *,
+        allowed_entities: set[str] | None = None,
+    ) -> None:
+        for column in expression.find_all(exp.Column):
+            raw = f"{column.table}.{column.name}" if column.table else column.name
+            canonical, _ = self._canonical_field(
+                raw, indexes, f"{context} 引用了不存在的字段"
+            )
+            entity_name, field_name = canonical.split(".", 1)
+            if (
+                allowed_entities is not None
+                and entity_name.casefold() not in allowed_entities
+            ):
+                raise SemanticCompileError(
+                    f"{context} 引用了关系端点之外的字段: {canonical}"
+                )
+            column.set("table", exp.to_identifier(entity_name))
+            column.set("this", exp.to_identifier(field_name))
+
+    @classmethod
+    def _conjunctive_atoms(
+        cls, expression: exp.Expression | None
+    ) -> tuple[exp.Expression, ...] | None:
+        if expression is None or isinstance(expression, exp.Or):
+            return None
+        if isinstance(expression, exp.And):
+            left = cls._conjunctive_atoms(expression.this)
+            right = cls._conjunctive_atoms(expression.expression)
+            return None if left is None or right is None else left + right
+        return (expression,)
+
+    @staticmethod
+    def _walk_nodes(expression: exp.Expression):
+        for item in expression.walk():
+            yield item[0] if isinstance(item, tuple) else item
+
+    @staticmethod
+    def _add_unique(
+        index: dict[str, Any], key: str, value: Any, kind: str
+    ) -> None:
         if key in index:
-            raise SemanticCompileError(f"重复{kind}: {value}")
+            name = getattr(value, "name", str(value))
+            raise SemanticCompileError(f"重复{kind}: {name}")
         index[key] = value
 
     @staticmethod
+    def _require_entity(
+        reference: str, indexes: _Indexes, context: str
+    ) -> SemanticEntity:
+        entity = indexes.entities.get(reference.casefold())
+        if entity is None:
+            raise SemanticCompileError(f"{context}: {reference}")
+        return entity
+
     def _require_field(
+        self,
         entity_name: str,
         field_name: str,
-        entities: dict[str, Any],
-        fields: dict[str, dict[str, Any]],
+        indexes: _Indexes,
         context: str,
-    ) -> None:
-        entity_key = entity_name.casefold()
-        field_key = field_name.casefold()
-        if entity_key not in entities:
-            raise SemanticCompileError(f"{context} 引用了不存在的实体: {entity_name}")
-        if field_key not in fields[entity_key]:
+    ) -> SemanticField:
+        entity = self._require_entity(entity_name, indexes, context)
+        semantic_field = indexes.fields[entity.name.casefold()].get(field_name.casefold())
+        if semantic_field is None:
             raise SemanticCompileError(
                 f"{context} 引用了不存在的字段: {entity_name}.{field_name}"
             )
+        return semantic_field
 
-    def _resolve_field_reference(
+    def _canonical_field(
         self,
         reference: str,
-        entities: dict[str, Any],
-        fields: dict[str, dict[str, Any]],
-        fields_by_name: dict[str, list[str]],
+        indexes: _Indexes,
         context: str,
-    ) -> None:
+    ) -> tuple[str, SemanticField]:
+        if reference.count(".") > 1:
+            raise SemanticCompileError(f"{context}: {reference}")
         if "." in reference:
             entity_name, field_name = reference.split(".", 1)
-            self._require_field(entity_name, field_name, entities, fields, context)
-            return
-        matches = fields_by_name.get(reference.casefold(), [])
+            entity = self._require_entity(entity_name, indexes, context)
+            semantic_field = self._require_field(
+                entity.name, field_name, indexes, context
+            )
+            return f"{entity.name}.{semantic_field.name}", semantic_field
+        matches = indexes.fields_by_name.get(reference.casefold(), ())
         if not matches:
             raise SemanticCompileError(f"{context}: {reference}")
-        if len(matches) > 1:
+        if len(matches) != 1:
             raise SemanticCompileError(f"{context} 且字段引用不明确: {reference}")
+        entity, semantic_field = matches[0]
+        return f"{entity.name}.{semantic_field.name}", semantic_field
 
-    def _write_snapshot_atomically(self, snapshot: SemanticSnapshot, output_root: Path) -> None:
-        payload = snapshot.model_dump(mode="json")
-        jsonschema.validate(payload, SemanticSnapshot.model_json_schema())
-        destination = output_root / snapshot.datasource / f"{snapshot.model_version}.json"
-        self._write_json_atomically(payload, destination)
-
-    def _write_manifest_atomically(self, snapshot: SemanticSnapshot, output_root: Path) -> None:
+    def _prepare_write(
+        self, snapshot: SemanticSnapshot, output_root: Path
+    ) -> _WritePlan:
+        artifact = output_root / snapshot.datasource / f"{snapshot.model_version}.json"
         manifest_path = output_root / "manifest.json"
+        schema_path = output_root.parent / "schema/semantic-model.schema.json"
+        self._validate_output_path(output_root, artifact)
+        self._validate_output_path(output_root, manifest_path)
+        self._validate_output_path(output_root.parent, schema_path)
+
         manifest: dict[str, Any] = {"active": {}}
         if manifest_path.exists():
-            try:
-                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise SemanticCompileError(f"无法读取现有清单: {exc}") from exc
-            if not isinstance(existing, dict) or not isinstance(existing.get("active"), dict):
-                raise SemanticCompileError("现有清单格式无效")
-            manifest = existing
-        manifest["active"][snapshot.datasource] = snapshot.model_version
-        self._write_json_atomically(manifest, manifest_path)
+            manifest = self._read_manifest(manifest_path)
+
+        existing_snapshot = None
+        if artifact.exists():
+            existing_snapshot = self._read_existing_snapshot(artifact)
+            if (
+                existing_snapshot.datasource != snapshot.datasource
+                or existing_snapshot.model_version != snapshot.model_version
+                or existing_snapshot.content_sha256 != snapshot.content_sha256
+            ):
+                raise SemanticCompileError(
+                    f"语义版本 {snapshot.datasource}@{snapshot.model_version} "
+                    "已存在且内容不同"
+                )
+
+        next_manifest = json.loads(json.dumps(manifest))
+        next_manifest["active"][snapshot.datasource] = snapshot.model_version
+        payload = (existing_snapshot or snapshot).model_dump(mode="json")
+        try:
+            jsonschema.validate(payload, SemanticSnapshot.model_json_schema())
+        except jsonschema.ValidationError as exc:
+            raise SemanticCompileError("编译产物格式无效") from exc
+        return _WritePlan(
+            artifact=artifact,
+            manifest_path=manifest_path,
+            schema_path=schema_path,
+            manifest=next_manifest,
+            existing_snapshot=existing_snapshot,
+        )
+
+    @staticmethod
+    def _read_manifest(path: Path) -> dict[str, Any]:
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SemanticCompileError(f"无法读取现有清单: {exc}") from exc
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("active"), dict
+        ):
+            raise SemanticCompileError("现有清单格式无效")
+        if not all(
+            isinstance(name, str) and isinstance(version, str)
+            for name, version in manifest["active"].items()
+        ):
+            raise SemanticCompileError("现有清单格式无效")
+        return manifest
+
+    def _read_existing_snapshot(self, path: Path) -> SemanticSnapshot:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            jsonschema.validate(payload, SemanticSnapshot.model_json_schema())
+            snapshot = SemanticSnapshot.model_validate(payload)
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            jsonschema.ValidationError,
+            ValidationError,
+        ) as exc:
+            raise SemanticCompileError(
+                "现有版本 artifact 格式无效，拒绝覆盖"
+            ) from exc
+        semantic_payload = {
+            name: getattr(snapshot, name) for name in SemanticModel.model_fields
+        }
+        digest = sha256(
+            self._canonical_bytes(
+                SemanticModel.model_validate(semantic_payload).model_dump(mode="json")
+            )
+        ).hexdigest()
+        if (
+            snapshot.content_sha256 != digest
+            or _SHA256_HEX.fullmatch(snapshot.source_sha256) is None
+        ):
+            raise SemanticCompileError("现有版本 artifact 摘要无效，拒绝覆盖")
+        return snapshot
+
+    @staticmethod
+    def _validate_source_path(source: Path) -> None:
+        if source.is_symlink():
+            raise SemanticCompileError("语义源文件不得是符号链接")
+        if not source.is_file():
+            raise SemanticCompileError(f"语义源文件不存在: {source}")
+
+    @staticmethod
+    def _validate_expected_datasource(value: str) -> None:
+        if not isinstance(value, str) or _DATASOURCE.fullmatch(value) is None:
+            raise SemanticCompileError("expected datasource 不是安全的数据源标识符")
+
+    @staticmethod
+    def _validate_output_path(boundary: Path, destination: Path) -> None:
+        boundary_absolute = boundary.absolute()
+        if boundary_absolute.is_symlink():
+            raise SemanticCompileError(f"编译输出路径不得包含符号链接: {boundary}")
+        if boundary_absolute.exists() and not boundary_absolute.is_dir():
+            raise SemanticCompileError(f"编译输出路径的父级不是目录: {boundary}")
+        try:
+            relative = destination.absolute().relative_to(boundary_absolute)
+        except ValueError:
+            raise SemanticCompileError("编译输出路径越界") from None
+        current = boundary_absolute
+        for index, part in enumerate(relative.parts):
+            current = current / part
+            if current.is_symlink():
+                raise SemanticCompileError(f"编译输出路径不得包含符号链接: {current}")
+            if not current.exists():
+                continue
+            is_destination = index == len(relative.parts) - 1
+            if is_destination and not current.is_file():
+                raise SemanticCompileError(f"编译输出路径不是普通文件: {current}")
+            if not is_destination and not current.is_dir():
+                raise SemanticCompileError(f"编译输出路径的父级不是目录: {current}")
+        try:
+            destination.resolve(strict=False).relative_to(
+                boundary_absolute.resolve(strict=False)
+            )
+        except ValueError:
+            raise SemanticCompileError("编译输出解析后越界") from None
+
+    @staticmethod
+    def _canonical_bytes(payload: Any) -> bytes:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     @staticmethod
     def _write_json_schema(destination: Path) -> None:
-        SemanticCompiler._write_json_atomically(SemanticModel.model_json_schema(), destination)
+        SemanticCompiler._write_json_atomically(
+            SemanticModel.model_json_schema(), destination
+        )
 
     @staticmethod
     def _write_json_atomically(payload: Any, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
         temporary_name: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="wb", dir=destination.parent, prefix=f".{destination.name}.", delete=False
+                mode="wb",
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                delete=False,
             ) as temporary:
                 temporary_name = temporary.name
                 temporary.write(encoded)

@@ -34,12 +34,13 @@ def _normalize_definition_value(value: str | None) -> str | None:
     return unicodedata.normalize("NFKC", value).strip()
 
 
-def build_v2_payload(snapshot: SemanticSnapshot, database_id: int) -> dict[str, Any]:
+def build_v2_payload(snapshot: SemanticSnapshot, database_id: str) -> dict[str, Any]:
     """Build the deterministic v2 graph payload for one compiled snapshot."""
     provenance = {
         "semantic_version": snapshot.model_version,
         "semantic_content_sha256": snapshot.content_sha256,
         "source": "git_semantic_model",
+        "datasource": snapshot.datasource,
     }
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -174,6 +175,7 @@ def build_v2_payload(snapshot: SemanticSnapshot, database_id: int) -> dict[str, 
         "format": "text2sql_knowledge_graph",
         "semantic_version": snapshot.model_version,
         "semantic_content_sha256": snapshot.content_sha256,
+        "datasource": snapshot.datasource,
         "nodes": nodes,
         "edges": edges,
     }
@@ -188,8 +190,7 @@ class SemanticNeo4jPublisher:
     def to_graph_payload(self, snapshot: SemanticSnapshot) -> dict:
         if not isinstance(snapshot, SemanticSnapshot):
             raise TypeError("publisher requires a compiled SemanticSnapshot")
-        datasource_hash = sha256(snapshot.datasource.encode("utf-8")).hexdigest()
-        database_id = max(1, int(datasource_hash[:8], 16))
+        database_id = sha256(snapshot.datasource.encode("utf-8")).hexdigest()
         return build_v2_payload(snapshot, database_id)
 
     def publish(self, snapshot: SemanticSnapshot) -> dict:

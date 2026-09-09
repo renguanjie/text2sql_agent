@@ -1874,7 +1874,7 @@ def test_repository_semantic_content_and_golden_suite_use_new_version(tmp_path: 
     )
     compiled = tmp_path / "compiled"
     compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
-    compiler.compile_file(old_source, compiled)
+    compiler.compile_file(old_source, compiled, expected_datasource="default")
     compiler.compile_file(root / "semantic_models/default.yaml", compiled)
 
     manifest = json.loads((compiled / "manifest.json").read_text("utf-8"))

@@ -14,6 +14,11 @@ from sqlglot import exp, parse, parse_one
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from .models import SemanticMetric, SemanticSnapshot, ValidationIssue, ValidationReport
+from .terms import (
+    ResolvedSemanticTerms,
+    SemanticTermResolutionError,
+    SemanticTermResolver,
+)
 
 _FieldReference = tuple[str, str]
 
@@ -1111,6 +1116,52 @@ def normalize_filter_expression(
     )
 
 
+def _relevant_filter_signatures(
+    analysis: _SQLAnalysis,
+    semantic_indexes: Mapping[str, frozenset[str]],
+) -> frozenset[str]:
+    """Collect conjunctive filters only along physical lineage of root outputs."""
+    infos = {id(info.scope): info for info in analysis.scope_infos}
+    relevant_ids: set[int] = set()
+
+    def include_sources(info: _ScopeInfo) -> None:
+        marker = id(info.scope)
+        if marker in relevant_ids:
+            return
+        relevant_ids.add(marker)
+        for source in _unique_sources(info):
+            if isinstance(source, Scope):
+                include_sources(infos[id(source)])
+
+    for root_info in analysis.root_output_infos:
+        include_sources(root_info)
+
+    signatures: set[str] = set()
+    for info in analysis.scope_infos:
+        if id(info.scope) not in relevant_ids:
+            continue
+        select = info.scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        for clause_name in ("where", "having"):
+            clause = select.args.get(clause_name)
+            if not isinstance(clause, exp.Expression) or clause.this is None:
+                continue
+            atoms = _conjunctive_atoms(clause.this)
+            if atoms is None:
+                continue
+            signatures.update(
+                _filter_signature_text(
+                    atom,
+                    info,
+                    infos,
+                    semantic_indexes,
+                )
+                for atom in atoms
+            )
+    return frozenset(signatures)
+
+
 def _date_format_time_facts(format_text: str) -> frozenset[str]:
     tokens: set[str] = set()
     index = 0
@@ -1661,6 +1712,9 @@ def _has_time_intent(question: str) -> bool:
 class SemanticSQLValidator:
     """Evaluate governed semantic rules without constructing database clients."""
 
+    def __init__(self) -> None:
+        self._term_resolver = SemanticTermResolver()
+
     def validate(
         self,
         sql: str,
@@ -1707,6 +1761,15 @@ class SemanticSQLValidator:
                     message=message,
                     objects=tuple(sorted({_casefold(item) for item in objects if item})),
                 )
+            )
+
+        resolved_terms = ResolvedSemanticTerms()
+        try:
+            resolved_terms = self._term_resolver.resolve(question, snapshot)
+        except SemanticTermResolutionError:
+            add(
+                "TERM_RESOLUTION_FAILED",
+                "问题命中的治理术语无法唯一且安全地解析",
             )
 
         # Object existence.
@@ -1868,8 +1931,90 @@ class SemanticSQLValidator:
             metric
             for metric in snapshot.metrics
             if _question_matches(question, _metric_terms(metric))
+            or metric.name.casefold() in resolved_terms.metric_names
         )
         lineage = _lineage_for_analysis(analysis, field_indexes)
+
+        # Term targets and conditions are deterministic authorization facts, not
+        # prompt hints. A condition must be proven in the returned query lineage.
+        active_tables = frozenset(
+            table
+            for info in analysis.active_scope_infos
+            for table in info.physical_tables
+        )
+        active_scope_ids = {
+            id(info.scope) for info in analysis.active_scope_infos
+        }
+        query_filters = _relevant_filter_signatures(analysis, field_indexes)
+        relationships = {
+            relation.name.casefold(): relation for relation in snapshot.relationships
+        }
+        for term in resolved_terms.matches:
+            if term.target_kind == "field" and term.target_name.casefold() not in lineage.fields:
+                add(
+                    "TERM_TARGET_MISMATCH",
+                    "SQL 未使用问题命中的治理术语字段",
+                    term.target,
+                )
+            elif (
+                term.target_kind == "entity"
+                and term.target_name.casefold() not in active_tables
+            ):
+                add(
+                    "TERM_TARGET_MISMATCH",
+                    "SQL 未使用问题命中的治理术语实体",
+                    term.target,
+                )
+            elif term.target_kind == "relationship":
+                relation = relationships[term.target_name.casefold()]
+                endpoint = frozenset(
+                    {
+                        f"{relation.from_entity}.{relation.from_field}".casefold(),
+                        f"{relation.to_entity}.{relation.to_field}".casefold(),
+                    }
+                )
+                relation_present = any(
+                    id(fact.info.scope) in active_scope_ids
+                    and endpoint
+                    in {
+                        frozenset(
+                            {
+                                f"{left}.{left_field}".casefold(),
+                                f"{right}.{right_field}".casefold(),
+                            }
+                        )
+                        for left, left_field, right, right_field in fact.pairs
+                    }
+                    for fact in analysis.join_facts
+                )
+                if not relation_present:
+                    add(
+                        "TERM_TARGET_MISMATCH",
+                        "SQL 未使用问题命中的治理术语关系",
+                        term.target,
+                    )
+            if term.when is not None:
+                try:
+                    required = frozenset(
+                        normalize_filter_expression(
+                            term.when,
+                            snapshot.dialect,
+                            field_indexes,
+                        )
+                    )
+                except Exception:
+                    add(
+                        "TERM_RESOLUTION_FAILED",
+                        "治理术语条件无法安全解析",
+                        term.target,
+                    )
+                else:
+                    if not required.issubset(query_filters):
+                        add(
+                            "TERM_CONDITION_REQUIRED",
+                            "SQL 缺少问题命中术语的治理条件",
+                            term.target,
+                        )
 
         # Matched metrics.
         for metric in matched_metrics:

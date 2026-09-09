@@ -11,10 +11,14 @@
           "type": "array"
         },
         "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "Name",
           "type": "string"
         },
         "name_cn": {
+          "minLength": 1,
           "title": "Name Cn",
           "type": "string"
         },
@@ -39,6 +43,7 @@
       "additionalProperties": false,
       "properties": {
         "data_type": {
+          "minLength": 1,
           "title": "Data Type",
           "type": "string"
         },
@@ -56,10 +61,14 @@
           "type": "array"
         },
         "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "Name",
           "type": "string"
         },
         "name_cn": {
+          "minLength": 1,
           "title": "Name Cn",
           "type": "string"
         },
@@ -116,6 +125,7 @@
         "default_time_field": {
           "anyOf": [
             {
+              "minLength": 1,
               "type": "string"
             },
             {
@@ -126,14 +136,19 @@
           "title": "Default Time Field"
         },
         "expression": {
+          "minLength": 1,
           "title": "Expression",
           "type": "string"
         },
         "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "Name",
           "type": "string"
         },
         "name_cn": {
+          "minLength": 1,
           "title": "Name Cn",
           "type": "string"
         },
@@ -168,6 +183,9 @@
         "denied_entities": {
           "default": [],
           "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
             "type": "string"
           },
           "title": "Denied Entities",
@@ -191,6 +209,7 @@
         "extra_condition": {
           "anyOf": [
             {
+              "minLength": 1,
               "type": "string"
             },
             {
@@ -201,10 +220,16 @@
           "title": "Extra Condition"
         },
         "from_entity": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "From Entity",
           "type": "string"
         },
         "from_field": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "From Field",
           "type": "string"
         },
@@ -218,14 +243,23 @@
           "type": "string"
         },
         "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "Name",
           "type": "string"
         },
         "to_entity": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "To Entity",
           "type": "string"
         },
         "to_field": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
           "title": "To Field",
           "type": "string"
         }
@@ -244,16 +278,19 @@
       "additionalProperties": false,
       "properties": {
         "target": {
+          "minLength": 1,
           "title": "Target",
           "type": "string"
         },
         "term": {
+          "minLength": 1,
           "title": "Term",
           "type": "string"
         },
         "when": {
           "anyOf": [
             {
+              "minLength": 1,
               "type": "string"
             },
             {
@@ -275,6 +312,9 @@
   "additionalProperties": false,
   "properties": {
     "datasource": {
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
       "title": "Datasource",
       "type": "string"
     },

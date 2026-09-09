@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Literal
 
-from ..semantic.context import SemanticContextBuilder
+from ..semantic.context import SemanticContextBuilder, SemanticPromptBundle
 from ..semantic.models import (
     CorrectnessResult,
     PreflightResult,
@@ -49,7 +49,7 @@ class _CorrectnessRequest:
 class _PreparedState:
     question: str = field(repr=False)
     snapshot: SemanticSnapshot = field(repr=False)
-    semantic_context: str | None = field(repr=False)
+    semantic_context: SemanticPromptBundle | None = field(repr=False)
 
 
 class CorrectnessPipeline:
@@ -82,7 +82,7 @@ class CorrectnessPipeline:
         return self._issue_request(
             question,
             snapshot,
-            semantic_context=context.rendered,
+            semantic_context=SemanticPromptBundle(context),
         )
 
     def discard_prepared(self, request: Any) -> bool:
@@ -306,7 +306,7 @@ class CorrectnessPipeline:
         question: str,
         snapshot: SemanticSnapshot,
         *,
-        semantic_context: str | None,
+        semantic_context: SemanticPromptBundle | None,
     ) -> _CorrectnessRequest:
         request = _CorrectnessRequest()
         state = _PreparedState(
@@ -351,12 +351,14 @@ class CorrectnessPipeline:
         state: _PreparedState,
         sql: str,
         validation: ValidationReport,
-    ) -> str | CorrectnessResult:
+    ) -> SemanticPromptBundle | CorrectnessResult:
         snapshot = state.snapshot
         if state.semantic_context:
             return state.semantic_context
         try:
-            return self.context_builder.build(state.question, snapshot).rendered
+            return SemanticPromptBundle(
+                self.context_builder.build(state.question, snapshot)
+            )
         except Exception as exc:
             self._log_internal_failure("repair_context", exc)
             return self._repair_error(sql, snapshot, validation, _REPAIR_FAILED, 0)

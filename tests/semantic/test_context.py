@@ -41,6 +41,8 @@ metrics:
     allowed_dimensions: [orders.created_at]
     required_filters: [orders.status]
     default_time_field: orders.created_at
+terms:
+  - {term: 成交额, target: order_amount, when: "orders.status = 'paid'"}
 policies:
   denied_fields: [customers.mobile]
 """,
@@ -109,4 +111,40 @@ def test_context_rejects_limit_that_cannot_fit_all_matched_metric_dependencies(
     with pytest.raises(SemanticContextError, match="max_items"):
         SemanticContextBuilder(max_chars=800, max_items=8).build(
             "订单金额汇总", two_metric_snapshot
+        )
+
+
+def test_context_resolves_chinese_term_to_complete_metric_bundle(
+    sales_snapshot: SemanticSnapshot,
+):
+    """Break caught: terms being published but ignored by semantic context selection."""
+    context = SemanticContextBuilder(max_chars=1000, max_items=10).build(
+        "查询成交额", sales_snapshot
+    )
+
+    assert context.metrics == ("order_amount",)
+    assert context.terms == ("成交额",)
+    assert "术语: 成交额 -> metric:order_amount" in context.rendered
+    assert "条件: orders.status = 'paid'" in context.rendered
+    assert "orders.customer_id = customers.id [LEFT JOIN]" in context.rendered
+    assert "禁止字段 customers.mobile" in context.rendered
+
+
+def test_context_fails_closed_for_ambiguous_conditional_term(
+    sales_snapshot: SemanticSnapshot,
+):
+    """Break caught: choosing one of several conditional term definitions arbitrarily."""
+    first = sales_snapshot.terms[0]
+    ambiguous = sales_snapshot.model_copy(
+        update={
+            "terms": (
+                first,
+                first.model_copy(update={"when": "orders.status = 'refunded'"}),
+            )
+        }
+    )
+
+    with pytest.raises(SemanticContextError, match="术语"):
+        SemanticContextBuilder(max_chars=1000, max_items=12).build(
+            "查询成交额", ambiguous
         )

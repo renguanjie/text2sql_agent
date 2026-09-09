@@ -177,6 +177,7 @@ def test_successful_repair_runs_full_validation_again(pipeline):
 def test_process_pins_one_snapshot_across_context_and_repair_validation():
     """Catches a request mixing semantic versions by reading the registry twice."""
     from core.sql.correctness import CorrectnessPipeline
+    from core.semantic.context import SemanticPromptBundle
 
     registry = ChangingRegistry(_snapshot("1.0.0"), _snapshot("1.1.0"))
     contexts: list[str] = []
@@ -194,11 +195,14 @@ def test_process_pins_one_snapshot_across_context_and_repair_validation():
     assert result.status == "success"
     assert result.semantic_version == "1.0.0"
     assert contexts and "版本: sales@1.0.0" in contexts[0]
+    assert isinstance(contexts[0], SemanticPromptBundle)
     assert registry.calls == 1
 
 
 def test_prepared_request_is_an_empty_identity_capability():
     """The token itself must expose no semantic payload that can be forged."""
+    from core.semantic.context import SemanticPromptBundle
+
     pipeline = _make_pipeline()
     request = pipeline.prepare_generation("订单金额")
     assert not hasattr(request, "_question")
@@ -214,6 +218,7 @@ def test_prepared_request_is_an_empty_identity_capability():
     assert "版本: sales@1.0.0" in semantic_context
     assert semantic_version == "1.0.0"
     assert content_sha256 == "1" * 64
+    assert isinstance(semantic_context, SemanticPromptBundle)
 
 
 def test_prepared_request_rejects_lookalike_with_forged_fields():

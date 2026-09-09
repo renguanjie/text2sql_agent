@@ -14,6 +14,13 @@ from .models import (
     ValidationIssue,
     ValidationReport,
 )
+from .terms import (
+    ResolvedSemanticTerm,
+    ResolvedSemanticTerms,
+    SemanticTermResolutionError,
+    SemanticTermResolver,
+)
+from .context import SemanticPromptBundle
 
 __all__ = [
     "FrozenModel",
@@ -30,4 +37,9 @@ __all__ = [
     "ValidationReport",
     "PreflightResult",
     "CorrectnessResult",
+    "ResolvedSemanticTerm",
+    "ResolvedSemanticTerms",
+    "SemanticTermResolutionError",
+    "SemanticTermResolver",
+    "SemanticPromptBundle",
 ]

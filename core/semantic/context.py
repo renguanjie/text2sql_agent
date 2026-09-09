@@ -14,6 +14,11 @@ from .models import (
     SemanticRelationship,
     SemanticSnapshot,
 )
+from .terms import (
+    ResolvedSemanticTerm,
+    SemanticTermResolutionError,
+    SemanticTermResolver,
+)
 
 
 _QUALIFIED_FIELD = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
@@ -21,6 +26,17 @@ _QUALIFIED_FIELD = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9
 
 class SemanticContextError(ValueError):
     """Raised when a complete mandatory semantic dependency bundle cannot fit."""
+
+
+class SemanticPromptBundle(str):
+    """String-compatible carrier marking a complete structured semantic context."""
+
+    def __new__(cls, context: SemanticContext):
+        if not isinstance(context, SemanticContext):
+            raise TypeError("SemanticPromptBundle requires SemanticContext")
+        instance = super().__new__(cls, context.rendered)
+        instance.context = context
+        return instance
 
 
 @dataclass(frozen=True)
@@ -36,14 +52,22 @@ class SemanticContextBuilder:
             raise ValueError("max_chars 和 max_items 必须为正数")
         self._max_chars = max_chars
         self._max_items = max_items
+        self._term_resolver = SemanticTermResolver()
 
     def build(self, question: str, snapshot: SemanticSnapshot) -> SemanticContext:
         header = f"版本: {snapshot.datasource}@{snapshot.model_version}"
         if len(header) > self._max_chars:
             raise SemanticContextError("max_chars 无法容纳版本信息")
 
+        try:
+            resolved_terms = self._term_resolver.resolve(question, snapshot)
+        except SemanticTermResolutionError as exc:
+            raise SemanticContextError(str(exc)) from None
         matched_metrics = [
-            metric for metric in snapshot.metrics if self._matches(question, self._metric_terms(metric))
+            metric
+            for metric in snapshot.metrics
+            if self._matches(question, self._metric_terms(metric))
+            or metric.name.casefold() in resolved_terms.metric_names
         ]
         mandatory_items = self._deduplicated(
             [],
@@ -51,6 +75,11 @@ class SemanticContextBuilder:
                 item
                 for metric in matched_metrics
                 for item in self._metric_dependency_bundle(metric, snapshot)
+            )
+            + tuple(
+                item
+                for term in resolved_terms.matches
+                for item in self._term_dependency_bundle(term, snapshot)
             ),
         )
         self._validate_mandatory_items(header, mandatory_items)
@@ -67,6 +96,7 @@ class SemanticContextBuilder:
             fields=tuple(item.identifier for item in selected if item.kind == "field"),
             relationships=tuple(item.identifier for item in selected if item.kind == "relationship"),
             metrics=tuple(item.identifier for item in selected if item.kind == "metric"),
+            terms=tuple(item.identifier for item in selected if item.kind == "term"),
             policies=tuple(item.identifier for item in selected if item.kind == "policy"),
             rendered=rendered,
         )
@@ -149,6 +179,87 @@ class SemanticContextBuilder:
         items.extend(
             _ContextItem("policy", f"field:{entity.name}.{field.name}", f"策略: 禁止字段 {entity.name}.{field.name}")
             for entity, field in policy_fields
+        )
+        return tuple(items)
+
+    def _term_dependency_bundle(
+        self, term: ResolvedSemanticTerm, snapshot: SemanticSnapshot
+    ) -> tuple[_ContextItem, ...]:
+        suffix = f"; 条件: {term.when}" if term.when is not None else ""
+        items: list[_ContextItem] = [
+            _ContextItem(
+                "term",
+                term.term,
+                f"术语: {term.term} -> {term.target}{suffix}",
+            )
+        ]
+        if term.target_kind == "metric":
+            metric = next(
+                item
+                for item in snapshot.metrics
+                if item.name.casefold() == term.target_name.casefold()
+            )
+            items.extend(self._metric_dependency_bundle(metric, snapshot))
+        elif term.target_kind == "entity":
+            entity = next(
+                item
+                for item in snapshot.entities
+                if item.name.casefold() == term.target_name.casefold()
+            )
+            items.append(self._entity_item(entity))
+        elif term.target_kind == "field":
+            resolved = self._resolve_field(
+                term.target_name, self._fields_by_reference(snapshot)
+            )
+            if resolved is not None:
+                items.extend(
+                    (self._entity_item(resolved[0]), self._field_item(*resolved))
+                )
+        elif term.target_kind == "relationship":
+            relationship = next(
+                item
+                for item in snapshot.relationships
+                if item.name.casefold() == term.target_name.casefold()
+            )
+            items.append(self._relationship_item(relationship))
+            fields = self._fields_by_reference(snapshot)
+            for reference in (
+                f"{relationship.from_entity}.{relationship.from_field}",
+                f"{relationship.to_entity}.{relationship.to_field}",
+            ):
+                resolved = self._resolve_field(reference, fields)
+                if resolved is not None:
+                    items.extend(
+                        (self._entity_item(resolved[0]), self._field_item(*resolved))
+                    )
+
+        fields = self._fields_by_reference(snapshot)
+        if term.when is not None:
+            for match in _QUALIFIED_FIELD.finditer(term.when):
+                resolved = self._resolve_field(
+                    f"{match.group(1)}.{match.group(2)}", fields
+                )
+                if resolved is not None:
+                    items.extend(
+                        (self._entity_item(resolved[0]), self._field_item(*resolved))
+                    )
+        target_entities = {
+            item.identifier.casefold() for item in items if item.kind == "entity"
+        }
+        target_fields = {
+            item.identifier.casefold() for item in items if item.kind == "field"
+        }
+        items.extend(
+            _ContextItem("policy", f"entity:{name}", f"策略: 禁止实体 {name}")
+            for name in snapshot.policies.denied_entities
+            if name.casefold() in target_entities
+        )
+        items.extend(
+            _ContextItem(
+                "policy", f"field:{reference}", f"策略: 禁止字段 {reference}"
+            )
+            for reference in snapshot.policies.denied_fields
+            if reference.casefold() in target_fields
         )
         return tuple(items)
 

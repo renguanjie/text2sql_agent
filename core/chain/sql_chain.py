@@ -9,7 +9,7 @@ from loguru import logger
 import re
 import asyncio
 
-from .prompts import get_prompt_templates
+from .prompts import SemanticPromptBudgetError, get_prompt_templates
 from ..utils.log_sanitizer import mask_sensitive, text_fingerprint, truncate_log
 
 
@@ -182,6 +182,13 @@ class SQLGenerationChain:
             response = self._invoke_llm_with_retry(messages)
             return self._process_llm_response(response.content, knowledge_results, user_query)
 
+        except SemanticPromptBudgetError as e:
+            logger.warning("SQL 生成在 LLM 调用前因语义提示词预算不足而拒绝")
+            self.stats['failed_generations'] += 1
+            return {
+                'sql': None, 'status': 'error',
+                'error': str(e), 'raw_response': None
+            }
         except Exception as e:
             logger.opt(exception=e).error("SQL 生成失败")
             self.stats['failed_generations'] += 1
@@ -213,6 +220,13 @@ class SQLGenerationChain:
             response = await self._ainvoke_llm_with_retry(messages)
             return self._process_llm_response(response.content, knowledge_results, user_query)
 
+        except SemanticPromptBudgetError as e:
+            logger.warning("异步 SQL 生成在 LLM 调用前因语义提示词预算不足而拒绝")
+            self.stats['failed_generations'] += 1
+            return {
+                'sql': None, 'status': 'error',
+                'error': str(e), 'raw_response': None
+            }
         except Exception as e:
             logger.opt(exception=e).error("异步 SQL 生成失败")
             self.stats['failed_generations'] += 1

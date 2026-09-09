@@ -819,6 +819,131 @@ def test_neo4j_write_batch_uses_one_transaction():
     assert transaction.run.call_count == 2
 
 
+def test_semantic_overwrite_cleans_all_old_concepts_by_datasource_in_atomic_batch():
+    """Break caught: deleted/renamed concepts surviving because cleanup sees only new names."""
+    from core.knowledge.neo4j_client import Neo4jClient
+
+    client = Neo4jClient("bolt://unused", "user", "password")
+    client.driver = Mock()
+    captured: list[tuple[str, dict]] = []
+    client._execute_write_batch = Mock(side_effect=lambda writes: captured.extend(writes))
+    payload = {
+        "version": "2.0",
+        "format": "text2sql_knowledge_graph",
+        "nodes": [
+            {
+                "label": "Database",
+                "properties": {
+                    "database_id": "a" * 64,
+                    "name": "sales",
+                    "datasource": "sales",
+                    "source": "git_semantic_model",
+                },
+            },
+            {
+                "label": "BusinessConcept",
+                "properties": {
+                    "name": "metric:sales:renamed_revenue",
+                    "datasource": "sales",
+                    "source": "git_semantic_model",
+                },
+            },
+        ],
+        "edges": [],
+    }
+
+    result = client.import_knowledge_graph(payload, overwrite=True)
+
+    assert "error" not in result
+    client._execute_write_batch.assert_called_once()
+    cleanup = [
+        (query, params)
+        for query, params in captured
+        if "MATCH (c:BusinessConcept)" in query and "DELETE c" in query
+    ]
+    assert len(cleanup) == 1
+    query, params = cleanup[0]
+    assert "c.datasource IN $datasources" in query
+    assert params == {"datasources": ["sales"]}
+    assert "renamed_revenue" not in str(params)
+    assert captured.index(cleanup[0]) < next(
+        index
+        for index, (statement, _) in enumerate(captured)
+        if "MERGE (n:BusinessConcept" in statement
+    )
+
+
+def test_semantic_concept_cleanup_is_scoped_away_from_other_datasources():
+    """Break caught: publishing sales deleting Git concepts owned by archive."""
+    from core.knowledge.neo4j_client import Neo4jClient
+
+    client = Neo4jClient("bolt://unused", "user", "password")
+    writes: list[tuple[str, dict]] = []
+    client._execute_write = Mock(
+        side_effect=lambda query, params=None: writes.append((query, params or {})) or []
+    )
+    client.clear_databases_from_import(
+        {
+            "nodes": [
+                {
+                    "label": "Database",
+                    "properties": {
+                        "database_id": "a" * 64,
+                        "name": "sales",
+                        "datasource": "sales",
+                        "source": "git_semantic_model",
+                    },
+                }
+            ]
+        }
+    )
+
+    concept_query, params = next(
+        (query, params)
+        for query, params in writes
+        if "MATCH (c:BusinessConcept)" in query
+    )
+    assert params == {"datasources": ["sales"]}
+    assert "archive" not in str(params)
+    assert "c.datasource IN $datasources" in concept_query
+
+
+def test_neo4j_connect_installs_unique_constraints_for_actual_import_keys(monkeypatch):
+    """Break caught: MERGE keys having no database-level uniqueness guarantees."""
+    from core.knowledge.neo4j_client import Neo4jClient
+    import core.knowledge.neo4j_client as module
+
+    transaction = Mock()
+    transaction.run.return_value.consume.return_value = None
+    session = Mock()
+    session.__enter__ = Mock(return_value=session)
+    session.__exit__ = Mock(return_value=False)
+    session.execute_write.side_effect = lambda work: work(transaction)
+    driver = Mock()
+    driver.session.return_value = session
+    monkeypatch.setattr(module.GraphDatabase, "driver", Mock(return_value=driver))
+    monkeypatch.setattr(module.AsyncGraphDatabase, "driver", Mock(return_value=Mock()))
+
+    client = Neo4jClient("bolt://unused", "user", "password")
+
+    assert client.connect() is True
+    statements = [call.args[0] for call in transaction.run.call_args_list]
+    assert any("Database" in query and "database_id" in query for query in statements)
+    assert any(
+        "Table" in query and "database_id" in query and "n.name" in query
+        for query in statements
+    )
+    assert any(
+        "Column" in query
+        and "database_id" in query
+        and "table_name" in query
+        and "n.name" in query
+        for query in statements
+    )
+    assert any("BusinessConcept" in query and "n.name" in query for query in statements)
+    assert all("IF NOT EXISTS" in query for query in statements)
+
+
 def test_graph_payload_limits_are_enforced():
     from core.knowledge.neo4j_client import Neo4jClient
 

@@ -1,5 +1,6 @@
 from pathlib import Path
 from unittest.mock import ANY, Mock
+from hashlib import sha256
 
 import pytest
 
@@ -50,39 +51,43 @@ def test_payload_projects_complete_governed_graph_with_provenance(
 ):
     """Break caught: omitting derived graph nodes, edges, or semantic provenance."""
     payload = SemanticNeo4jPublisher(Mock()).to_graph_payload(sales_snapshot)
+    database_id = sha256(b"sales").hexdigest()
 
     assert payload["version"] == "2.0"
     assert payload["format"] == "text2sql_knowledge_graph"
     assert payload["semantic_version"] == "1.0.0"
     assert payload["semantic_content_sha256"] == sales_snapshot.content_sha256
+    assert payload["datasource"] == "sales"
     assert payload["nodes"] == [
         {
             "label": "Database",
             "properties": {
-                "database_id": 3763253904,
+                "database_id": database_id,
                 "name": "sales",
                 "db_type": "mysql",
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
         {
             "label": "Table",
             "properties": {
-                "database_id": 3763253904,
+                "database_id": database_id,
                 "name": "orders",
                 "display_label": "订单",
                 "synonyms": [],
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
         {
             "label": "Column",
             "properties": {
-                "database_id": 3763253904,
+                "database_id": database_id,
                 "table_name": "orders",
                 "name": "id",
                 "display_label": "订单号",
@@ -95,12 +100,13 @@ def test_payload_projects_complete_governed_graph_with_provenance(
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
         {
             "label": "Column",
             "properties": {
-                "database_id": 3763253904,
+                "database_id": database_id,
                 "table_name": "orders",
                 "name": "customer_id",
                 "display_label": "客户编号",
@@ -113,24 +119,26 @@ def test_payload_projects_complete_governed_graph_with_provenance(
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
         {
             "label": "Table",
             "properties": {
-                "database_id": 3763253904,
+                "database_id": database_id,
                 "name": "customers",
                 "display_label": "客户",
                 "synonyms": [],
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
         {
             "label": "Column",
             "properties": {
-                "database_id": 3763253904,
+                "database_id": database_id,
                 "table_name": "customers",
                 "name": "id",
                 "display_label": "客户编号",
@@ -143,6 +151,7 @@ def test_payload_projects_complete_governed_graph_with_provenance(
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
         {
@@ -159,19 +168,21 @@ def test_payload_projects_complete_governed_graph_with_provenance(
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
         {
             "label": "BusinessConcept",
             "properties": {
-                "name": "term:sales:order_count:dc8d407dcd906c095734395e68dcbf8e75a5eacd3bff2dcf9c549f365cfb7775",
+                "name": "term:sales:order_count:406d283ddbd643b4453c9a00b5300a8fbc63730745876d25a7656fd21fb931bf",
                 "display_label": "order_count",
                 "concept_type": "term",
-                "target": "orders.id",
+                "target": "field:orders.id",
                 "when": None,
                 "semantic_version": "1.0.0",
                 "semantic_content_sha256": sales_snapshot.content_sha256,
                 "source": "git_semantic_model",
+                "datasource": "sales",
             },
         },
     ]
@@ -192,6 +203,7 @@ def test_payload_projects_complete_governed_graph_with_provenance(
         "semantic_version": "1.0.0",
         "semantic_content_sha256": sales_snapshot.content_sha256,
         "source": "git_semantic_model",
+        "datasource": "sales",
     }
     assert all(
         edge["properties"]["semantic_version"] == "1.0.0" for edge in payload["edges"]
@@ -293,3 +305,33 @@ def test_metric_concept_keys_are_scoped_to_their_datasource(sales_snapshot: Sema
     assert sales_name != archive_name
     assert sales_name.startswith("metric:")
     assert archive_name.startswith("metric:")
+
+
+def test_full_datasource_hash_prevents_known_truncated_hash_collision(
+    sales_snapshot: SemanticSnapshot,
+):
+    """Break caught: two datasources sharing the old first eight hex digits merging."""
+    first_name = "datasource_100865"
+    second_name = "datasource_127887"
+    assert sha256(first_name.encode()).hexdigest()[:8] == sha256(
+        second_name.encode()
+    ).hexdigest()[:8]
+    first = sales_snapshot.model_copy(update={"datasource": first_name})
+    second = sales_snapshot.model_copy(update={"datasource": second_name})
+
+    first_payload = SemanticNeo4jPublisher(Mock()).to_graph_payload(first)
+    second_payload = SemanticNeo4jPublisher(Mock()).to_graph_payload(second)
+    first_database = first_payload["nodes"][0]["properties"]
+    second_database = second_payload["nodes"][0]["properties"]
+
+    assert first_database["database_id"] == sha256(first_name.encode()).hexdigest()
+    assert second_database["database_id"] == sha256(second_name.encode()).hexdigest()
+    assert first_database["database_id"] != second_database["database_id"]
+    assert all(
+        node["properties"]["datasource"] == first_name
+        for node in first_payload["nodes"]
+    )
+    assert all(
+        edge["properties"]["datasource"] == first_name
+        for edge in first_payload["edges"]
+    )

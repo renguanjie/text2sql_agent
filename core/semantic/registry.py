@@ -16,6 +16,8 @@ from .models import SemanticModel, SemanticSnapshot
 
 
 _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+_DATASOURCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+_SEMVER = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)")
 
 
 class SemanticRegistryError(ValueError):
@@ -24,6 +26,11 @@ class SemanticRegistryError(ValueError):
 
 class SemanticRegistry:
     def __init__(self, compiled_root: Path, datasource: str):
+        if not isinstance(datasource, str) or _DATASOURCE.fullmatch(datasource) is None:
+            raise SemanticRegistryError("数据源不是安全标识符")
+        compiled_root = Path(compiled_root)
+        if compiled_root.is_symlink():
+            raise SemanticRegistryError("编译目录不得是符号链接")
         self._compiled_root = compiled_root
         self._datasource = datasource
         self._lock = threading.RLock()
@@ -48,7 +55,9 @@ class SemanticRegistry:
         return self._compiled_root
 
     def _read_active_candidate(self) -> SemanticSnapshot:
-        manifest = self._read_json(self._compiled_root / "manifest.json", "清单")
+        manifest_path = self._compiled_root / "manifest.json"
+        self._reject_symlink(manifest_path, "清单")
+        manifest = self._read_json(manifest_path, "清单")
         version = self._active_version(manifest)
         path = self._snapshot_path(version)
         payload = self._read_json(path, "快照")
@@ -73,19 +82,35 @@ class SemanticRegistry:
         if not isinstance(active, dict):
             raise SemanticRegistryError("清单缺少 active 对象")
         version = active.get(self._datasource)
-        if not isinstance(version, str) or not version:
+        if not isinstance(version, str) or _SEMVER.fullmatch(version) is None:
             raise SemanticRegistryError(f"清单未指定数据源 {self._datasource} 的活动版本")
         return version
 
     def _snapshot_path(self, version: str) -> Path:
-        root = self._compiled_root.resolve()
-        datasource_dir = (root / self._datasource).resolve()
-        path = (datasource_dir / f"{version}.json").resolve()
-        if path.parent != datasource_dir or datasource_dir.parent != root:
+        root_path = self._compiled_root.absolute()
+        datasource_path = root_path / self._datasource
+        snapshot_path = datasource_path / f"{version}.json"
+        self._reject_symlink(root_path, "编译目录")
+        self._reject_symlink(datasource_path, "数据源目录")
+        self._reject_symlink(snapshot_path, "快照")
+        root = root_path.resolve(strict=False)
+        datasource_dir = datasource_path.resolve(strict=False)
+        path = snapshot_path.resolve(strict=False)
+        try:
+            datasource_dir.relative_to(root)
+            path.relative_to(datasource_dir)
+        except ValueError:
+            raise SemanticRegistryError("清单中的数据源或版本不是安全的快照位置")
+        if path.parent != datasource_dir:
             raise SemanticRegistryError("清单中的数据源或版本不是安全的快照位置")
         if not path.is_file():
             raise SemanticRegistryError(f"活动快照不存在: {path}")
         return path
+
+    @staticmethod
+    def _reject_symlink(path: Path, label: str) -> None:
+        if path.is_symlink():
+            raise SemanticRegistryError(f"{label}不得是符号链接")
 
     @staticmethod
     def _read_json(path: Path, label: str) -> Any:

@@ -1,7 +1,46 @@
 import re
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    StrictBool,
+    StrictStr,
+    StringConstraints,
+    field_serializer,
+    field_validator,
+)
+
+
+def _yaml_tuple(value: Any) -> Any:
+    """Accept YAML arrays while retaining strict, deeply immutable tuple fields."""
+    return tuple(value) if isinstance(value, list) else value
+
+
+Identifier = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*$",
+    ),
+]
+DatasourceIdentifier = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    ),
+]
+NonEmptyText = Annotated[
+    str,
+    StringConstraints(strict=True, strip_whitespace=True, min_length=1),
+]
+StringTuple = Annotated[tuple[StrictStr, ...], BeforeValidator(_yaml_tuple)]
 
 
 class FrozenModel(BaseModel):
@@ -13,63 +52,65 @@ class FrozenModel(BaseModel):
 
 
 class SemanticField(FrozenModel):
-    name: str
-    name_cn: str
-    data_type: str
+    name: Identifier
+    name_cn: NonEmptyText
+    data_type: NonEmptyText
     role: Literal["identifier", "dimension", "measure", "time"]
-    synonyms: tuple[str, ...] = ()
-    enum_values: tuple[str, ...] = ()
+    synonyms: StringTuple = ()
+    enum_values: StringTuple = ()
     sensitivity: Literal["public", "internal", "sensitive", "restricted"] = "internal"
-    directly_queryable: bool = True
+    directly_queryable: StrictBool = True
 
 
 class SemanticEntity(FrozenModel):
-    name: str
-    name_cn: str
-    synonyms: tuple[str, ...] = ()
-    fields: tuple[SemanticField, ...]
+    name: Identifier
+    name_cn: NonEmptyText
+    synonyms: StringTuple = ()
+    fields: Annotated[tuple[SemanticField, ...], BeforeValidator(_yaml_tuple)]
 
 
 class SemanticRelationship(FrozenModel):
-    name: str
-    from_entity: str
-    from_field: str
-    to_entity: str
-    to_field: str
+    name: Identifier
+    from_entity: Identifier
+    from_field: Identifier
+    to_entity: Identifier
+    to_field: Identifier
     join_type: Literal["INNER JOIN", "LEFT JOIN"] = "LEFT JOIN"
-    extra_condition: str | None = None
+    extra_condition: NonEmptyText | None = None
 
 
 class SemanticMetric(FrozenModel):
-    name: str
-    name_cn: str
-    synonyms: tuple[str, ...] = ()
-    expression: str
-    allowed_dimensions: tuple[str, ...] = ()
-    required_filters: tuple[str, ...] = ()
-    default_time_field: str | None = None
+    name: Identifier
+    name_cn: NonEmptyText
+    synonyms: StringTuple = ()
+    expression: NonEmptyText
+    allowed_dimensions: StringTuple = ()
+    required_filters: StringTuple = ()
+    default_time_field: NonEmptyText | None = None
 
 
 class SemanticTerm(FrozenModel):
-    term: str
-    target: str
-    when: str | None = None
+    term: NonEmptyText
+    target: NonEmptyText
+    when: NonEmptyText | None = None
 
 
 class SemanticPolicies(FrozenModel):
-    denied_entities: tuple[str, ...] = ()
-    denied_fields: tuple[str, ...] = ()
+    denied_entities: Annotated[tuple[Identifier, ...], BeforeValidator(_yaml_tuple)] = ()
+    denied_fields: StringTuple = ()
 
 
 class SemanticModel(FrozenModel):
     schema_version: Literal[1]
-    model_version: str
-    datasource: str
+    model_version: StrictStr
+    datasource: DatasourceIdentifier
     dialect: Literal["mysql"]
-    entities: tuple[SemanticEntity, ...]
-    relationships: tuple[SemanticRelationship, ...] = ()
-    metrics: tuple[SemanticMetric, ...] = ()
-    terms: tuple[SemanticTerm, ...] = ()
+    entities: Annotated[tuple[SemanticEntity, ...], BeforeValidator(_yaml_tuple)]
+    relationships: Annotated[
+        tuple[SemanticRelationship, ...], BeforeValidator(_yaml_tuple)
+    ] = ()
+    metrics: Annotated[tuple[SemanticMetric, ...], BeforeValidator(_yaml_tuple)] = ()
+    terms: Annotated[tuple[SemanticTerm, ...], BeforeValidator(_yaml_tuple)] = ()
     policies: SemanticPolicies = SemanticPolicies()
 
     @field_validator("model_version")
@@ -81,27 +122,28 @@ class SemanticModel(FrozenModel):
 
 
 class SemanticSnapshot(SemanticModel):
-    source_sha256: str
-    content_sha256: str
-    compiler_version: str
-    compiled_at: str
+    source_sha256: StrictStr
+    content_sha256: StrictStr
+    compiler_version: StrictStr
+    compiled_at: StrictStr
 
 
 class SemanticContext(FrozenModel):
-    datasource: str
-    semantic_version: str
-    entities: tuple[str, ...] = ()
-    fields: tuple[str, ...] = ()
-    relationships: tuple[str, ...] = ()
-    metrics: tuple[str, ...] = ()
-    policies: tuple[str, ...] = ()
-    rendered: str = ""
+    datasource: DatasourceIdentifier
+    semantic_version: StrictStr
+    entities: StringTuple = ()
+    fields: StringTuple = ()
+    relationships: StringTuple = ()
+    metrics: StringTuple = ()
+    terms: StringTuple = ()
+    policies: StringTuple = ()
+    rendered: StrictStr = ""
 
 
 class ValidationIssue(FrozenModel):
-    code: str
-    message: str
-    objects: tuple[str, ...] = ()
+    code: StrictStr
+    message: StrictStr
+    objects: StringTuple = ()
     stage: Literal["syntax", "safety", "semantic", "preflight"] = "semantic"
 
     @field_serializer("objects")
@@ -110,14 +152,14 @@ class ValidationIssue(FrozenModel):
 
 
 class ValidationReport(FrozenModel):
-    valid: bool
-    issues: tuple[ValidationIssue, ...] = ()
+    valid: StrictBool
+    issues: Annotated[tuple[ValidationIssue, ...], BeforeValidator(_yaml_tuple)] = ()
 
 
 class PreflightResult(FrozenModel):
-    valid: bool
+    valid: StrictBool
     estimated_rows: int = 0
-    issues: tuple[ValidationIssue, ...] = ()
+    issues: Annotated[tuple[ValidationIssue, ...], BeforeValidator(_yaml_tuple)] = ()
 
 
 class CorrectnessResult(FrozenModel):
@@ -126,4 +168,4 @@ class CorrectnessResult(FrozenModel):
     semantic_version: str | None
     validation: ValidationReport
     repair_attempts: Literal[0, 1]
-    executable: bool
+    executable: StrictBool

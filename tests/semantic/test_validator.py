@@ -9,6 +9,7 @@ from core.semantic.models import (
     SemanticPolicies,
     SemanticRelationship,
     SemanticSnapshot,
+    SemanticTerm,
 )
 from core.semantic.validator import SQLScope, SemanticSQLValidator, parse_sql_scope
 
@@ -209,6 +210,119 @@ def test_metric_matching_rejects_wrong_aggregate_or_source_field(
     report = validator.validate(sql, "订单金额", sales_snapshot)
 
     assert {issue.code for issue in report.issues} == {"METRIC_MISMATCH"}
+
+
+def test_term_targeted_metric_uses_the_same_validator_path(
+    validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
+):
+    """Break caught: 成交额 -> order_amount allowing an unrelated COUNT aggregate."""
+    snapshot = sales_snapshot.model_copy(
+        update={
+            "terms": (
+                SemanticTerm(term="成交额", target="metric:order_amount"),
+            )
+        }
+    )
+
+    report = validator.validate(
+        "SELECT COUNT(id) FROM orders WHERE status = 'paid'",
+        "查询成交额",
+        snapshot,
+    )
+
+    assert "METRIC_MISMATCH" in {issue.code for issue in report.issues}
+
+
+def test_term_when_is_a_required_structural_predicate_not_prompt_text(
+    validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
+):
+    """Break caught: a term's compiled condition having no deterministic consumer."""
+    snapshot = sales_snapshot.model_copy(
+        update={
+            "terms": (
+                SemanticTerm(
+                    term="成交额",
+                    target="metric:order_amount",
+                    when="orders.status = 'paid'",
+                ),
+            )
+        }
+    )
+
+    missing = validator.validate(
+        "SELECT SUM(amount) FROM orders WHERE status = 'refunded'",
+        "查询成交额",
+        snapshot,
+    )
+    present = validator.validate(
+        "SELECT SUM(o.amount) FROM orders o WHERE o.status = 'paid'",
+        "查询成交额",
+        snapshot,
+    )
+
+    assert "TERM_CONDITION_REQUIRED" in {issue.code for issue in missing.issues}
+    assert present.valid, present.issues
+
+
+def test_validator_fails_closed_for_ambiguous_conditional_term(
+    validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
+):
+    """Break caught: resolving one of two same-spelling governed definitions by order."""
+    snapshot = sales_snapshot.model_copy(
+        update={
+            "terms": (
+                SemanticTerm(
+                    term="成交额",
+                    target="metric:order_amount",
+                    when="orders.status = 'paid'",
+                ),
+                SemanticTerm(
+                    term="成交额",
+                    target="metric:order_amount",
+                    when="orders.status = 'refunded'",
+                ),
+            )
+        }
+    )
+
+    report = validator.validate(
+        "SELECT SUM(amount) FROM orders WHERE status = 'paid'",
+        "查询成交额",
+        snapshot,
+    )
+
+    assert "TERM_RESOLUTION_FAILED" in {issue.code for issue in report.issues}
+
+
+def test_compiled_unqualified_denied_field_is_enforced_by_validator(tmp_path):
+    """Break caught: compiler accepting 'amount' while validator compares 'orders.amount'."""
+    from core.semantic.compiler import SemanticCompiler
+
+    source = tmp_path / "sales.yaml"
+    source.write_text(
+        """
+schema_version: 1
+model_version: 1.0.0
+datasource: sales
+dialect: mysql
+entities:
+  - name: orders
+    name_cn: 订单
+    fields:
+      - {name: amount, name_cn: 金额, data_type: decimal, role: measure}
+policies:
+  denied_fields: [amount]
+""",
+        encoding="utf-8",
+    )
+    snapshot = SemanticCompiler().compile_file(source, tmp_path / ".compiled")
+
+    report = SemanticSQLValidator().validate(
+        "SELECT amount FROM orders", "查询金额", snapshot
+    )
+
+    assert snapshot.policies.denied_fields == ("orders.amount",)
+    assert "POLICY_DENIED" in {issue.code for issue in report.issues}
 
 
 def test_rejects_grouping_by_a_dimension_not_allowed_for_the_metric(

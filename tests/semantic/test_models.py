@@ -1,3 +1,5 @@
+from copy import deepcopy
+
 from pydantic import ValidationError
 import pytest
 
@@ -41,3 +43,45 @@ def test_validation_issue_has_stable_public_shape():
         "objects": ["orders.foo"],
         "stage": "semantic",
     }
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("schema_version",), True),
+        (("entities", 0, "fields", 0, "directly_queryable"), "false"),
+    ],
+)
+def test_semantic_model_rejects_scalar_type_coercion(path, value):
+    """Break caught: strings and booleans being coerced into security-relevant types."""
+    payload = deepcopy(minimal_model())
+    target = payload
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+
+    with pytest.raises(ValidationError):
+        SemanticModel.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("datasource",), ""),
+        (("datasource",), "../escaped"),
+        (("datasource",), "sales\nshadow"),
+        (("entities", 0, "name"), ""),
+        (("entities", 0, "name"), "orders\u0000shadow"),
+        (("entities", 0, "fields", 0, "name"), "amount\nMATCH"),
+    ],
+)
+def test_semantic_model_rejects_empty_or_unsafe_identifiers(path, value):
+    """Break caught: unsafe names reaching filesystem paths, SQL, or graph identifiers."""
+    payload = deepcopy(minimal_model())
+    target = payload
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+
+    with pytest.raises(ValidationError):
+        SemanticModel.model_validate(payload)
