@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from unittest.mock import Mock
+
+import pytest
 
 
 def _recording_client(*, governance_proof_verifier=None):
@@ -119,9 +122,9 @@ def test_guarded_history_save_requires_matching_one_time_process_proof():
         semantic_content_sha256="a" * 64,
     )
 
-    assert client.save_governed_sql_history(
-        command, foreign_issuer.issue(command)
-    ) is None
+    assert (
+        client.save_governed_sql_history(command, foreign_issuer.issue(command)) is None
+    )
     issued = issuer.issue(command)
     malformed = HistoryMutationProof(
         nonce=issued.nonce,
@@ -174,6 +177,112 @@ def test_history_proof_that_expires_during_verification_fails_closed():
     )
 
     assert verifier.consume(command, issuer.issue(command)) is False
+
+
+def test_outstanding_proofs_are_hard_bounded_and_expired_entries_reclaim_space():
+    """A burst cannot retain more live proof state than the configured limit."""
+    from core.history.proof import GovernedHistorySave, create_history_proof_pair
+
+    now = [0.0]
+    issuer, verifier = create_history_proof_pair(
+        ttl_seconds=1.0,
+        max_outstanding=3,
+        clock=lambda: now[0],
+    )
+    command = GovernedHistorySave(
+        session_id="session-a",
+        user_query="订单金额",
+        generated_sql="SELECT SUM(amount) FROM orders",
+        matched_knowledge_json=None,
+        retrieval_query="订单金额",
+        validation_status="success",
+        validation_error=None,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="a" * 64,
+    )
+
+    for _ in range(3):
+        issuer.issue(command)
+
+    assert verifier.outstanding_size == 3
+    with pytest.raises(RuntimeError, match="outstanding capacity"):
+        issuer.issue(command)
+
+    now[0] = 1.0
+
+    assert issuer.outstanding_size == 0
+    issuer.issue(command)
+    assert verifier.outstanding_size == 1
+
+
+def test_outstanding_proof_capacity_stays_bounded_under_a_20k_issue_probe():
+    """Capacity exhaustion is stable instead of growing nonce state with traffic."""
+    from core.history.proof import GovernedHistorySave, create_history_proof_pair
+
+    issuer, verifier = create_history_proof_pair(max_outstanding=32)
+    command = GovernedHistorySave(
+        session_id="session-a",
+        user_query="订单金额",
+        generated_sql="SELECT SUM(amount) FROM orders",
+        matched_knowledge_json=None,
+        retrieval_query="订单金额",
+        validation_status="success",
+        validation_error=None,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="a" * 64,
+    )
+
+    rejected = 0
+    for _ in range(20_000):
+        try:
+            issuer.issue(command)
+        except RuntimeError:
+            rejected += 1
+
+    assert verifier.outstanding_size == 32
+    assert rejected == 20_000 - 32
+
+
+def test_competing_consumers_have_exactly_one_winner_and_release_proof_state():
+    """Concurrent verification atomically consumes the one registered proof."""
+    from core.history.proof import GovernedHistorySave, create_history_proof_pair
+
+    issuer, verifier = create_history_proof_pair()
+    command = GovernedHistorySave(
+        session_id="session-a",
+        user_query="订单金额",
+        generated_sql="SELECT SUM(amount) FROM orders",
+        matched_knowledge_json=None,
+        retrieval_query="订单金额",
+        validation_status="success",
+        validation_error=None,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="a" * 64,
+    )
+    proof = issuer.issue(command)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        outcomes = list(
+            executor.map(lambda _unused: verifier.consume(command, proof), range(32))
+        )
+
+    assert outcomes.count(True) == 1
+    assert verifier.outstanding_size == 0
+
+
+@pytest.mark.parametrize("max_outstanding", (0, -1, True, 1.5, 10_000_000))
+def test_history_proof_pair_rejects_invalid_outstanding_capacity(max_outstanding):
+    """Untrusted configuration cannot disable the proof store's memory bound."""
+    from core.history.proof import create_history_proof_pair
+
+    with pytest.raises(ValueError, match="outstanding"):
+        create_history_proof_pair(max_outstanding=max_outstanding)
 
 
 def test_guarded_success_finalization_is_a_one_time_pending_cas():
