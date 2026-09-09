@@ -78,6 +78,7 @@ def sales_snapshot() -> SemanticSnapshot:
                 from_field="customer_id",
                 to_entity="customers",
                 to_field="id",
+                join_type="INNER JOIN",
             ),
         ),
         metrics=(
@@ -448,6 +449,94 @@ def test_accepts_only_the_governed_join_key_in_either_direction(
 
     assert forward.valid, forward.issues
     assert reverse.valid, reverse.issues
+
+
+@pytest.mark.parametrize(
+    ("declared", "actual", "valid"),
+    [
+        ("INNER JOIN", "JOIN", True),
+        ("INNER JOIN", "INNER JOIN", True),
+        ("INNER JOIN", "LEFT JOIN", False),
+        ("LEFT JOIN", "LEFT JOIN", True),
+        ("LEFT JOIN", "LEFT OUTER JOIN", True),
+        ("LEFT JOIN", "JOIN", False),
+        ("LEFT JOIN", "INNER JOIN", False),
+        ("LEFT JOIN", "RIGHT JOIN", False),
+        ("RIGHT JOIN", "RIGHT JOIN", True),
+        ("RIGHT JOIN", "LEFT JOIN", False),
+    ],
+)
+def test_relationship_join_kind_is_an_exact_authorization_contract(
+    validator: SemanticSQLValidator,
+    sales_snapshot: SemanticSnapshot,
+    declared: str,
+    actual: str,
+    valid: bool,
+):
+    """Break caught: endpoint equality authorizing a different outer/inner join behavior."""
+    relationship = sales_snapshot.relationships[0].model_copy(
+        update={"join_type": declared}
+    )
+    snapshot = sales_snapshot.model_copy(update={"relationships": (relationship,)})
+
+    report = validator.validate(
+        "SELECT o.amount, c.name FROM orders o "
+        f"{actual} customers c ON o.customer_id = c.id",
+        "订单和客户",
+        snapshot,
+    )
+
+    assert report.valid is valid, report.issues
+
+
+def test_directional_join_contract_preserves_declared_left_and_right_entities(
+    validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
+):
+    """Break caught: reversing a LEFT relationship while retaining its null-preserving meaning."""
+    relationship = sales_snapshot.relationships[0].model_copy(
+        update={"join_type": "LEFT JOIN"}
+    )
+    snapshot = sales_snapshot.model_copy(update={"relationships": (relationship,)})
+
+    report = validator.validate(
+        "SELECT o.amount, c.name FROM customers c "
+        "LEFT JOIN orders o ON c.id = o.customer_id",
+        "订单和客户",
+        snapshot,
+    )
+
+    assert "INVALID_JOIN" in {issue.code for issue in report.issues}
+
+
+@pytest.mark.parametrize("actual", ["CROSS JOIN", "FULL JOIN"])
+def test_non_relationship_join_kinds_cannot_be_authorized_by_an_on_clause(
+    validator: SemanticSQLValidator,
+    sales_snapshot: SemanticSnapshot,
+    actual: str,
+):
+    """Break caught: CROSS/FULL syntax being reduced to a governed endpoint equality."""
+    report = validator.validate(
+        "SELECT o.amount, c.name FROM orders o "
+        f"{actual} customers c ON o.customer_id = c.id",
+        "订单和客户",
+        sales_snapshot,
+    )
+
+    assert "INVALID_JOIN" in {issue.code for issue in report.issues}
+
+
+def test_correlated_where_equality_cannot_substitute_for_an_active_join_on(
+    validator: SemanticSQLValidator, sales_snapshot: SemanticSnapshot
+):
+    """Break caught: a correlated subquery WHERE being treated as a governed JOIN ON."""
+    report = validator.validate(
+        "SELECT (SELECT c.name FROM customers c "
+        "WHERE o.customer_id = c.id) FROM orders o",
+        "订单和客户",
+        sales_snapshot,
+    )
+
+    assert "INVALID_JOIN" in {issue.code for issue in report.issues}
 
 
 def test_parse_errors_fail_closed_as_a_syntax_issue(

@@ -157,6 +157,60 @@ def test_compile_strictly_validates_relationship_extra_condition(
 
 
 @pytest.mark.parametrize(
+    "extra_condition",
+    [
+        "orders.status <> customers.status",
+        "COALESCE(orders.status, '') = customers.status",
+        "RAND() = 0",
+        "orders.status = (SELECT MAX(customers.status) FROM customers)",
+        "orders.status IS TRUE",
+    ],
+)
+def test_compile_rejects_relationship_predicates_outside_canonical_grammar(
+    tmp_path: Path, extra_condition: str
+):
+    """Break caught: compiler accepting predicates the runtime cannot prove exactly."""
+    relationship = f"""
+        relationships:
+          - name: order_customer
+            from_entity: orders
+            from_field: id
+            to_entity: customers
+            to_field: id
+            extra_condition: {json.dumps(extra_condition)}
+    """
+
+    with pytest.raises(SemanticCompileError, match="仅支持"):
+        _compile_yaml(tmp_path, _rich_model(extra=relationship))
+
+
+def test_compile_canonicalizes_supported_relationship_predicate_atoms(tmp_path: Path):
+    """Break caught: null predicates or AND atoms being dropped from the compiled contract."""
+    relationship = """
+        relationships:
+          - name: order_customer
+            from_entity: ORDERS
+            from_field: ID
+            to_entity: CUSTOMERS
+            to_field: ID
+            join_type: RIGHT JOIN
+            extra_condition: >-
+              ORDERS.status = CUSTOMERS.status
+              AND ORDERS.status IS NOT NULL
+              AND CUSTOMERS.status IS NULL
+    """
+
+    snapshot = _compile_yaml(tmp_path, _rich_model(extra=relationship))
+
+    assert snapshot.relationships[0].join_type == "RIGHT JOIN"
+    assert snapshot.relationships[0].extra_condition == (
+        "orders.status = customers.status "
+        "AND orders.status IS NOT NULL "
+        "AND customers.status IS NULL"
+    )
+
+
+@pytest.mark.parametrize(
     ("metric_lines", "expected"),
     [
         ("allowed_dimensions: [orders.amount]", "维度"),
@@ -357,6 +411,27 @@ def test_compile_same_content_is_byte_stable_and_returns_existing_artifact(
 
     assert second == first
     assert artifact.read_bytes() == before
+
+
+def test_compile_rejects_same_version_when_only_source_bytes_change(tmp_path: Path):
+    """Break caught: returning stale source provenance for comment-only source changes."""
+    compiler = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z")
+    first = _compile_yaml(tmp_path, _rich_model(), compiler=compiler)
+    output_root = tmp_path / ".compiled"
+    artifact = output_root / "sales/1.0.0.json"
+    manifest = output_root / "manifest.json"
+    schema = tmp_path / "schema/semantic-model.schema.json"
+    before = (artifact.read_bytes(), manifest.read_bytes(), schema.read_bytes())
+
+    changed_source = "# review-only comment\n" + _rich_model()
+    with pytest.raises(
+        SemanticCompileError,
+        match=r"源字节.*升级 model_version",
+    ):
+        _compile_yaml(tmp_path, changed_source, compiler=compiler)
+
+    assert (artifact.read_bytes(), manifest.read_bytes(), schema.read_bytes()) == before
+    assert first.source_sha256 in artifact.read_text(encoding="utf-8")
 
 
 def test_compile_validates_existing_manifest_before_creating_artifact(tmp_path: Path):

@@ -14,6 +14,11 @@ from sqlglot import exp, parse, parse_one
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from .models import SemanticMetric, SemanticSnapshot, ValidationIssue, ValidationReport
+from .relationship_predicates import (
+    RelationshipPredicateError,
+    parse_relationship_predicate,
+    relationship_predicate_atoms,
+)
 from .terms import (
     ResolvedSemanticTerms,
     SemanticTermResolutionError,
@@ -70,6 +75,7 @@ class _JoinFact:
     info: _ScopeInfo
     left_tables: frozenset[str]
     right_tables: frozenset[str]
+    join_type: str
     pairs: tuple[tuple[str, str, str, str], ...]
     atom_signatures: frozenset[Any]
     supported: bool
@@ -348,18 +354,27 @@ def _join_fact_for_predicate(
     info: _ScopeInfo,
     left_tables: set[str],
     right_tables: set[str],
+    join_type: str,
     infos: Mapping[int, _ScopeInfo],
     semantic_indexes: Mapping[str, frozenset[str]],
     aliases: Mapping[str, str],
+    *,
+    supported_join_syntax: bool = True,
 ) -> _JoinFact:
-    atoms = _conjunctive_atoms(predicate)
     pairs: list[tuple[str, str, str, str]] = []
     signatures: set[Any] = set()
-    supported = atoms is not None
+    try:
+        atoms = (
+            relationship_predicate_atoms(predicate)
+            if predicate is not None
+            else ()
+        )
+    except RelationshipPredicateError:
+        atoms = ()
+        supported = False
+    else:
+        supported = bool(atoms) and supported_join_syntax
     for atom in atoms or ():
-        if not isinstance(atom, exp.EQ):
-            supported = False
-            continue
         references = _normalized_column_references(
             atom, info, infos, semantic_indexes, aliases
         )
@@ -371,7 +386,7 @@ def _join_fact_for_predicate(
         if len(distinct) > 2:
             supported = False
             continue
-        if len(distinct) == 2:
+        if isinstance(atom, exp.EQ) and len(distinct) == 2:
             left_ref, right_ref = distinct
             if left_ref[0] in right_tables and right_ref[0] in left_tables:
                 left_ref, right_ref = right_ref, left_ref
@@ -385,6 +400,7 @@ def _join_fact_for_predicate(
         info=info,
         left_tables=frozenset(left_tables),
         right_tables=frozenset(right_tables),
+        join_type=join_type,
         pairs=tuple(pairs),
         atom_signatures=frozenset(signatures),
         supported=supported,
@@ -412,19 +428,38 @@ def _extract_join_facts(
             set(_source_tables(right_source, infos)) if right_source is not None else set()
         )
         if left_tables and right_tables:
+            join_type, supported_join_syntax = _normalized_join_type(join)
             facts.append(
                 _join_fact_for_predicate(
                     join.args.get("on"),
                     info,
                     left_tables,
                     right_tables,
+                    join_type,
                     infos,
                     semantic_indexes,
                     aliases,
+                    supported_join_syntax=supported_join_syntax,
                 )
             )
         left_tables.update(right_tables)
     return tuple(facts)
+
+
+def _normalized_join_type(join: exp.Join) -> tuple[str, bool]:
+    """Normalize sqlglot's side/kind/method split without losing join semantics."""
+    side = str(join.args.get("side") or "").upper()
+    kind = str(join.args.get("kind") or "").upper()
+    method = str(join.args.get("method") or "").upper()
+    if method:
+        return "UNSUPPORTED JOIN", False
+    if kind == "CROSS":
+        return "CROSS JOIN", False
+    if side in {"LEFT", "RIGHT", "FULL"} and kind in {"", "OUTER"}:
+        return f"{side} JOIN", side in {"LEFT", "RIGHT"}
+    if not side and kind in {"", "INNER"}:
+        return "INNER JOIN", True
+    return "UNSUPPORTED JOIN", False
 
 
 def is_single_readonly_query(sql: str, dialect: str = "mysql") -> bool:
@@ -698,9 +733,11 @@ def _analyze_sql(
                 info,
                 left_tables,
                 right_tables,
+                "CORRELATED",
                 infos_by_scope,
                 indexes,
                 aliases,
+                supported_join_syntax=False,
             )
         )
 
@@ -1847,6 +1884,14 @@ class SemanticSQLValidator:
             proven = False
             if fact.supported:
                 for relation in candidate_relations:
+                    relation_join_type = relation.join_type.upper()
+                    if relation_join_type != fact.join_type:
+                        continue
+                    if relation_join_type in {"LEFT JOIN", "RIGHT JOIN"} and not (
+                        _casefold(relation.from_entity) in fact.left_tables
+                        and _casefold(relation.to_entity) in fact.right_tables
+                    ):
+                        continue
                     endpoint = frozenset(
                         {
                             f"{_casefold(relation.from_entity)}.{_casefold(relation.from_field)}",
@@ -1865,14 +1910,12 @@ class SemanticSQLValidator:
                     extra_cross_pairs: set[frozenset[str]] = set()
                     if relation.extra_condition:
                         try:
-                            extra_expression = parse_one(
-                                relation.extra_condition, read=snapshot.dialect
+                            predicate = parse_relationship_predicate(
+                                relation.extra_condition,
+                                snapshot.dialect,
+                                f"关系 {relation.name} 的 extra_condition",
                             )
-                            atoms = _conjunctive_atoms(extra_expression)
-                            if atoms is None or not all(
-                                isinstance(atom, exp.EQ) for atom in atoms
-                            ):
-                                continue
+                            atoms = predicate.atoms
                             source_tables = frozenset(
                                 {
                                     _casefold(relation.from_entity),

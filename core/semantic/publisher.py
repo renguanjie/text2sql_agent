@@ -198,4 +198,6 @@ class SemanticNeo4jPublisher:
         result = self._client.import_knowledge_graph(payload, overwrite=True)
         if result.get("error"):
             raise SemanticPublishError(result["error"])
+        if payload["nodes"] and result.get("nodes", 0) == 0:
+            raise SemanticPublishError("Neo4j 原子导入未写入语义索引")
         return result

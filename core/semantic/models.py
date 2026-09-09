@@ -75,7 +75,7 @@ class SemanticRelationship(FrozenModel):
     from_field: Identifier
     to_entity: Identifier
     to_field: Identifier
-    join_type: Literal["INNER JOIN", "LEFT JOIN"] = "LEFT JOIN"
+    join_type: Literal["INNER JOIN", "LEFT JOIN", "RIGHT JOIN"] = "LEFT JOIN"
     extra_condition: NonEmptyText | None = None
 
 
@@ -116,7 +116,7 @@ class SemanticModel(FrozenModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version_type(cls, value: Any) -> int:
-        if type(value) is not int:
+        if not isinstance(value, int) or isinstance(value, bool):
             raise ValueError("schema_version 必须是整数")
         return value
 

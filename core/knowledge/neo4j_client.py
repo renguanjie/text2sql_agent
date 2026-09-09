@@ -822,11 +822,15 @@ class Neo4jClient:
         }
 
     def import_knowledge_graph(self, import_data: Dict[str, Any],
-                               overwrite: bool = False) -> Dict[str, int]:
+                               overwrite: bool = False) -> Dict[str, Any]:
         """标准化导入数据，并将全部写操作作为一个原子事务提交。"""
-        if not self.driver:
+        if self.driver is None or getattr(self.driver, "_closed", False) is True:
             logger.error("Neo4j 未连接")
-            return {"nodes": 0, "relationships": 0}
+            return {
+                "nodes": 0,
+                "relationships": 0,
+                "error": "Neo4j 未连接，无法原子导入知识图谱",
+            }
 
         try:
             validation = self.validate_knowledge_graph_json(import_data)

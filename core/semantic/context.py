@@ -351,12 +351,18 @@ class SemanticContextBuilder:
     @staticmethod
     def _relationship_item(relationship: SemanticRelationship) -> _ContextItem:
         identifier = relationship.name
+        extra_condition = (
+            f" AND {relationship.extra_condition}"
+            if relationship.extra_condition is not None
+            else ""
+        )
         return _ContextItem(
             "relationship",
             identifier,
             "关系: "
             f"{relationship.from_entity}.{relationship.from_field} = "
-            f"{relationship.to_entity}.{relationship.to_field} [{relationship.join_type}]",
+            f"{relationship.to_entity}.{relationship.to_field}"
+            f"{extra_condition} [{relationship.join_type}]",
         )
 
     @classmethod

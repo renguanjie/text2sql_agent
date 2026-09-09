@@ -26,6 +26,10 @@ from .models import (
     SemanticSnapshot,
     SemanticTerm,
 )
+from .relationship_predicates import (
+    RelationshipPredicateError,
+    parse_relationship_predicate,
+)
 from .storage import (
     SemanticStorageError,
     VerifiedRead,
@@ -264,16 +268,25 @@ class SemanticCompiler:
         )
         condition = None
         if relationship.extra_condition is not None:
-            condition = self._canonical_boolean_expression(
-                relationship.extra_condition,
+            context = f"关系 {relationship.name} 的 extra_condition"
+            try:
+                predicate = parse_relationship_predicate(
+                    relationship.extra_condition,
+                    dialect,
+                    context,
+                )
+            except RelationshipPredicateError as exc:
+                raise SemanticCompileError(str(exc)) from None
+            self._canonicalize_columns(
+                predicate.expression,
                 indexes,
-                dialect,
-                f"关系 {relationship.name} 的 extra_condition",
+                context,
                 allowed_entities={
                     from_entity.name.casefold(),
                     to_entity.name.casefold(),
                 },
             )
+            condition = predicate.sql(dialect)
         return SemanticRelationship(
             name=relationship.name,
             from_entity=from_entity.name,
@@ -605,6 +618,11 @@ class SemanticCompiler:
         artifact_read = None
         if artifact.exists():
             existing_snapshot, artifact_read = self._read_existing_snapshot(artifact)
+            if existing_snapshot.source_sha256 != snapshot.source_sha256:
+                raise SemanticCompileError(
+                    f"语义版本 {snapshot.datasource}@{snapshot.model_version} "
+                    "已由不同源字节编译；请升级 model_version"
+                )
             if (
                 existing_snapshot.datasource != snapshot.datasource
                 or existing_snapshot.model_version != snapshot.model_version

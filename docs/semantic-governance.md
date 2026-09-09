@@ -35,6 +35,17 @@ source .venv/bin/activate
 
 首版只接受 `schema_version: 1`、`dialect: mysql`，且 `model_version` 必须是严格的 `MAJOR.MINOR.PATCH`。模型字段角色限定为 `identifier`、`dimension`、`measure`、`time`。治理源、编译快照、Golden 用例都不得包含凭据或真实业务值。
 
+关系的 `join_type` 是执行授权契约，只允许规范形式 `INNER JOIN`、`LEFT JOIN`、
+`RIGHT JOIN`。裸 `JOIN` 规范为 `INNER JOIN`；`LEFT OUTER JOIN` 规范为
+`LEFT JOIN`。`LEFT`/`RIGHT` 还固定 `from_entity` 与 `to_entity` 的左右位置，不能用
+相反方向或其他 JOIN 种类替代。`CROSS JOIN`、`FULL JOIN`、`NATURAL JOIN` 不能声明为
+语义关系，也不能通过添加 `ON` 条件冒充已治理关系。
+
+关系 `extra_condition` 只允许字段/字面量的 `=`、字段 `IS NULL`、字段
+`IS NOT NULL`，以及这些原子的 `AND` 合取；函数、子查询、`OR`、非确定性表达式和
+其他运算符均在编译时拒绝。编译后的完整条件会进入语义上下文，并且每个原子必须以
+AST 等价形式出现在当前活动 JOIN 的 `ON` 中；注释、文本命中或 `WHERE` 条件不能替代。
+
 ## 2. 作者 → 校验/编译 → 激活
 
 1. 在 Git 分支中编辑 `semantic_models/default.yaml`（或你的 `<datasource>.yaml`）。YAML 是唯一人工源文件；请评审实体、字段、关系、指标、术语和策略。
@@ -51,7 +62,12 @@ source .venv/bin/activate
    python -m json.tool semantic_models/.compiled/manifest.json
    ```
 
-   相同 YAML 与编译器版本应产生相同 `content_sha256`；`compiled_at` 不参与内容摘要。若编译失败，不会生成部分快照或替换已加载的有效快照。
+   `content_sha256` 标识规范化语义内容，`source_sha256` 标识 YAML 原始字节。已存在的
+   `<datasource>@<model_version>` 只有在源字节完全相同时才是幂等重编译；空白、换行或
+   注释变化即使不改变 `content_sha256`，也必须先升级 `model_version`。否则编译器以
+   `已由不同源字节编译；请升级 model_version` 拒绝，并保持 artifact、manifest 和
+   schema 不变。`compiled_at` 不参与内容摘要，完全相同的源字节会返回已有 artifact，
+   不刷新 provenance。若编译失败，不会生成部分快照或替换已加载的有效快照。
 
 `semantic_models/default.yaml`、`semantic_models/schema/semantic-model.schema.json` 和 `eval/golden/*.yaml` 是受版本控制的源资产；`.compiled/` 是运行产物，必须保持忽略。
 
@@ -64,7 +80,7 @@ python scripts/publish_semantic_model.py default \
   --compiled-root semantic_models/.compiled
 ```
 
-命令仅接受编译目录和数据源，不能以原始 YAML 绕过编译。发布是显式运维动作，不会在应用启动时自动执行；它委托现有图导入的原子覆盖路径。不要在 Neo4j 中手工编辑图来“修正”语义：下一次发布会由 Git 快照重建索引，SQL 校验始终读取注册表中的 Git 编译快照。
+命令仅接受编译目录和数据源，不能以原始 YAML 绕过编译。发布是显式运维动作，不会在应用启动时自动执行；它委托现有图导入的原子覆盖路径。同步 driver 缺失或已关闭时，原子导入明确返回 `Neo4j 未连接，无法原子导入知识图谱`；semantic publisher 也会拒绝零节点写入，不能宣称派生索引已更新。连接正常时，通用 v2 importer 的合法空 payload 仍可返回零计数成功；semantic publisher 的 payload 至少包含 Database 节点，因此不属于该例外。不要在 Neo4j 中手工编辑图来“修正”语义：下一次发布会由 Git 快照重建索引，SQL 校验始终读取注册表中的 Git 编译快照。
 
 ## 4. 启动与热重载
 

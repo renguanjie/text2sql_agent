@@ -237,6 +237,17 @@ def test_publish_surfaces_atomic_import_error(sales_snapshot: SemanticSnapshot):
         SemanticNeo4jPublisher(client).publish(sales_snapshot)
 
 
+def test_publish_rejects_zero_write_result_without_claiming_index_update(
+    sales_snapshot: SemanticSnapshot,
+):
+    """Break caught: disconnected/closed imports being reported as a successful publication."""
+    client = Mock()
+    client.import_knowledge_graph.return_value = {"nodes": 0, "relationships": 0}
+
+    with pytest.raises(SemanticPublishError, match="未写入语义索引"):
+        SemanticNeo4jPublisher(client).publish(sales_snapshot)
+
+
 def test_publisher_rejects_uncompiled_semantic_data():
     """Break caught: allowing a raw mapping to bypass registry snapshot validation."""
     with pytest.raises(TypeError, match="SemanticSnapshot"):

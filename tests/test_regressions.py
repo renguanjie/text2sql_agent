@@ -1858,6 +1858,59 @@ def test_neo4j_import_does_not_report_success_when_a_write_fails():
     assert "write failed" not in result["error"]
 
 
+@pytest.mark.parametrize("driver_state", ["missing", "closed"])
+def test_neo4j_atomic_import_fails_closed_when_driver_is_unavailable(driver_state):
+    """Break caught: unavailable drivers returning the same success shape as an empty import."""
+    from core.knowledge.neo4j_client import Neo4jClient
+
+    client = Neo4jClient("bolt://unused", "user", "password")
+    if driver_state == "closed":
+        client.driver = SimpleNamespace(_closed=True)
+
+    result = client.import_knowledge_graph(
+        {
+            "version": "2.0",
+            "format": "text2sql_knowledge_graph",
+            "nodes": [],
+            "edges": [],
+        }
+    )
+
+    assert result == {
+        "nodes": 0,
+        "relationships": 0,
+        "error": "Neo4j 未连接，无法原子导入知识图谱",
+    }
+
+
+def test_neo4j_atomic_import_preserves_connected_empty_payload_success():
+    """Break caught: fail-closed connectivity checks rejecting a valid empty import."""
+    from core.knowledge.neo4j_client import Neo4jClient
+
+    client = Neo4jClient("bolt://unused", "user", "password")
+    client.driver = SimpleNamespace(_closed=False)
+    client._execute_write_batch = Mock()
+
+    result = client.import_knowledge_graph(
+        {
+            "version": "2.0",
+            "format": "text2sql_knowledge_graph",
+            "nodes": [],
+            "edges": [],
+        }
+    )
+
+    assert result == {
+        "nodes": 0,
+        "relationships": 0,
+        "databases": 0,
+        "tables": 0,
+        "columns": 0,
+        "concepts": 0,
+    }
+    client._execute_write_batch.assert_called_once_with([])
+
+
 def test_legacy_graph_normalization_uses_composite_table_and_column_keys():
     from core.knowledge.neo4j_client import Neo4jClient
 

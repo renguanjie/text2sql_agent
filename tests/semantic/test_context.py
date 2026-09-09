@@ -3,8 +3,13 @@ from pathlib import Path
 import pytest
 
 from core.semantic.compiler import SemanticCompiler
-from core.semantic.context import SemanticContextBuilder, SemanticContextError
+from core.semantic.context import (
+    SemanticContextBuilder,
+    SemanticContextError,
+    SemanticPromptBundle,
+)
 from core.semantic.models import SemanticMetric, SemanticSnapshot
+from core.semantic.validator import SemanticSQLValidator
 
 
 @pytest.fixture
@@ -73,6 +78,25 @@ def test_context_is_deterministic(sales_snapshot: SemanticSnapshot):
     builder = SemanticContextBuilder(max_chars=800, max_items=8)
 
     assert builder.build("订单金额", sales_snapshot) == builder.build("订单金额", sales_snapshot)
+
+
+def test_context_renders_the_complete_relationship_on_contract(
+    sales_snapshot: SemanticSnapshot,
+):
+    """Break caught: prompting the model with the endpoint while hiding its required atoms."""
+    relationship = sales_snapshot.relationships[0].model_copy(
+        update={"extra_condition": "orders.status IS NULL"}
+    )
+    snapshot = sales_snapshot.model_copy(update={"relationships": (relationship,)})
+
+    context = SemanticContextBuilder(max_chars=800, max_items=8).build(
+        "order_customer", snapshot
+    )
+
+    assert (
+        "关系: orders.customer_id = customers.id "
+        "AND orders.status IS NULL [LEFT JOIN]"
+    ) in context.rendered
 
 
 def test_context_rejects_limit_that_cannot_fit_metric_dependency_bundle(
@@ -148,3 +172,73 @@ def test_context_fails_closed_for_ambiguous_conditional_term(
         SemanticContextBuilder(max_chars=1000, max_items=12).build(
             "查询成交额", ambiguous
         )
+
+
+def test_compiled_reviewer_relationship_flows_through_prompt_and_validation(
+    tmp_path: Path,
+):
+    """Break caught: compile/context/validate disagreeing about a soft-delete ON atom."""
+    source = tmp_path / "reviews.yaml"
+    source.write_text(
+        """
+schema_version: 1
+model_version: 1.0.0
+datasource: reviews
+dialect: mysql
+entities:
+  - name: reviews
+    name_cn: 评审记录
+    fields:
+      - {name: reviewer_id, name_cn: 评审人编号, data_type: bigint, role: identifier}
+  - name: reviewers
+    name_cn: 评审人
+    fields:
+      - {name: id, name_cn: 编号, data_type: bigint, role: identifier}
+      - {name: deleted_at, name_cn: 删除时间, data_type: datetime, role: time}
+relationships:
+  - name: review_reviewer
+    from_entity: reviews
+    from_field: reviewer_id
+    to_entity: reviewers
+    to_field: id
+    join_type: LEFT JOIN
+    extra_condition: reviewers.deleted_at IS NULL
+""",
+        encoding="utf-8",
+    )
+    snapshot = SemanticCompiler(clock=lambda: "2026-09-09T00:00:00Z").compile_file(
+        source, tmp_path / ".compiled"
+    )
+
+    context = SemanticContextBuilder(max_chars=1000, max_items=12).build(
+        "review_reviewer", snapshot
+    )
+    prompt = SemanticPromptBundle(context)
+    present = SemanticSQLValidator().validate(
+        "SELECT r.reviewer_id FROM reviews r "
+        "LEFT JOIN reviewers rv "
+        "ON r.reviewer_id = rv.id AND rv.deleted_at IS NULL",
+        "评审记录和评审人",
+        snapshot,
+    )
+    missing = SemanticSQLValidator().validate(
+        "SELECT r.reviewer_id FROM reviews r "
+        "LEFT JOIN reviewers rv ON r.reviewer_id = rv.id",
+        "评审记录和评审人",
+        snapshot,
+    )
+    misplaced = SemanticSQLValidator().validate(
+        "SELECT r.reviewer_id FROM reviews r "
+        "LEFT JOIN reviewers rv ON r.reviewer_id = rv.id "
+        "WHERE rv.deleted_at IS NULL",
+        "评审记录和评审人",
+        snapshot,
+    )
+
+    assert (
+        "reviews.reviewer_id = reviewers.id "
+        "AND reviewers.deleted_at IS NULL [LEFT JOIN]"
+    ) in prompt
+    assert present.valid, present.issues
+    assert "INVALID_JOIN" in {issue.code for issue in missing.issues}
+    assert "INVALID_JOIN" in {issue.code for issue in misplaced.issues}
