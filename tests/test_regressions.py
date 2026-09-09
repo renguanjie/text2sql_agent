@@ -3,7 +3,9 @@ import logging
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Barrier, Event, Thread
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -1166,7 +1168,7 @@ def test_governance_reload_rejects_inconsistent_candidate_component_graph(monkey
     context._embedding_factory = object()
 
     candidate_registry = object()
-    candidate_pipeline = SimpleNamespace(registry=candidate_registry)
+    candidate_pipeline = SimpleNamespace(registry=object())
     context._build_governance_components = lambda _config: (
         candidate_registry,
         candidate_pipeline,
@@ -1179,7 +1181,12 @@ def test_governance_reload_rejects_inconsistent_candidate_component_graph(monkey
     monkeypatch.setattr(
         context,
         "_build_sql_generator",
-        lambda **_kwargs: SimpleNamespace(correctness_pipeline=None),
+        lambda **components: SimpleNamespace(
+            llm=components["llm"],
+            knowledge_retriever=components["knowledge_retriever"],
+            sql_chain=components["sql_chain"],
+            correctness_pipeline=components["correctness_pipeline"],
+        ),
     )
     populate_retriever = Mock()
     monkeypatch.setattr(context, "_populate_retriever", populate_retriever)
@@ -1193,6 +1200,312 @@ def test_governance_reload_rejects_inconsistent_candidate_component_graph(monkey
     assert context.correctness_pipeline is old_pipeline
     assert context.knowledge_retriever is old_retriever
     assert context.sql_generator is old_generator
+
+
+@pytest.mark.parametrize(
+    "broken_reference",
+    ["llm", "knowledge_retriever", "sql_chain", "correctness_pipeline"],
+)
+def test_governance_reload_rejects_generator_bound_to_another_candidate(
+    monkeypatch, broken_reference
+):
+    """Every generator dependency must belong to the candidate being published."""
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    context = ApplicationContext({"semantic_governance_enabled": False})
+    context._llm = object()
+    context._embedding_factory = object()
+    context._knowledge_retriever = object()
+    context._sql_chain = object()
+    candidate_registry = object()
+    candidate_pipeline = SimpleNamespace(registry=candidate_registry)
+    context._build_governance_components = lambda _config: (
+        candidate_registry,
+        candidate_pipeline,
+    )
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: SimpleNamespace(retriever=SimpleNamespace()),
+    )
+
+    def build_mismatched_generator(**components):
+        generator_components = {
+            "llm": components["llm"],
+            "knowledge_retriever": components["knowledge_retriever"],
+            "sql_chain": components["sql_chain"],
+            "correctness_pipeline": components["correctness_pipeline"],
+        }
+        generator_components[broken_reference] = object()
+        return SimpleNamespace(**generator_components)
+
+    monkeypatch.setattr(
+        context, "_build_sql_generator", build_mismatched_generator
+    )
+    populate_retriever = Mock()
+    monkeypatch.setattr(context, "_populate_retriever", populate_retriever)
+
+    with pytest.raises(ApplicationConfigurationError, match="组件图"):
+        context.reload_governance(semantic_governance_enabled=True)
+
+    populate_retriever.assert_not_called()
+
+
+def test_embedding_reload_rejects_invalid_graph_before_population(monkeypatch):
+    """An invalid embedding candidate must not consume data during population."""
+    import core.embedding_factory
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    old_config = {"semantic_governance_enabled": False}
+    old_llm = object()
+    old_chain = object()
+    old_embedding = SimpleNamespace(clear_cache=lambda: None)
+    old_retriever = object()
+    old_generator = SimpleNamespace(
+        llm=old_llm,
+        knowledge_retriever=old_retriever,
+        sql_chain=old_chain,
+        correctness_pipeline=None,
+    )
+    context = ApplicationContext(old_config)
+    context._llm = old_llm
+    context._sql_chain = old_chain
+    context._embedding_factory = old_embedding
+    context._knowledge_retriever = old_retriever
+    context._sql_generator = old_generator
+    candidate_embedding = Mock()
+    candidate_retriever = SimpleNamespace(retriever=SimpleNamespace())
+    monkeypatch.setattr(
+        core.embedding_factory,
+        "EmbeddingFactory",
+        lambda **_kwargs: candidate_embedding,
+    )
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: candidate_retriever,
+    )
+    monkeypatch.setattr(
+        context,
+        "_build_sql_generator",
+        lambda **components: SimpleNamespace(
+            llm=object(),
+            knowledge_retriever=components["knowledge_retriever"],
+            sql_chain=components["sql_chain"],
+            correctness_pipeline=components["correctness_pipeline"],
+        ),
+    )
+    populate_retriever = Mock()
+    monkeypatch.setattr(context, "_populate_retriever", populate_retriever)
+
+    with pytest.raises(ApplicationConfigurationError, match="组件图"):
+        context.reload_embedding(embedding_model="candidate-model")
+
+    populate_retriever.assert_not_called()
+    candidate_embedding.clear_cache.assert_called_once_with()
+    assert context.config is old_config
+    assert context.llm is old_llm
+    assert context.sql_chain is old_chain
+    assert context.embedding_factory is old_embedding
+    assert context.knowledge_retriever is old_retriever
+    assert context.sql_generator is old_generator
+
+
+def test_concurrent_governance_and_llm_reloads_publish_one_complete_generation(
+    monkeypatch,
+):
+    """A reload starting during population cannot splice two generations together."""
+    import core.llm_factory
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationContext
+
+    old_llm = object()
+    old_chain = object()
+    old_embedding = SimpleNamespace(clear_cache=lambda: None)
+    old_retriever = object()
+    context = ApplicationContext(
+        {
+            "llm_provider": "old-provider",
+            "llm_model": "old-model",
+            "semantic_governance_enabled": False,
+            "sql_explain_enabled": False,
+            "sql_dialect": "mysql",
+        }
+    )
+    context._llm = old_llm
+    context._embedding_factory = old_embedding
+    context._knowledge_retriever = old_retriever
+    context._sql_chain = old_chain
+    context._sql_generator = SimpleNamespace(
+        llm=old_llm,
+        knowledge_retriever=old_retriever,
+        sql_chain=old_chain,
+        correctness_pipeline=None,
+    )
+
+    candidate_registry = object()
+    candidate_pipeline = SimpleNamespace(registry=candidate_registry)
+    candidate_retriever = SimpleNamespace(retriever=SimpleNamespace())
+    new_llm = object()
+    context._build_governance_components = lambda _config: (
+        candidate_registry,
+        candidate_pipeline,
+    )
+    monkeypatch.setattr(core.llm_factory, "create_llm", lambda **_kwargs: new_llm)
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: candidate_retriever,
+    )
+    monkeypatch.setattr(
+        context,
+        "_build_sql_generator",
+        lambda **components: SimpleNamespace(
+            llm=components["llm"],
+            knowledge_retriever=components["knowledge_retriever"],
+            sql_chain=components["sql_chain"],
+            correctness_pipeline=components["correctness_pipeline"],
+        ),
+    )
+
+    population_started = Event()
+    reloads_meet = Barrier(2)
+    interleaving_decided = Event()
+    governance_reload_finished = Event()
+    llm_reload_finished = Event()
+
+    def populate_candidate(*_args, **_kwargs):
+        population_started.set()
+        reloads_meet.wait(timeout=5)
+        assert interleaving_decided.wait(timeout=5)
+
+    monkeypatch.setattr(context, "_populate_retriever", populate_candidate)
+
+    def reload_llm():
+        reloads_meet.wait(timeout=5)
+        acquired_without_waiting = context._reload_lock.acquire(blocking=False)
+        if acquired_without_waiting:
+            context._reload_lock.release()
+        else:
+            interleaving_decided.set()
+            assert governance_reload_finished.wait(timeout=5)
+        context.reload_llm(llm_model="new-model")
+        llm_reload_finished.set()
+        interleaving_decided.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        governance_reload = executor.submit(
+            context.reload_governance,
+            semantic_governance_enabled=True,
+        )
+        assert population_started.wait(timeout=5)
+        llm_reload = executor.submit(reload_llm)
+        governance_reload.result(timeout=5)
+        governance_reload_finished.set()
+        llm_reload.result(timeout=5)
+
+    assert llm_reload_finished.is_set()
+    assert context.config["semantic_governance_enabled"] is True
+    assert context.config["llm_model"] == "new-model"
+    assert context.llm is new_llm
+    assert context.semantic_registry is candidate_registry
+    assert context.correctness_pipeline is candidate_pipeline
+    assert context.sql_generator.llm is context.llm
+    assert context.sql_generator.sql_chain is context.sql_chain
+    assert context.sql_generator.knowledge_retriever is context.knowledge_retriever
+    assert context.sql_generator.correctness_pipeline is context.correctness_pipeline
+    assert context.correctness_pipeline.registry is context.semantic_registry
+
+
+def test_nested_llm_reload_during_governance_population_never_deadlocks_or_tears(
+    monkeypatch,
+):
+    """A same-thread nested reload may win or lose, but its graph stays whole."""
+    import core.llm_factory
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationContext
+
+    old_llm = object()
+    old_chain = object()
+    old_retriever = object()
+    new_llm = object()
+    candidate_registry = object()
+    candidate_pipeline = SimpleNamespace(registry=candidate_registry)
+    candidate_retriever = SimpleNamespace(retriever=SimpleNamespace())
+    context = ApplicationContext(
+        {
+            "llm_model": "old-model",
+            "semantic_governance_enabled": False,
+            "sql_explain_enabled": False,
+            "sql_dialect": "mysql",
+        }
+    )
+    context._llm = old_llm
+    context._embedding_factory = SimpleNamespace(clear_cache=lambda: None)
+    context._knowledge_retriever = old_retriever
+    context._sql_chain = old_chain
+    context._sql_generator = SimpleNamespace(
+        llm=old_llm,
+        knowledge_retriever=old_retriever,
+        sql_chain=old_chain,
+        correctness_pipeline=None,
+    )
+    context._build_governance_components = lambda _config: (
+        candidate_registry,
+        candidate_pipeline,
+    )
+    monkeypatch.setattr(core.llm_factory, "create_llm", lambda **_kwargs: new_llm)
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: candidate_retriever,
+    )
+    monkeypatch.setattr(
+        context,
+        "_build_sql_generator",
+        lambda **components: SimpleNamespace(
+            llm=components["llm"],
+            knowledge_retriever=components["knowledge_retriever"],
+            sql_chain=components["sql_chain"],
+            correctness_pipeline=components["correctness_pipeline"],
+        ),
+    )
+
+    def populate_with_nested_reload(*_args, **_kwargs):
+        context.reload_llm(llm_model="new-model")
+
+    monkeypatch.setattr(context, "_populate_retriever", populate_with_nested_reload)
+    reload_finished = Event()
+    reload_errors = []
+
+    def reload_governance():
+        try:
+            context.reload_governance(semantic_governance_enabled=True)
+        except Exception as exc:  # pragma: no cover - asserted below
+            reload_errors.append(exc)
+        finally:
+            reload_finished.set()
+
+    reload_thread = Thread(target=reload_governance, daemon=True)
+    reload_thread.start()
+
+    assert reload_finished.wait(timeout=5), "nested reload deadlocked"
+    reload_thread.join(timeout=5)
+    assert not reload_thread.is_alive()
+    assert not reload_errors
+    expected_llm = {
+        "old-model": old_llm,
+        "new-model": new_llm,
+    }[context.config["llm_model"]]
+    assert context.llm is expected_llm
+    assert context.sql_generator.llm is context.llm
+    assert context.sql_generator.sql_chain is context.sql_chain
+    assert context.sql_generator.knowledge_retriever is context.knowledge_retriever
+    assert context.sql_generator.correctness_pipeline is context.correctness_pipeline
+    if context.correctness_pipeline is not None:
+        assert context.correctness_pipeline.registry is context.semantic_registry
 
 
 def test_governance_reload_disable_publishes_no_governance_residue(monkeypatch):
@@ -1217,7 +1530,12 @@ def test_governance_reload_disable_publishes_no_governance_residue(monkeypatch):
     monkeypatch.setattr(
         context,
         "_build_sql_generator",
-        lambda **_kwargs: SimpleNamespace(correctness_pipeline=None),
+        lambda **components: SimpleNamespace(
+            llm=components["llm"],
+            knowledge_retriever=components["knowledge_retriever"],
+            sql_chain=components["sql_chain"],
+            correctness_pipeline=components["correctness_pipeline"],
+        ),
     )
 
     context.reload_governance(semantic_governance_enabled=False)
@@ -1253,7 +1571,15 @@ def test_llm_reload_accepts_its_whitelisted_updates(monkeypatch):
     sql_chain_module = ModuleType("core.chain.sql_chain")
     sql_chain_module.SQLGenerationChain = lambda **_kwargs: new_chain
     monkeypatch.setitem(sys.modules, "core.chain.sql_chain", sql_chain_module)
-    monkeypatch.setattr(context, "_build_sql_generator", lambda **_kwargs: new_generator)
+
+    def build_generator(**components):
+        new_generator.llm = components["llm"]
+        new_generator.knowledge_retriever = components["knowledge_retriever"]
+        new_generator.sql_chain = components["sql_chain"]
+        new_generator.correctness_pipeline = components["correctness_pipeline"]
+        return new_generator
+
+    monkeypatch.setattr(context, "_build_sql_generator", build_generator)
 
     context.reload_llm(
         llm_provider="new-provider",
@@ -1305,7 +1631,15 @@ def test_embedding_reload_accepts_its_whitelisted_updates(monkeypatch):
         "KnowledgeRetriever",
         lambda **_kwargs: new_retriever,
     )
-    monkeypatch.setattr(context, "_build_sql_generator", lambda **_kwargs: new_generator)
+
+    def build_generator(**components):
+        new_generator.llm = components["llm"]
+        new_generator.knowledge_retriever = components["knowledge_retriever"]
+        new_generator.sql_chain = components["sql_chain"]
+        new_generator.correctness_pipeline = components["correctness_pipeline"]
+        return new_generator
+
+    monkeypatch.setattr(context, "_build_sql_generator", build_generator)
 
     context.reload_embedding(
         embedding_provider="new-provider",

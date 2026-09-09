@@ -2,7 +2,9 @@
 应用上下文 - 统一管理所有组件的生命周期
 替代原有的全局单例模式
 """
+from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict
 
 from loguru import logger
@@ -11,7 +13,7 @@ from core.config_validation import RuntimeConfigurationError, validate_runtime_c
 from core.utils.log_sanitizer import log_safe_exception
 
 _CURRENT_GOVERNANCE_PIPELINE = object()
-_MISSING_COMPONENT_PIPELINE = object()
+_MISSING_COMPONENT = object()
 
 _LLM_RELOAD_KEYS = frozenset({
     "llm_provider",
@@ -32,6 +34,20 @@ class ApplicationConfigurationError(ValueError):
     """Stable public error raised for invalid application configuration."""
 
 
+@dataclass(frozen=True)
+class _ComponentGraphSnapshot:
+    """One internally consistent application graph used to build a reload."""
+
+    config: Dict[str, Any]
+    llm: Any
+    embedding_factory: Any
+    knowledge_retriever: Any
+    sql_chain: Any
+    semantic_registry: Any
+    correctness_pipeline: Any
+    sql_generator: Any
+
+
 class ApplicationContext:
     """应用上下文 - 统一管理 LLM、数据库、检索器等组件"""
 
@@ -42,7 +58,8 @@ class ApplicationContext:
         Args:
             config: 配置字典（从 config.py 读取）
         """
-        self.config = config
+        self._reload_lock = RLock()
+        self._config = config
         from core.history.proof import create_history_proof_pair
 
         (
@@ -64,48 +81,69 @@ class ApplicationContext:
         self._correctness_pipeline = None
 
     @property
+    def config(self):
+        with self._reload_lock:
+            return self._config
+
+    @config.setter
+    def config(self, value):
+        with self._reload_lock:
+            self._config = value
+
+    @property
     def llm(self):
-        return self._llm
+        with self._reload_lock:
+            return self._llm
 
     @property
     def neo4j_client(self):
-        return self._neo4j_client
+        with self._reload_lock:
+            return self._neo4j_client
 
     @property
     def mysql_client(self):
-        return self._mysql_client
+        with self._reload_lock:
+            return self._mysql_client
 
     @property
     def embedding_factory(self):
-        return self._embedding_factory
+        with self._reload_lock:
+            return self._embedding_factory
 
     @property
     def knowledge_retriever(self):
-        return self._knowledge_retriever
+        with self._reload_lock:
+            return self._knowledge_retriever
 
     @property
     def sql_generator(self):
-        return self._sql_generator
+        with self._reload_lock:
+            return self._sql_generator
 
     @property
     def sql_chain(self):
-        return self._sql_chain
+        with self._reload_lock:
+            return self._sql_chain
 
     @property
     def semantic_registry(self):
-        return self._semantic_registry
+        with self._reload_lock:
+            return self._semantic_registry
 
     @property
     def correctness_pipeline(self):
-        return self._correctness_pipeline
+        with self._reload_lock:
+            return self._correctness_pipeline
 
     @property
     def initialization_error(self):
-        return self._initialization_error
+        with self._reload_lock:
+            return self._initialization_error
 
     @property
     def is_initialized(self) -> bool:
-        return self._initialized
+        with self._reload_lock:
+            return self._initialized
 
     def ensure_initialized(self) -> bool:
         """确保所有组件已初始化"""
@@ -384,40 +422,59 @@ class ApplicationContext:
             "治理及其他运行时配置请使用 reload_governance"
         )
 
+    def _snapshot_component_graph(self) -> _ComponentGraphSnapshot:
+        """Capture every reload dependency while holding the shared lock."""
+        with self._reload_lock:
+            return _ComponentGraphSnapshot(
+                config=self._config,
+                llm=self._llm,
+                embedding_factory=self._embedding_factory,
+                knowledge_retriever=self._knowledge_retriever,
+                sql_chain=self._sql_chain,
+                semantic_registry=self._semantic_registry,
+                correctness_pipeline=self._correctness_pipeline,
+                sql_generator=self._sql_generator,
+            )
+
     @staticmethod
     def _validate_component_graph(
         config: Dict[str, Any],
         *,
+        llm,
+        knowledge_retriever,
+        sql_chain,
         semantic_registry,
         correctness_pipeline,
         sql_generator,
     ) -> None:
         """Require a complete, internally consistent graph before publication."""
-        generator_pipeline = getattr(
-            sql_generator,
-            "correctness_pipeline",
-            _MISSING_COMPONENT_PIPELINE,
+        generator_is_consistent = sql_generator is not None and all(
+            getattr(sql_generator, name, _MISSING_COMPONENT) is component
+            for name, component in (
+                ("llm", llm),
+                ("knowledge_retriever", knowledge_retriever),
+                ("sql_chain", sql_chain),
+                ("correctness_pipeline", correctness_pipeline),
+            )
         )
         governance_enabled = config.get("semantic_governance_enabled", False)
         if governance_enabled:
             graph_is_consistent = (
                 semantic_registry is not None
                 and correctness_pipeline is not None
-                and sql_generator is not None
+                and generator_is_consistent
                 and getattr(
                     correctness_pipeline,
                     "registry",
-                    _MISSING_COMPONENT_PIPELINE,
+                    _MISSING_COMPONENT,
                 )
                 is semantic_registry
-                and generator_pipeline is correctness_pipeline
             )
         else:
             graph_is_consistent = (
                 semantic_registry is None
                 and correctness_pipeline is None
-                and sql_generator is not None
-                and generator_pipeline is None
+                and generator_is_consistent
             )
         if not graph_is_consistent:
             raise ApplicationConfigurationError("发布的治理组件图不一致")
@@ -435,156 +492,184 @@ class ApplicationContext:
         sql_generator,
     ) -> None:
         """Publish a fully built graph only after checking its governance binding."""
-        self._validate_component_graph(
-            candidate_config,
-            semantic_registry=semantic_registry,
-            correctness_pipeline=correctness_pipeline,
-            sql_generator=sql_generator,
-        )
-        self.config = candidate_config
-        self._llm = llm
-        self._embedding_factory = embedding_factory
-        self._knowledge_retriever = knowledge_retriever
-        self._sql_chain = sql_chain
-        self._semantic_registry = semantic_registry
-        self._correctness_pipeline = correctness_pipeline
-        self._sql_generator = sql_generator
-        self._initialized = True
+        with self._reload_lock:
+            self._validate_component_graph(
+                candidate_config,
+                llm=llm,
+                knowledge_retriever=knowledge_retriever,
+                sql_chain=sql_chain,
+                semantic_registry=semantic_registry,
+                correctness_pipeline=correctness_pipeline,
+                sql_generator=sql_generator,
+            )
+            self._config = candidate_config
+            self._llm = llm
+            self._embedding_factory = embedding_factory
+            self._knowledge_retriever = knowledge_retriever
+            self._sql_chain = sql_chain
+            self._semantic_registry = semantic_registry
+            self._correctness_pipeline = correctness_pipeline
+            self._sql_generator = sql_generator
+            self._initialized = True
 
     def reload_llm(self, **updates: Any) -> None:
         """为当前会话事务式重载 LLM 链路。"""
-        self._validate_reload_updates(
-            "reload_llm", updates, _LLM_RELOAD_KEYS
-        )
-        from core.chain.sql_chain import SQLGenerationChain
-        from core.llm_factory import create_llm
-
-        candidate_config = {**self.config, **updates}
-        self._validate_candidate_config(candidate_config)
-        candidate_llm = create_llm(
-            provider=candidate_config.get('llm_provider', 'openai'),
-            model=candidate_config.get('llm_model', 'gpt-4'),
-            api_key=candidate_config.get('llm_api_key', ''),
-            base_url=candidate_config.get('llm_base_url', ''),
-        )
-        candidate_chain = SQLGenerationChain(
-            llm=candidate_llm,
-            dialect=candidate_config.get('sql_dialect', 'mysql'),
-            retrieval_top_k=candidate_config.get('retrieval_top_k', 5),
-            prompt_max_length=candidate_config.get('prompt_max_length', 4000),
-        )
-        candidate_generator = self._build_sql_generator(
-            llm=candidate_llm,
-            knowledge_retriever=self._knowledge_retriever,
-            sql_chain=candidate_chain,
-            config=candidate_config,
-            correctness_pipeline=self._correctness_pipeline,
-        )
-        self._publish_component_graph(
-            candidate_config,
-            llm=candidate_llm,
-            embedding_factory=self._embedding_factory,
-            knowledge_retriever=self._knowledge_retriever,
-            sql_chain=candidate_chain,
-            semantic_registry=self._semantic_registry,
-            correctness_pipeline=self._correctness_pipeline,
-            sql_generator=candidate_generator,
-        )
-
-    def reload_embedding(self, **updates: Any) -> None:
-        """为当前会话构建新检索链路，成功后一次性替换旧组件。"""
-        self._validate_reload_updates(
-            "reload_embedding", updates, _EMBEDDING_RELOAD_KEYS
-        )
-        from core.embedding_factory import EmbeddingFactory
-        from core.retrieval.bm25_tfidf import KnowledgeRetriever
-
-        candidate_config = {**self.config, **updates}
-        self._validate_candidate_config(candidate_config)
-        candidate_embedding = EmbeddingFactory(
-            provider=candidate_config.get('embedding_provider', 'dashscope'),
-            model=candidate_config.get('embedding_model', 'text-embedding-v1'),
-            api_key=candidate_config.get('embedding_api_key', ''),
-            api_base=candidate_config.get('embedding_api_base', ''),
-        )
-        old_embedding = self._embedding_factory
-        try:
-            candidate_retriever = KnowledgeRetriever(
-                config=self._retriever_config(candidate_config),
-                embedding_factory=candidate_embedding,
+        with self._reload_lock:
+            self._validate_reload_updates(
+                "reload_llm", updates, _LLM_RELOAD_KEYS
             )
-            self._populate_retriever(candidate_retriever, candidate_config)
+            from core.chain.sql_chain import SQLGenerationChain
+            from core.llm_factory import create_llm
+
+            snapshot = self._snapshot_component_graph()
+            candidate_config = {**snapshot.config, **updates}
+            self._validate_candidate_config(candidate_config)
+            candidate_llm = create_llm(
+                provider=candidate_config.get('llm_provider', 'openai'),
+                model=candidate_config.get('llm_model', 'gpt-4'),
+                api_key=candidate_config.get('llm_api_key', ''),
+                base_url=candidate_config.get('llm_base_url', ''),
+            )
+            candidate_chain = SQLGenerationChain(
+                llm=candidate_llm,
+                dialect=candidate_config.get('sql_dialect', 'mysql'),
+                retrieval_top_k=candidate_config.get('retrieval_top_k', 5),
+                prompt_max_length=candidate_config.get('prompt_max_length', 4000),
+            )
             candidate_generator = self._build_sql_generator(
-                llm=self._llm,
-                knowledge_retriever=candidate_retriever,
-                sql_chain=self._sql_chain,
+                llm=candidate_llm,
+                knowledge_retriever=snapshot.knowledge_retriever,
+                sql_chain=candidate_chain,
                 config=candidate_config,
-                correctness_pipeline=self._correctness_pipeline,
+                correctness_pipeline=snapshot.correctness_pipeline,
             )
             self._publish_component_graph(
                 candidate_config,
-                llm=self._llm,
-                embedding_factory=candidate_embedding,
-                knowledge_retriever=candidate_retriever,
-                sql_chain=self._sql_chain,
-                semantic_registry=self._semantic_registry,
-                correctness_pipeline=self._correctness_pipeline,
+                llm=candidate_llm,
+                embedding_factory=snapshot.embedding_factory,
+                knowledge_retriever=snapshot.knowledge_retriever,
+                sql_chain=candidate_chain,
+                semantic_registry=snapshot.semantic_registry,
+                correctness_pipeline=snapshot.correctness_pipeline,
                 sql_generator=candidate_generator,
             )
-        except Exception:
-            try:
-                candidate_embedding.clear_cache()
-            except Exception as cleanup_error:
-                logger.warning(f"候选 Embedding 缓存清理失败：{cleanup_error}")
-            raise
 
-        if old_embedding:
+    def reload_embedding(self, **updates: Any) -> None:
+        """为当前会话构建新检索链路，成功后一次性替换旧组件。"""
+        with self._reload_lock:
+            self._validate_reload_updates(
+                "reload_embedding", updates, _EMBEDDING_RELOAD_KEYS
+            )
+            from core.embedding_factory import EmbeddingFactory
+            from core.retrieval.bm25_tfidf import KnowledgeRetriever
+
+            snapshot = self._snapshot_component_graph()
+            candidate_config = {**snapshot.config, **updates}
+            self._validate_candidate_config(candidate_config)
+            candidate_embedding = EmbeddingFactory(
+                provider=candidate_config.get('embedding_provider', 'dashscope'),
+                model=candidate_config.get('embedding_model', 'text-embedding-v1'),
+                api_key=candidate_config.get('embedding_api_key', ''),
+                api_base=candidate_config.get('embedding_api_base', ''),
+            )
+            old_embedding = snapshot.embedding_factory
             try:
-                old_embedding.clear_cache()
-            except Exception as cleanup_error:
-                logger.warning(f"旧 Embedding 缓存清理失败：{cleanup_error}")
+                candidate_retriever = KnowledgeRetriever(
+                    config=self._retriever_config(candidate_config),
+                    embedding_factory=candidate_embedding,
+                )
+                candidate_generator = self._build_sql_generator(
+                    llm=snapshot.llm,
+                    knowledge_retriever=candidate_retriever,
+                    sql_chain=snapshot.sql_chain,
+                    config=candidate_config,
+                    correctness_pipeline=snapshot.correctness_pipeline,
+                )
+                self._validate_component_graph(
+                    candidate_config,
+                    llm=snapshot.llm,
+                    knowledge_retriever=candidate_retriever,
+                    sql_chain=snapshot.sql_chain,
+                    semantic_registry=snapshot.semantic_registry,
+                    correctness_pipeline=snapshot.correctness_pipeline,
+                    sql_generator=candidate_generator,
+                )
+                self._populate_retriever(
+                    candidate_retriever,
+                    candidate_config,
+                    correctness_pipeline=snapshot.correctness_pipeline,
+                )
+                self._publish_component_graph(
+                    candidate_config,
+                    llm=snapshot.llm,
+                    embedding_factory=candidate_embedding,
+                    knowledge_retriever=candidate_retriever,
+                    sql_chain=snapshot.sql_chain,
+                    semantic_registry=snapshot.semantic_registry,
+                    correctness_pipeline=snapshot.correctness_pipeline,
+                    sql_generator=candidate_generator,
+                )
+            except Exception:
+                try:
+                    candidate_embedding.clear_cache()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"候选 Embedding 缓存清理失败：{cleanup_error}"
+                    )
+                raise
+
+            if old_embedding:
+                try:
+                    old_embedding.clear_cache()
+                except Exception as cleanup_error:
+                    logger.warning(f"旧 Embedding 缓存清理失败：{cleanup_error}")
 
     def reload_governance(self, **updates: Any) -> None:
         """Candidate-build governance and atomically replace registry/generator."""
-        from core.retrieval.bm25_tfidf import KnowledgeRetriever
+        with self._reload_lock:
+            from core.retrieval.bm25_tfidf import KnowledgeRetriever
 
-        candidate_config = {**self.config, **updates}
-        candidate_registry, candidate_pipeline = self._build_governance_components(
-            candidate_config
-        )
-        candidate_retriever = KnowledgeRetriever(
-            config=self._retriever_config(candidate_config),
-            embedding_factory=self._embedding_factory,
-        )
-        candidate_generator = self._build_sql_generator(
-            llm=self._llm,
-            knowledge_retriever=candidate_retriever,
-            sql_chain=self._sql_chain,
-            config=candidate_config,
-            correctness_pipeline=candidate_pipeline,
-        )
-        self._validate_component_graph(
-            candidate_config,
-            semantic_registry=candidate_registry,
-            correctness_pipeline=candidate_pipeline,
-            sql_generator=candidate_generator,
-        )
-        self._populate_retriever(
-            candidate_retriever,
-            candidate_config,
-            correctness_pipeline=candidate_pipeline,
-        )
+            snapshot = self._snapshot_component_graph()
+            candidate_config = {**snapshot.config, **updates}
+            candidate_registry, candidate_pipeline = (
+                self._build_governance_components(candidate_config)
+            )
+            candidate_retriever = KnowledgeRetriever(
+                config=self._retriever_config(candidate_config),
+                embedding_factory=snapshot.embedding_factory,
+            )
+            candidate_generator = self._build_sql_generator(
+                llm=snapshot.llm,
+                knowledge_retriever=candidate_retriever,
+                sql_chain=snapshot.sql_chain,
+                config=candidate_config,
+                correctness_pipeline=candidate_pipeline,
+            )
+            self._validate_component_graph(
+                candidate_config,
+                llm=snapshot.llm,
+                knowledge_retriever=candidate_retriever,
+                sql_chain=snapshot.sql_chain,
+                semantic_registry=candidate_registry,
+                correctness_pipeline=candidate_pipeline,
+                sql_generator=candidate_generator,
+            )
+            self._populate_retriever(
+                candidate_retriever,
+                candidate_config,
+                correctness_pipeline=candidate_pipeline,
+            )
 
-        self._publish_component_graph(
-            candidate_config,
-            llm=self._llm,
-            embedding_factory=self._embedding_factory,
-            knowledge_retriever=candidate_retriever,
-            sql_chain=self._sql_chain,
-            semantic_registry=candidate_registry,
-            correctness_pipeline=candidate_pipeline,
-            sql_generator=candidate_generator,
-        )
+            self._publish_component_graph(
+                candidate_config,
+                llm=snapshot.llm,
+                embedding_factory=snapshot.embedding_factory,
+                knowledge_retriever=candidate_retriever,
+                sql_chain=snapshot.sql_chain,
+                semantic_registry=candidate_registry,
+                correctness_pipeline=candidate_pipeline,
+                sql_generator=candidate_generator,
+            )
 
     def _populate_retriever(
         self,

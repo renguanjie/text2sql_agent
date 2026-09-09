@@ -1643,7 +1643,12 @@ def test_governance_reload_builds_candidate_then_atomically_replaces_pair(
     candidate_generator = SimpleNamespace()
 
     def build_generator(**kwargs):
-        candidate_generator.correctness_pipeline = kwargs["correctness_pipeline"]
+        candidate_generator.llm = kwargs["llm"]
+        candidate_generator.knowledge_retriever = kwargs["knowledge_retriever"]
+        candidate_generator.sql_chain = kwargs["sql_chain"]
+        candidate_generator.correctness_pipeline = kwargs[
+            "correctness_pipeline"
+        ]
         return candidate_generator
 
     build_generator = Mock(side_effect=build_generator)
@@ -1678,6 +1683,9 @@ def test_governance_pipeline_receives_configured_sql_max_length(
         "_build_sql_generator",
         Mock(
             side_effect=lambda **kwargs: SimpleNamespace(
+                llm=kwargs["llm"],
+                knowledge_retriever=kwargs["knowledge_retriever"],
+                sql_chain=kwargs["sql_chain"],
                 correctness_pipeline=kwargs["correctness_pipeline"]
             )
         ),
@@ -1762,7 +1770,12 @@ def test_governance_reload_starts_with_empty_process_local_few_shot(monkeypatch)
     )
 
     def build_generator(**kwargs):
-        candidate_generator.correctness_pipeline = kwargs["correctness_pipeline"]
+        candidate_generator.llm = kwargs["llm"]
+        candidate_generator.knowledge_retriever = kwargs["knowledge_retriever"]
+        candidate_generator.sql_chain = kwargs["sql_chain"]
+        candidate_generator.correctness_pipeline = kwargs[
+            "correctness_pipeline"
+        ]
         return candidate_generator
 
     context._build_sql_generator = Mock(side_effect=build_generator)
