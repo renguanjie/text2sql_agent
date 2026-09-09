@@ -194,11 +194,11 @@ def test_saved_history_uses_validation_state_not_extraction_state():
 
     saved = mysql.save_sql_history.call_args.kwargs
     assert saved["validation_status"] == "success"
-    assert saved["semantic_datasource"] is None
-    assert saved["semantic_dialect"] is None
-    assert saved["semantic_version"] is None
-    assert saved["semantic_content_sha256"] is None
-    assert saved["governance_validated"] is False
+    assert "semantic_datasource" not in saved
+    assert "semantic_dialect" not in saved
+    assert "semantic_version" not in saved
+    assert "semantic_content_sha256" not in saved
+    assert "governance_validated" not in saved
     assert result["history_id"] == 7
     generator.knowledge_retriever.add_history_record.assert_not_called()
 
@@ -523,8 +523,8 @@ def test_generator_factory_loads_only_fully_successful_history_for_few_shot():
     assert [record["id"] for record in generator.knowledge_retriever.history_records] == [7]
 
 
-def test_governed_generator_factory_loads_only_the_current_snapshot_history():
-    """Startup must reject cross-datasource, old-content, and legacy examples."""
+def test_governed_generator_factory_never_loads_persisted_history():
+    """DB governance fields are audit metadata, not restart-time Few-Shot proof."""
     from core.embedding_factory import EmbeddingFactory
     from core.sql.generator import create_sql_generator
 
@@ -609,15 +609,9 @@ def test_governed_generator_factory_loads_only_the_current_snapshot_history():
         correctness_pipeline=pipeline,
     )
 
-    mysql.get_successful_history_for_few_shot.assert_called_once_with(
-        limit=100,
-        semantic_datasource="sales",
-        semantic_dialect="mysql",
-        semantic_version="1.0.0",
-        semantic_content_sha256="a" * 64,
-        governance_validated=True,
-    )
-    assert [record["id"] for record in generator.knowledge_retriever.history_records] == [1]
+    mysql.get_successful_history_for_few_shot.assert_not_called()
+    assert generator.knowledge_retriever.history_records == []
+    assert generator.knowledge_retriever.history_index is None
 
 
 def test_single_few_shot_add_rejects_noncurrent_or_ungoverned_history():
@@ -731,22 +725,37 @@ def test_mysql_few_shot_query_preserves_ungoverned_legacy_compatibility():
 def test_guarded_history_update_binds_session_sql_and_validation_status():
     """The storage mutation itself must retain the verified history predicates."""
     from core.history.mysql_client import MySQLClient
+    from core.history.proof import (
+        GovernedHistoryFinalization,
+        create_history_proof_pair,
+    )
 
-    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    issuer, verifier = create_history_proof_pair()
+    client = MySQLClient(
+        "localhost",
+        3306,
+        "user",
+        "password",
+        "database",
+        governance_proof_verifier=verifier,
+    )
     client.execute_update = Mock(return_value=1)
-
-    updated = client.update_sql_execution(
+    command = GovernedHistoryFinalization(
         history_id=7,
-        execution_status="success",
         session_id="session-a",
+        user_query="original question",
         generated_sql="SELECT 1",
-        expected_user_query="original question",
-        require_validation_success=True,
-        expected_semantic_datasource="sales",
-        expected_semantic_dialect="mysql",
-        expected_semantic_version="1.0.0",
-        expected_semantic_content_sha256="a" * 64,
-        require_governance_validated=True,
+        execution_status="success",
+        execution_error=None,
+        execution_result_json=None,
+        semantic_datasource="sales",
+        semantic_dialect="mysql",
+        semantic_version="1.0.0",
+        semantic_content_sha256="a" * 64,
+    )
+    updated = client.finalize_governed_sql_execution(
+        command,
+        issuer.issue(command),
     )
 
     query, params = client.execute_update.call_args.args
@@ -754,23 +763,24 @@ def test_guarded_history_update_binds_session_sql_and_validation_status():
     assert updated is True
     assert "session_id = :session_id" in normalized_query
     assert "generated_sql = :generated_sql" in normalized_query
-    assert "user_query = :expected_user_query" in normalized_query
+    assert "user_query = :user_query" in normalized_query
     assert "validation_status = 'success'" in normalized_query
-    assert "semantic_datasource = :expected_semantic_datasource" in normalized_query
-    assert "semantic_dialect = :expected_semantic_dialect" in normalized_query
-    assert "semantic_version = :expected_semantic_version" in normalized_query
+    assert "execution_status = 'pending'" in normalized_query
+    assert "governance_validated = 0" in normalized_query
+    assert "semantic_datasource = :semantic_datasource" in normalized_query
+    assert "semantic_dialect = :semantic_dialect" in normalized_query
+    assert "semantic_version = :semantic_version" in normalized_query
     assert (
-        "semantic_content_sha256 = :expected_semantic_content_sha256"
+        "semantic_content_sha256 = :semantic_content_sha256"
         in normalized_query
     )
-    assert "governance_validated = 1" in normalized_query
     assert params["session_id"] == "session-a"
     assert params["generated_sql"] == "SELECT 1"
-    assert params["expected_user_query"] == "original question"
-    assert params["expected_semantic_datasource"] == "sales"
-    assert params["expected_semantic_dialect"] == "mysql"
-    assert params["expected_semantic_version"] == "1.0.0"
-    assert params["expected_semantic_content_sha256"] == "a" * 64
+    assert params["user_query"] == "original question"
+    assert params["semantic_datasource"] == "sales"
+    assert params["semantic_dialect"] == "mysql"
+    assert params["semantic_version"] == "1.0.0"
+    assert params["semantic_content_sha256"] == "a" * 64
 
 
 def test_history_governance_schema_migration_is_idempotent():
@@ -841,11 +851,20 @@ def test_history_governance_schema_migration_tolerates_concurrent_duplicates():
     assert client.execute_update.call_count == 6
 
 
-def test_mysql_save_history_binds_complete_governance_identity():
+def test_mysql_guarded_save_binds_complete_governance_identity():
     """The durable INSERT, not only the generator call, carries every identity field."""
     from core.history.mysql_client import MySQLClient
+    from core.history.proof import GovernedHistorySave, create_history_proof_pair
 
-    client = MySQLClient("localhost", 3306, "user", "password", "database")
+    issuer, verifier = create_history_proof_pair()
+    client = MySQLClient(
+        "localhost",
+        3306,
+        "user",
+        "password",
+        "database",
+        governance_proof_verifier=verifier,
+    )
     connection = Mock()
     connection.execute.return_value.lastrowid = 17
 
@@ -856,16 +875,20 @@ def test_mysql_save_history_binds_complete_governance_identity():
     client.get_connection = connection_context
     client._prune_history = Mock()
 
-    history_id = client.save_sql_history(
+    command = GovernedHistorySave(
+        session_id="session-a",
         user_query="订单金额",
         generated_sql="SELECT SUM(amount) FROM orders",
+        matched_knowledge_json=None,
+        retrieval_query=None,
         validation_status="success",
+        validation_error=None,
         semantic_datasource="sales",
         semantic_dialect="mysql",
         semantic_version="1.0.0",
         semantic_content_sha256="a" * 64,
-        governance_validated=True,
     )
+    history_id = client.save_governed_sql_history(command, issuer.issue(command))
 
     statement, params = connection.execute.call_args.args
     normalized_statement = " ".join(str(statement).split()).lower()
@@ -883,7 +906,7 @@ def test_mysql_save_history_binds_complete_governance_identity():
     assert params["semantic_dialect"] == "mysql"
     assert params["semantic_version"] == "1.0.0"
     assert params["semantic_content_sha256"] == "a" * 64
-    assert params["governance_validated"] is True
+    assert params["governance_validated"] is False
 
 
 def test_mysql_connect_migrates_history_before_reporting_success(monkeypatch):

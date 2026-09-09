@@ -63,5 +63,14 @@ class GovernedHistoryIdentity:
             and record.get("semantic_content_sha256") == self.content_sha256
         )
 
+    def matches_audit_identity(self, record: Mapping[str, Any]) -> bool:
+        """Match persisted identity fields without treating validation as proof."""
+        return bool(
+            record.get("semantic_datasource") == self.datasource
+            and record.get("semantic_dialect") == self.dialect
+            and record.get("semantic_version") == self.semantic_version
+            and record.get("semantic_content_sha256") == self.content_sha256
+        )
+
 
 __all__ = ["GovernedHistoryIdentity"]

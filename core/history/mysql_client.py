@@ -17,6 +17,12 @@ from sqlglot import exp, parse_one
 from ..config_validation import validate_history_max_records
 from ..sql.preflight import ExplainDeadlineExceeded, run_with_wall_clock_deadline
 from ..utils.log_sanitizer import mask_sensitive, sanitize_sql, truncate_log
+from .proof import (
+    GovernedHistoryFinalization,
+    GovernedHistorySave,
+    HistoryMutationProof,
+    HistoryProofVerifier,
+)
 
 _SEMANTIC_CONTENT_SHA256 = re.compile(r"[0-9a-f]{64}")
 _HISTORY_GOVERNANCE_COLUMNS = (
@@ -53,7 +59,8 @@ class MySQLClient:
 
     def __init__(self, host: str, port: int, user: str, password: str, database: str,
                  pool_size: int = 10, max_overflow: int = 20, pool_timeout: int = 30,
-                 history_max_records: int = 1000):
+                 history_max_records: int = 1000, *,
+                 governance_proof_verifier: HistoryProofVerifier | None = None):
         """
         初始化 MySQL 客户端
 
@@ -78,6 +85,7 @@ class MySQLClient:
         self.history_max_records = validate_history_max_records(
             history_max_records, key="history_max_records"
         )
+        self._governance_proof_verifier = governance_proof_verifier
         self.engine = None
 
     def connect(self) -> bool:
@@ -433,6 +441,13 @@ class MySQLClient:
         if not session_id:
             session_id = str(uuid.uuid4())
 
+        # This is the legacy/public writer. Persisted governance claims are audit
+        # metadata issued by the governed pipeline, never caller assertions.
+        semantic_datasource = None
+        semantic_dialect = None
+        semantic_version = None
+        semantic_content_sha256 = None
+        governance_validated = False
         self._validate_governance_identity(
             semantic_datasource=semantic_datasource,
             semantic_dialect=semantic_dialect,
@@ -475,6 +490,113 @@ class MySQLClient:
         except Exception as e:
             logger.error(f"保存 SQL 历史失败：{e}")
             return None
+
+    def save_governed_sql_history(
+        self,
+        command: GovernedHistorySave,
+        proof: HistoryMutationProof,
+    ) -> Optional[int]:
+        """Persist governed audit identity only with a matching one-use proof."""
+        verifier = self._governance_proof_verifier
+        if verifier is None or not verifier.consume(command, proof):
+            logger.warning("governed_history_save_rejected reason=invalid_proof")
+            return None
+        self._validate_governance_identity(
+            semantic_datasource=command.semantic_datasource,
+            semantic_dialect=command.semantic_dialect,
+            semantic_version=command.semantic_version,
+            semantic_content_sha256=command.semantic_content_sha256,
+            governance_validated=False,
+        )
+        params = {
+            "session_id": command.session_id,
+            "user_query": command.user_query,
+            "generated_sql": command.generated_sql,
+            "matched_knowledge": command.matched_knowledge_json,
+            "retrieval_query": command.retrieval_query,
+            "validation_status": command.validation_status,
+            "validation_error": command.validation_error,
+            "semantic_datasource": command.semantic_datasource,
+            "semantic_dialect": command.semantic_dialect,
+            "semantic_version": command.semantic_version,
+            "semantic_content_sha256": command.semantic_content_sha256,
+            "governance_validated": False,
+        }
+        query = """
+        INSERT INTO sql_generation_history
+        (session_id, user_query, generated_sql, matched_knowledge, retrieval_query,
+         validation_status, validation_error, semantic_datasource, semantic_dialect,
+         semantic_version, semantic_content_sha256, governance_validated)
+        VALUES (:session_id, :user_query, :generated_sql, :matched_knowledge, :retrieval_query,
+         :validation_status, :validation_error, :semantic_datasource, :semantic_dialect,
+         :semantic_version, :semantic_content_sha256, :governance_validated)
+        """
+        try:
+            with self.get_connection() as conn:
+                result = conn.execute(text(query), params)
+                history_id = result.lastrowid
+                logger.info("保存受治理 SQL 历史记录，ID={}", history_id)
+            self._prune_history()
+            return history_id
+        except Exception as exc:
+            safe_error = truncate_log(mask_sensitive(str(exc)), 160)
+            logger.error("保存受治理 SQL 历史失败：{}", safe_error)
+            return None
+
+    def finalize_governed_sql_execution(
+        self,
+        command: GovernedHistoryFinalization,
+        proof: HistoryMutationProof,
+    ) -> bool:
+        """Consume proof and CAS one pending governed audit row to a final state."""
+        verifier = self._governance_proof_verifier
+        if verifier is None or not verifier.consume(command, proof):
+            logger.warning("governed_history_update_rejected reason=invalid_proof")
+            return False
+        if command.execution_status not in {"success", "fail"}:
+            return False
+        self._validate_governance_identity(
+            semantic_datasource=command.semantic_datasource,
+            semantic_dialect=command.semantic_dialect,
+            semantic_version=command.semantic_version,
+            semantic_content_sha256=command.semantic_content_sha256,
+            governance_validated=False,
+        )
+        governance_validated = command.execution_status == "success"
+        query = """
+        UPDATE sql_generation_history
+        SET execution_status = :execution_status,
+            execution_error = :execution_error,
+            execution_result = :execution_result,
+            governance_validated = :governance_validated,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = :history_id
+          AND session_id = :session_id
+          AND user_query = :user_query
+          AND generated_sql = :generated_sql
+          AND validation_status = 'success'
+          AND execution_status = 'pending'
+          AND governance_validated = 0
+          AND semantic_datasource = :semantic_datasource
+          AND semantic_dialect = :semantic_dialect
+          AND semantic_version = :semantic_version
+          AND semantic_content_sha256 = :semantic_content_sha256
+        """
+        params = {
+            "history_id": command.history_id,
+            "session_id": command.session_id,
+            "user_query": command.user_query,
+            "generated_sql": command.generated_sql,
+            "execution_status": command.execution_status,
+            "execution_error": command.execution_error,
+            "execution_result": command.execution_result_json,
+            "semantic_datasource": command.semantic_datasource,
+            "semantic_dialect": command.semantic_dialect,
+            "semantic_version": command.semantic_version,
+            "semantic_content_sha256": command.semantic_content_sha256,
+            "governance_validated": governance_validated,
+        }
+        return self.execute_update(query, params) > 0
 
     @staticmethod
     def _validate_governance_identity(
@@ -548,7 +670,25 @@ class MySQLClient:
         Returns:
             bool: 是否成功
         """
-        predicates = ["id = :history_id"]
+        expected_identity = (
+            expected_semantic_datasource,
+            expected_semantic_dialect,
+            expected_semantic_version,
+            expected_semantic_content_sha256,
+        )
+        if require_governance_validated or any(
+            value is not None for value in expected_identity
+        ):
+            logger.warning("legacy_history_update_rejected reason=governed_arguments")
+            return False
+        predicates = [
+            "id = :history_id",
+            "(governance_validated = 0 OR governance_validated IS NULL)",
+            "semantic_datasource IS NULL",
+            "semantic_dialect IS NULL",
+            "semantic_version IS NULL",
+            "semantic_content_sha256 IS NULL",
+        ]
         if session_id is not None:
             predicates.append("session_id = :session_id")
         if generated_sql is not None:
@@ -557,32 +697,6 @@ class MySQLClient:
             predicates.append("user_query = :expected_user_query")
         if require_validation_success:
             predicates.append("validation_status = 'success'")
-        expected_identity = (
-            expected_semantic_datasource,
-            expected_semantic_dialect,
-            expected_semantic_version,
-            expected_semantic_content_sha256,
-        )
-        if any(value is not None for value in expected_identity):
-            self._validate_governance_identity(
-                semantic_datasource=expected_semantic_datasource,
-                semantic_dialect=expected_semantic_dialect,
-                semantic_version=expected_semantic_version,
-                semantic_content_sha256=expected_semantic_content_sha256,
-                governance_validated=require_governance_validated,
-            )
-            predicates.extend(
-                (
-                    "semantic_datasource = :expected_semantic_datasource",
-                    "semantic_dialect = :expected_semantic_dialect",
-                    "semantic_version = :expected_semantic_version",
-                    "semantic_content_sha256 = :expected_semantic_content_sha256",
-                )
-            )
-        elif require_governance_validated:
-            raise ValueError("governed update requires a semantic identity")
-        if require_governance_validated:
-            predicates.append("governance_validated = 1")
         where_clause = " AND ".join(predicates)
         query = f"""
         UPDATE sql_generation_history
@@ -605,17 +719,6 @@ class MySQLClient:
             params["generated_sql"] = generated_sql
         if expected_user_query is not None:
             params["expected_user_query"] = expected_user_query
-        if any(value is not None for value in expected_identity):
-            params.update(
-                {
-                    "expected_semantic_datasource": expected_semantic_datasource,
-                    "expected_semantic_dialect": expected_semantic_dialect,
-                    "expected_semantic_version": expected_semantic_version,
-                    "expected_semantic_content_sha256": (
-                        expected_semantic_content_sha256
-                    ),
-                }
-            )
         result = self.execute_update(query, params)
         return result > 0
 

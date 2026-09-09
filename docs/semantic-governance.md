@@ -102,7 +102,21 @@ python -m streamlit run app.py
 原子删除；达到上限会稳定地拒绝新请求。受治理历史 binding 默认 900 秒过期，
 容量不超过 `HISTORY_MAX_RECORDS`（并有 4096 的进程内硬上限），只保存带进程随机密钥
 的会话、问题和规范化 SQL 摘要，不保留这些字段的明文。binding 在一次匹配的执行尝试
-开始时即消费；数据库历史本身按 `HISTORY_MAX_RECORDS`（1–10000，默认 1000）持续裁剪。
+开始时即消费；业务数据库失败或历史状态 CAS 失败也不能用同一 history ID 重试。
+数据库历史本身按 `HISTORY_MAX_RECORDS`（1–10000，默认 1000）持续裁剪。
+
+受治理历史写入另有一对仅存在于当前进程内的 HMAC issuer/verifier。公共
+`save_sql_history(...)` 始终写入 `governance_validated=false` 且治理身份为 `NULL`；
+公共 legacy 执行更新也只允许命中未治理行。治理生成器使用一次性、短时 proof 写入
+完整审计身份，但该行仍保持未治理；只有真实业务查询成功后，proof-backed
+`pending → success` CAS 才会同时置为 `governance_validated=true`。无需部署或迁移持久
+密钥，已有治理身份列保持不变。
+
+数据库中的治理字段只用于审计与 CAS 谓词，不是运行时证明。启用治理时，启动、
+治理重载和 embedding 重载均不会从持久 SQL 历史恢复 Few-Shot；索引从空集开始，
+只接收当前进程中“重新授权成功 + 真实执行成功 + CAS 成功”的即时晋升。其安全成本是
+冷启动或上述重载会丢失此前 Few-Shot 学习，需要新的成功执行重新积累；关闭治理时仍
+保留 legacy 历史加载兼容性。
 
 ```python
 context.reload_governance(
@@ -127,7 +141,9 @@ context.reload_governance(
 只有全部阶段通过时结果才是 `status: "success"`、`executable: true`。公共结果同时携带
 `semantic_version` 与 64 位小写 `content_sha256`。执行前会用当前激活快照重新授权，
 并同时核对生成时绑定的原问题、版本和内容摘要；任一身份变化、上下文缺失或 SQL
-重新校验失败都会拒绝执行。启用预检时，MySQL `EXPLAIN` 的数据库错误、墙钟超时、
+重新校验失败都会拒绝执行。携带 history ID 的受治理执行还必须持有同一生成器进程
+颁发且尚未消费的本地 binding；重启后即使持久行身份完整，也会以
+`HISTORY_CONTEXT_MISMATCH` 失败关闭，调用方必须重新生成。启用预检时，MySQL `EXPLAIN` 的数据库错误、墙钟超时、
 空计划或超过阈值的估算扫描行数都会阻断执行；超时连接会失效并关闭，不会提交或回池复用。
 
 ## 6. 回滚

@@ -28,6 +28,12 @@ class ApplicationContext:
             config: 配置字典（从 config.py 读取）
         """
         self.config = config
+        from core.history.proof import create_history_proof_pair
+
+        (
+            self._history_proof_issuer,
+            self._history_proof_verifier,
+        ) = create_history_proof_pair()
         self._initialized = False
         self._initialization_error = None
 
@@ -170,6 +176,7 @@ class ApplicationContext:
             max_overflow=self.config.get('mysql_max_overflow', 20),
             pool_timeout=self.config.get('mysql_pool_timeout', 30),
             history_max_records=self.config.get('history_max_records', 1000),
+            governance_proof_verifier=self._history_proof_verifier,
         )
         if not self._mysql_client.connect():
             logger.warning("MySQL 连接失败，历史记录功能可能不可用")
@@ -334,6 +341,7 @@ class ApplicationContext:
                 if self._neo4j_client and self._neo4j_client.driver else None
             ),
             correctness_pipeline=correctness_pipeline,
+            history_proof_issuer=self._history_proof_issuer,
         )
 
     def _init_sql_generator(self):
@@ -490,36 +498,14 @@ class ApplicationContext:
                     })
         if documents:
             retriever.retriever.index_documents(documents, metadata_list)
-        if (
-            config.get('few_shot_enabled', True)
-            and self._mysql_client
-            and self._mysql_client.engine
-        ):
-            identity, retrieval_fields = self._governed_history_retrieval_fields(
-                correctness_pipeline
-            )
-            records = self._mysql_client.get_successful_history_for_few_shot(
-                limit=100,
-                **retrieval_fields,
-            )
-            if identity is None:
-                retriever.build_few_shot_index(records)
-            else:
-                retriever.build_few_shot_index(
-                    records,
-                    governance_identity=identity,
+        if config.get('few_shot_enabled', True):
+            if correctness_pipeline is not None:
+                retriever.build_few_shot_index([])
+            elif self._mysql_client and self._mysql_client.engine:
+                records = self._mysql_client.get_successful_history_for_few_shot(
+                    limit=100,
                 )
-
-    @staticmethod
-    def _governed_history_retrieval_fields(correctness_pipeline):
-        if correctness_pipeline is None:
-            return None, {}
-        from core.history.identity import GovernedHistoryIdentity
-
-        identity = GovernedHistoryIdentity.from_snapshot(
-            correctness_pipeline.registry.get_snapshot()
-        )
-        return identity, identity.retrieval_fields()
+                retriever.build_few_shot_index(records)
 
     def _load_knowledge_base(self):
         """加载知识库到检索器；磁盘索引缓存需显式开启以避免读到旧图谱。"""
@@ -588,23 +574,16 @@ class ApplicationContext:
         """从已验证或执行成功的历史记录构建 Few-Shot 索引。"""
         if not self.config.get('few_shot_enabled', True):
             return
+        if self._correctness_pipeline is not None:
+            self._knowledge_retriever.build_few_shot_index([])
+            return
         if not self._mysql_client or not self._mysql_client.engine:
             return
         try:
-            identity, retrieval_fields = self._governed_history_retrieval_fields(
-                self._correctness_pipeline
-            )
             records = self._mysql_client.get_successful_history_for_few_shot(
                 limit=100,
-                **retrieval_fields,
             )
-            if identity is None:
-                self._knowledge_retriever.build_few_shot_index(records)
-            else:
-                self._knowledge_retriever.build_few_shot_index(
-                    records,
-                    governance_identity=identity,
-                )
+            self._knowledge_retriever.build_few_shot_index(records)
         except Exception as e:
             logger.warning(f"Few-Shot 索引加载失败：{e}")
 
