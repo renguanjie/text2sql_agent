@@ -1919,7 +1919,7 @@ def test_governance_accepts_nested_model_dir_inside_project_anchor(
     assert pipeline.registry is registry
 
 
-def test_reload_rejects_explain_without_governance_and_keeps_live_components():
+def test_governance_reload_rejects_cross_domain_key_before_partial_validation():
     from core.app_context import ApplicationConfigurationError, ApplicationContext
 
     context = ApplicationContext({"semantic_governance_enabled": False})
@@ -1937,8 +1937,7 @@ def test_reload_rejects_explain_without_governance_and_keeps_live_components():
         )
 
     message = str(error.value)
-    assert "SQL_EXPLAIN_ENABLED" in message
-    assert "SEMANTIC_GOVERNANCE_ENABLED" in message
+    assert "reload_llm" in message
     assert "do-not-leak-this-secret" not in message
     assert context.config == {"semantic_governance_enabled": False}
     assert context.semantic_registry is old_registry

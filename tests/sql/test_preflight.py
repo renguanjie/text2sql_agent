@@ -57,6 +57,36 @@ def test_mysql_explain_rejects_non_positive_timeout_before_database_execution():
         client.explain_query("SELECT 1", timeout_ms=0)
 
 
+def test_preflight_constructor_rejects_invalid_limits_before_any_check():
+    """Catches invalid startup/reload limits being normalized into EXPLAIN_FAILED."""
+    from core.sql.preflight import MySQLExplainPreflight
+
+    client = Mock()
+
+    with pytest.raises(ValueError, match="timeout_ms 必须大于 0"):
+        MySQLExplainPreflight(client, timeout_ms=0, max_estimated_rows=-1)
+
+    client.explain_query.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("timeout_ms", "max_estimated_rows"),
+    [(True, 0), (3000, True), (3000, "0")],
+)
+def test_preflight_constructor_requires_strict_integer_limits(
+    timeout_ms, max_estimated_rows
+):
+    """Catches bools and strings silently becoming safe-looking preflight limits."""
+    from core.sql.preflight import MySQLExplainPreflight
+
+    with pytest.raises(ValueError):
+        MySQLExplainPreflight(
+            Mock(),
+            timeout_ms=timeout_ms,
+            max_estimated_rows=max_estimated_rows,
+        )
+
+
 def test_mysql_explain_rejects_non_select_before_database_execution():
     """Catches a preflight adapter that lets writes reach EXPLAIN."""
     from core.history.mysql_client import MySQLClient

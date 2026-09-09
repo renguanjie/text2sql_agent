@@ -27,6 +27,14 @@ source .venv/bin/activate
 | `SQL_EXPLAIN_ENABLED` | `false` | 设为 `true` 时必须同时启用 `SEMANTIC_GOVERNANCE_ENABLED=true`。 |
 | `SQL_EXPLAIN_TIMEOUT_MS` | `3000` | 必须大于 `0`，单位毫秒。 |
 | `SQL_EXPLAIN_MAX_ESTIMATED_ROWS` | `0` | 不得为负；`0` 表示不因估算扫描行数拒绝。 |
+| `SQL_MAX_LENGTH` | `2000` | 必须是 `1`–`100000` 的整数。 |
+| `SQL_QUERY_MAX_ROWS` | `500` | 必须是 `1`–`100000` 的整数。 |
+| `SQL_QUERY_TIMEOUT_MS` | `10000` | 必须是 `1`–`3600000` 的整数，单位毫秒。 |
+| `PROMPT_MAX_LENGTH` | `4000` | 必须是 `1`–`100000` 的整数。 |
+| `MAX_PREPARED_REQUESTS` | `256` | 治理 capability 容量，必须是 `1`–`4096` 的整数。 |
+| `PREPARED_REQUEST_TTL_SECONDS` | `120` | 治理 capability TTL，必须大于 `0` 且不超过 `3600` 秒。 |
+| `GOVERNED_HISTORY_BINDING_TTL_SECONDS` | `900` | 治理历史 binding TTL，必须大于 `0` 且不超过 `3600` 秒。 |
+| `HISTORY_MAX_RECORDS` | `1000` | 必须是 `1`–`10000` 的整数；也限制进程内治理历史 binding 容量。 |
 
 所有布尔环境变量只接受不区分大小写的 `true` 或 `false`（允许首尾空白）；
 `1`、`0`、`yes`、`on` 及拼写错误都会让启动或热重载失败。错误只指出变量名，
@@ -112,7 +120,9 @@ SQL_EXPLAIN_MAX_ESTIMATED_ROWS=100000 \
 python -m streamlit run app.py
 ```
 
-现有进程可由拥有 `ApplicationContext` 的运维代码调用 `reload_governance(...)`。它会先候选构建（编译、加载、校验、新生成器），成功后一次替换注册表/管线/生成器；失败时旧的不可变对象图继续服务。
+现有进程可由拥有 `ApplicationContext` 的运维代码调用 `reload_governance(...)`。它只接受语义开关、模型目录/数据源、语义上下文预算、一次修复、EXPLAIN、治理 SQL 方言与限制、以及治理 capability/history binding 限制；会先候选构建（编译、加载、校验、新检索器/生成器），成功后一次替换对象图；失败时旧的不可变对象图继续服务。`sql_dialect` 在该热重载中会一并重建 SQL chain。
+
+LLM 的 provider/model/key/base URL 必须使用 `reload_llm(...)`；Embedding 的 provider/model/key/base/dimension 必须使用 `reload_embedding(...)`。检索预算、连接、普通运行时开关等其他配置不能通过 `reload_governance(...)` 部分发布，必须完整重启应用。
 
 生成阶段的 prepared capability 默认最多保留 256 个、120 秒，并在消费或放弃时
 原子删除；达到上限会稳定地拒绝新请求。受治理历史 binding 默认 900 秒过期，
@@ -145,6 +155,9 @@ context.reload_governance(
     sql_explain_enabled=False,
     sql_explain_timeout_ms=3000,
     sql_explain_max_estimated_rows=0,
+    max_prepared_requests=256,
+    prepared_request_ttl_seconds=120,
+    governed_history_binding_ttl_seconds=900,
 )
 ```
 

@@ -99,6 +99,83 @@ raise SystemExit(0)
     assert secret_value not in output
 
 
+@pytest.mark.parametrize(
+    ("key", "raw"),
+    [
+        ("SQL_MAX_LENGTH", "100001"),
+        ("SQL_QUERY_MAX_ROWS", "0"),
+        ("SQL_QUERY_TIMEOUT_MS", "0"),
+        ("PROMPT_MAX_LENGTH", "0"),
+        ("SEMANTIC_CONTEXT_MAX_CHARS", "0"),
+        ("SEMANTIC_CONTEXT_MAX_ITEMS", "0"),
+        ("SQL_REPAIR_MAX_ATTEMPTS", "2"),
+        ("SQL_EXPLAIN_TIMEOUT_MS", "0"),
+        ("SQL_EXPLAIN_MAX_ESTIMATED_ROWS", "-1"),
+    ],
+)
+def test_runtime_limit_environment_rejects_invalid_documented_values(
+    key: str, raw: str
+):
+    """Startup uses the same bounded numeric contract as runtime reloads."""
+    result = _run_config_script("import config", **{key: raw})
+
+    assert result.returncode != 0
+    assert key in result.stdout + result.stderr
+
+
+def test_integer_environment_parser_does_not_echo_invalid_value():
+    secret_value = "not-an-integer-secret"
+    result = _run_config_script("import config", SQL_QUERY_TIMEOUT_MS=secret_value)
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "SQL_QUERY_TIMEOUT_MS" in output
+    assert secret_value not in output
+
+
+@pytest.mark.parametrize(
+    ("config", "key"),
+    [
+        ({"sql_explain_timeout_ms": 0}, "SQL_EXPLAIN_TIMEOUT_MS"),
+        ({"sql_explain_max_estimated_rows": -1}, "SQL_EXPLAIN_MAX_ESTIMATED_ROWS"),
+        ({"sql_max_length": 100_001}, "SQL_MAX_LENGTH"),
+        ({"sql_query_max_rows": 0}, "SQL_QUERY_MAX_ROWS"),
+        ({"sql_query_timeout_ms": 0}, "SQL_QUERY_TIMEOUT_MS"),
+        ({"prompt_max_length": 0}, "PROMPT_MAX_LENGTH"),
+        ({"semantic_context_max_chars": 0}, "SEMANTIC_CONTEXT_MAX_CHARS"),
+        ({"semantic_context_max_items": 0}, "SEMANTIC_CONTEXT_MAX_ITEMS"),
+        ({"sql_repair_max_attempts": 2}, "SQL_REPAIR_MAX_ATTEMPTS"),
+        ({"max_prepared_requests": 4097}, "MAX_PREPARED_REQUESTS"),
+        ({"prepared_request_ttl_seconds": 0}, "PREPARED_REQUEST_TTL_SECONDS"),
+        (
+            {"governed_history_binding_ttl_seconds": 3601},
+            "GOVERNED_HISTORY_BINDING_TTL_SECONDS",
+        ),
+    ],
+)
+def test_runtime_numeric_validation_rejects_unsafe_limits(config: dict, key: str):
+    """Reload validation must enforce every bounded runtime safety limit."""
+    from core.config_validation import (
+        RuntimeConfigurationError,
+        validate_runtime_config,
+    )
+
+    with pytest.raises(RuntimeConfigurationError, match=key):
+        validate_runtime_config(config)
+
+
+@pytest.mark.parametrize("value", [True, "2000"])
+def test_runtime_integer_validation_rejects_bool_and_string_values(value):
+    """Only the environment parser may turn strings into runtime integers."""
+    from core.config_validation import (
+        RuntimeConfigurationError,
+        validate_runtime_config,
+    )
+
+    with pytest.raises(RuntimeConfigurationError, match="SQL_MAX_LENGTH"):
+        validate_runtime_config({"sql_max_length": value})
+
+
 def test_postgres_remains_valid_when_governance_and_explain_are_disabled():
     result = _run_config_script(
         "import config; print(config.SQL_DIALECT)",
@@ -190,6 +267,102 @@ def test_runtime_reload_rejects_non_mysql_governance_with_safe_error():
     assert "SEMANTIC_GOVERNANCE_ENABLED" in message
     assert "postgres-secret-value" not in message
     assert context.config["semantic_governance_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("updates", "hint"),
+    [
+        ({"llm_model": "candidate-model"}, "reload_llm"),
+        ({"embedding_model": "candidate-model"}, "reload_embedding"),
+        ({"retrieval_top_k": 8}, "完整重启"),
+    ],
+)
+def test_governance_reload_rejects_cross_domain_updates_before_candidate_build(
+    monkeypatch: pytest.MonkeyPatch, updates: dict, hint: str
+):
+    """Cross-domain keys must never publish a graph built around stale components."""
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    context = ApplicationContext(
+        {
+            "semantic_governance_enabled": False,
+            "sql_explain_enabled": False,
+            "sql_dialect": "mysql",
+        }
+    )
+    old_generator = object()
+    context._llm = object()
+    context._embedding_factory = object()
+    context._sql_chain = object()
+    context._sql_generator = old_generator
+    context._build_governance_components = lambda _config: (None, None)
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: object(),
+    )
+
+    with pytest.raises(ApplicationConfigurationError, match=hint):
+        context.reload_governance(**updates)
+
+    assert context.sql_generator is old_generator
+    assert context.config == {
+        "semantic_governance_enabled": False,
+        "sql_explain_enabled": False,
+        "sql_dialect": "mysql",
+    }
+
+
+def test_governance_dialect_reload_rebuilds_the_sql_chain(monkeypatch):
+    """A newly governed dialect cannot reuse a chain built for another dialect."""
+    import core.chain.sql_chain
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationContext
+
+    old_chain = object()
+    new_chain = object()
+    candidate_registry = object()
+    candidate_pipeline = type("Pipeline", (), {"registry": candidate_registry})()
+    candidate_retriever = object()
+    context = ApplicationContext(
+        {
+            "semantic_governance_enabled": False,
+            "sql_explain_enabled": False,
+            "sql_dialect": "postgres",
+        }
+    )
+    context._llm = object()
+    context._embedding_factory = object()
+    context._sql_chain = old_chain
+    context._build_governance_components = lambda _config: (
+        candidate_registry,
+        candidate_pipeline,
+    )
+    monkeypatch.setattr(
+        core.chain.sql_chain,
+        "SQLGenerationChain",
+        lambda **_kwargs: new_chain,
+    )
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: candidate_retriever,
+    )
+    monkeypatch.setattr(context, "_populate_retriever", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        context,
+        "_build_sql_generator",
+        lambda **components: type("Generator", (), components)(),
+    )
+
+    context.reload_governance(
+        semantic_governance_enabled=True,
+        sql_dialect="mysql",
+    )
+
+    assert context.sql_chain is new_chain
+    assert context.sql_generator.sql_chain is new_chain
 
 
 @pytest.mark.parametrize("raw", ["0", "-1", "10001"])

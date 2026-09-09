@@ -31,6 +31,26 @@ _EMBEDDING_RELOAD_KEYS = frozenset({
     "embedding_api_base",
     "faiss_embedding_dim",
 })
+_GOVERNANCE_RELOAD_KEYS = frozenset({
+    "semantic_governance_enabled",
+    "semantic_model_dir",
+    "semantic_datasource",
+    "semantic_context_max_chars",
+    "semantic_context_max_items",
+    "sql_repair_max_attempts",
+    "sql_explain_enabled",
+    "sql_explain_timeout_ms",
+    "sql_explain_max_estimated_rows",
+    "sql_dialect",
+    "sql_max_length",
+    "sql_query_max_rows",
+    "sql_query_timeout_ms",
+    "sql_scope_enforcement",
+    "sql_blocked_tables",
+    "max_prepared_requests",
+    "prepared_request_ttl_seconds",
+    "governed_history_binding_ttl_seconds",
+})
 
 
 class _FrozenList(tuple):
@@ -451,6 +471,10 @@ class ApplicationContext:
                 max_repair_attempts=config.get('sql_repair_max_attempts', 1),
                 blocked_tables=tuple(config.get('sql_blocked_tables') or ()),
                 max_sql_length=config.get('sql_max_length', 2000),
+                max_prepared_requests=config.get('max_prepared_requests', 256),
+                prepared_request_ttl_seconds=config.get(
+                    'prepared_request_ttl_seconds', 120.0
+                ),
             )
             return registry, pipeline
         except Exception as exc:
@@ -508,9 +532,18 @@ class ApplicationContext:
         if set(updates) <= allowed_keys:
             return
         allowed = ", ".join(sorted(allowed_keys))
+        if reload_name == "reload_governance":
+            guidance = (
+                "LLM 配置请使用 reload_llm；Embedding 配置请使用 "
+                "reload_embedding；其他运行时配置请完整重启"
+            )
+        else:
+            guidance = (
+                "语义治理配置请使用 reload_governance；"
+                "其他运行时配置请完整重启"
+            )
         raise ApplicationConfigurationError(
-            f"{reload_name} 仅支持更新 {allowed}；"
-            "治理及其他运行时配置请使用 reload_governance"
+            f"{reload_name} 仅支持更新 {allowed}；{guidance}"
         )
 
     def _snapshot_component_graph(self) -> _ComponentGraphSnapshot:
@@ -719,6 +752,10 @@ class ApplicationContext:
     def reload_governance(self, **updates: Any) -> None:
         """Candidate-build governance and atomically replace registry/generator."""
         with self._reload_lock:
+            self._validate_reload_updates(
+                "reload_governance", updates, _GOVERNANCE_RELOAD_KEYS
+            )
+            from core.chain.sql_chain import SQLGenerationChain
             from core.retrieval.bm25_tfidf import KnowledgeRetriever
 
             snapshot = self._snapshot_component_graph()
@@ -726,6 +763,14 @@ class ApplicationContext:
             candidate_registry, candidate_pipeline = (
                 self._build_governance_components(candidate_config)
             )
+            candidate_chain = snapshot.sql_chain
+            if "sql_dialect" in updates:
+                candidate_chain = SQLGenerationChain(
+                    llm=snapshot.llm,
+                    dialect=candidate_config.get('sql_dialect', 'mysql'),
+                    retrieval_top_k=candidate_config.get('retrieval_top_k', 5),
+                    prompt_max_length=candidate_config.get('prompt_max_length', 4000),
+                )
             candidate_retriever = KnowledgeRetriever(
                 config=self._retriever_config(candidate_config),
                 embedding_factory=snapshot.embedding_factory,
@@ -733,7 +778,7 @@ class ApplicationContext:
             candidate_generator = self._build_sql_generator(
                 llm=snapshot.llm,
                 knowledge_retriever=candidate_retriever,
-                sql_chain=snapshot.sql_chain,
+                sql_chain=candidate_chain,
                 config=candidate_config,
                 correctness_pipeline=candidate_pipeline,
             )
@@ -741,7 +786,7 @@ class ApplicationContext:
                 candidate_config,
                 llm=snapshot.llm,
                 knowledge_retriever=candidate_retriever,
-                sql_chain=snapshot.sql_chain,
+                sql_chain=candidate_chain,
                 semantic_registry=candidate_registry,
                 correctness_pipeline=candidate_pipeline,
                 sql_generator=candidate_generator,
@@ -757,7 +802,7 @@ class ApplicationContext:
                 llm=snapshot.llm,
                 embedding_factory=snapshot.embedding_factory,
                 knowledge_retriever=candidate_retriever,
-                sql_chain=snapshot.sql_chain,
+                sql_chain=candidate_chain,
                 semantic_registry=candidate_registry,
                 correctness_pipeline=candidate_pipeline,
                 sql_generator=candidate_generator,
@@ -934,6 +979,9 @@ def create_app_context_from_env() -> ApplicationContext:
         'mysql_max_overflow': config.MYSQL_MAX_OVERFLOW,
         'mysql_pool_timeout': config.MYSQL_POOL_TIMEOUT,
         'history_max_records': config.HISTORY_MAX_RECORDS,
+        'governed_history_binding_ttl_seconds': (
+            config.GOVERNED_HISTORY_BINDING_TTL_SECONDS
+        ),
         # Neo4j
         'neo4j_enabled': config.NEO4J_ENABLED,
         'neo4j_uri': config.NEO4J_URI,
@@ -991,4 +1039,6 @@ def create_app_context_from_env() -> ApplicationContext:
         'sql_explain_enabled': config.SQL_EXPLAIN_ENABLED,
         'sql_explain_timeout_ms': config.SQL_EXPLAIN_TIMEOUT_MS,
         'sql_explain_max_estimated_rows': config.SQL_EXPLAIN_MAX_ESTIMATED_ROWS,
+        'max_prepared_requests': config.MAX_PREPARED_REQUESTS,
+        'prepared_request_ttl_seconds': config.PREPARED_REQUEST_TTL_SECONDS,
     })

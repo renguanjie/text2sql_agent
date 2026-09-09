@@ -31,7 +31,7 @@ def run_with_wall_clock_deadline(
     operation: Callable[[Event], _T], timeout_ms: int
 ) -> _T:
     """Run blocking EXPLAIN work with a prompt and globally bounded deadline."""
-    if type(timeout_ms) is not int or timeout_ms <= 0:
+    if not isinstance(timeout_ms, int) or isinstance(timeout_ms, bool) or timeout_ms <= 0:
         raise ValueError("timeout_ms 必须大于 0")
     if not _DEADLINE_SLOTS.acquire(blocking=False):
         raise ExplainDeadlineExceeded("EXPLAIN deadline worker capacity exhausted")
@@ -90,6 +90,18 @@ class MySQLExplainPreflight:
         timeout_ms: int = 3000,
         max_estimated_rows: int = 0,
     ):
+        if (
+            not isinstance(timeout_ms, int)
+            or isinstance(timeout_ms, bool)
+            or timeout_ms <= 0
+        ):
+            raise ValueError("timeout_ms 必须大于 0")
+        if (
+            not isinstance(max_estimated_rows, int)
+            or isinstance(max_estimated_rows, bool)
+            or max_estimated_rows < 0
+        ):
+            raise ValueError("max_estimated_rows 必须是非负整数")
         self.client = client
         self.timeout_ms = timeout_ms
         self.max_estimated_rows = max_estimated_rows
