@@ -2,10 +2,13 @@
 应用上下文 - 统一管理所有组件的生命周期
 替代原有的全局单例模式
 """
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict
+from types import MappingProxyType
+from typing import Any, Dict, cast
 
 from loguru import logger
 
@@ -30,6 +33,90 @@ _EMBEDDING_RELOAD_KEYS = frozenset({
 })
 
 
+class _FrozenList(tuple):
+    """Immutable list representation that can be thawed back to a list."""
+
+
+class _FrozenTuple(tuple):
+    """Immutable tuple representation that preserves the source container."""
+
+
+class _FrozenSet(frozenset):
+    """Immutable set representation that can be thawed back to a set."""
+
+
+class _FrozenFrozenSet(frozenset):
+    """Immutable frozenset representation preserving the source container."""
+
+
+def _freeze_config_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            deepcopy(key): _freeze_config_value(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, _FrozenList):
+        return _FrozenList(_freeze_config_value(item) for item in value)
+    if isinstance(value, _FrozenTuple):
+        return _FrozenTuple(_freeze_config_value(item) for item in value)
+    if isinstance(value, list):
+        return _FrozenList(_freeze_config_value(item) for item in value)
+    if isinstance(value, tuple):
+        return _FrozenTuple(_freeze_config_value(item) for item in value)
+    if isinstance(value, _FrozenSet):
+        return _FrozenSet(_freeze_config_value(item) for item in value)
+    if isinstance(value, _FrozenFrozenSet):
+        return _FrozenFrozenSet(_freeze_config_value(item) for item in value)
+    if isinstance(value, set):
+        return _FrozenSet(_freeze_config_value(item) for item in value)
+    if isinstance(value, frozenset):
+        return _FrozenFrozenSet(_freeze_config_value(item) for item in value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return deepcopy(value)
+
+
+def _thaw_config_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            deepcopy(key): _thaw_config_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, _FrozenList):
+        return [_thaw_config_value(item) for item in value]
+    if isinstance(value, _FrozenTuple):
+        return tuple(_thaw_config_value(item) for item in value)
+    if isinstance(value, list):
+        return [_thaw_config_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_thaw_config_value(item) for item in value)
+    if isinstance(value, _FrozenSet):
+        return {_thaw_config_value(item) for item in value}
+    if isinstance(value, _FrozenFrozenSet):
+        return frozenset(_thaw_config_value(item) for item in value)
+    if isinstance(value, set):
+        return {_thaw_config_value(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_thaw_config_value(item) for item in value)
+    return deepcopy(value)
+
+
+def _freeze_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    return cast(Mapping[str, Any], _freeze_config_value(config))
+
+
+def _thaw_config(config: Mapping[str, Any]) -> Dict[str, Any]:
+    return cast(Dict[str, Any], _thaw_config_value(config))
+
+
+def _merge_config(
+    config: Mapping[str, Any], updates: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    merged = _thaw_config(config)
+    merged.update(cast(Dict[str, Any], _thaw_config_value(updates)))
+    return _freeze_config(merged)
+
+
 class ApplicationConfigurationError(ValueError):
     """Stable public error raised for invalid application configuration."""
 
@@ -38,7 +125,7 @@ class ApplicationConfigurationError(ValueError):
 class _ComponentGraphSnapshot:
     """One internally consistent application graph used to build a reload."""
 
-    config: Dict[str, Any]
+    config: Mapping[str, Any]
     llm: Any
     embedding_factory: Any
     knowledge_retriever: Any
@@ -51,7 +138,7 @@ class _ComponentGraphSnapshot:
 class ApplicationContext:
     """应用上下文 - 统一管理 LLM、数据库、检索器等组件"""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Mapping[str, Any]):
         """
         初始化应用上下文
 
@@ -59,7 +146,7 @@ class ApplicationContext:
             config: 配置字典（从 config.py 读取）
         """
         self._reload_lock = RLock()
-        self._config = config
+        self._config = _freeze_config(config)
         from core.history.proof import create_history_proof_pair
 
         (
@@ -81,14 +168,16 @@ class ApplicationContext:
         self._correctness_pipeline = None
 
     @property
-    def config(self):
+    def config(self) -> Dict[str, Any]:
         with self._reload_lock:
-            return self._config
+            return _thaw_config(self._config)
 
     @config.setter
-    def config(self, value):
+    def config(self, _value: Mapping[str, Any]) -> None:
         with self._reload_lock:
-            self._config = value
+            raise ApplicationConfigurationError(
+                "config 是只读快照；请使用 reload 方法更新配置"
+            )
 
     @property
     def llm(self):
@@ -153,7 +242,7 @@ class ApplicationContext:
         logger.info("开始初始化系统组件...")
 
         try:
-            self._validate_candidate_config(self.config)
+            self._validate_candidate_config(self._config)
             self._init_llm()
             self._init_neo4j()
             self._init_mysql()
@@ -187,29 +276,29 @@ class ApplicationContext:
         """初始化 LLM"""
         from core.llm_factory import create_llm
         self._llm = create_llm(
-            provider=self.config.get('llm_provider', 'openai'),
-            model=self.config.get('llm_model', 'gpt-4'),
-            api_key=self.config.get('llm_api_key', ''),
-            base_url=self.config.get('llm_base_url', '')
+            provider=self._config.get('llm_provider', 'openai'),
+            model=self._config.get('llm_model', 'gpt-4'),
+            api_key=self._config.get('llm_api_key', ''),
+            base_url=self._config.get('llm_base_url', '')
         )
-        logger.info(f"LLM 初始化成功：{self.config.get('llm_provider')}/{self.config.get('llm_model')}")
+        logger.info(f"LLM 初始化成功：{self._config.get('llm_provider')}/{self._config.get('llm_model')}")
 
     def _init_neo4j(self):
         """初始化 Neo4j 客户端"""
         from core.knowledge.neo4j_client import Neo4jClient
         self._neo4j_client = Neo4jClient(
-            uri=self.config.get('neo4j_uri', 'bolt://localhost:7687'),
-            user=self.config.get('neo4j_user', 'neo4j'),
-            password=self.config.get('neo4j_password', 'neo4j@123'),
-            database=self.config.get('neo4j_database', 'neo4j'),
-            max_connection_pool_size=self.config.get('neo4j_max_pool_size', 50),
-            connection_timeout=self.config.get('neo4j_connection_timeout', 30),
-            graph_max_nodes=self.config.get('graph_max_nodes', 10000),
-            graph_max_edges=self.config.get('graph_max_edges', 20000),
-            graph_max_depth=self.config.get('graph_max_depth', 20),
-            graph_max_string_length=self.config.get('graph_max_string_length', 10000),
+            uri=self._config.get('neo4j_uri', 'bolt://localhost:7687'),
+            user=self._config.get('neo4j_user', 'neo4j'),
+            password=self._config.get('neo4j_password', 'neo4j@123'),
+            database=self._config.get('neo4j_database', 'neo4j'),
+            max_connection_pool_size=self._config.get('neo4j_max_pool_size', 50),
+            connection_timeout=self._config.get('neo4j_connection_timeout', 30),
+            graph_max_nodes=self._config.get('graph_max_nodes', 10000),
+            graph_max_edges=self._config.get('graph_max_edges', 20000),
+            graph_max_depth=self._config.get('graph_max_depth', 20),
+            graph_max_string_length=self._config.get('graph_max_string_length', 10000),
         )
-        neo4j_enabled = self.config.get('neo4j_enabled', False)
+        neo4j_enabled = self._config.get('neo4j_enabled', False)
         if neo4j_enabled:
             if not self._neo4j_client.connect():
                 logger.warning("Neo4j 连接失败，将使用 MySQL 元数据模式")
@@ -220,15 +309,15 @@ class ApplicationContext:
         """初始化 MySQL 客户端"""
         from core.history.mysql_client import MySQLClient
         self._mysql_client = MySQLClient(
-            host=self.config.get('mysql_host', 'localhost'),
-            port=self.config.get('mysql_port', 3306),
-            user=self.config.get('mysql_user', 'root'),
-            password=self.config.get('mysql_password', 'root'),
-            database=self.config.get('mysql_database', 'text2sql_db'),
-            pool_size=self.config.get('mysql_pool_size', 10),
-            max_overflow=self.config.get('mysql_max_overflow', 20),
-            pool_timeout=self.config.get('mysql_pool_timeout', 30),
-            history_max_records=self.config.get('history_max_records', 1000),
+            host=self._config.get('mysql_host', 'localhost'),
+            port=self._config.get('mysql_port', 3306),
+            user=self._config.get('mysql_user', 'root'),
+            password=self._config.get('mysql_password', 'root'),
+            database=self._config.get('mysql_database', 'text2sql_db'),
+            pool_size=self._config.get('mysql_pool_size', 10),
+            max_overflow=self._config.get('mysql_max_overflow', 20),
+            pool_timeout=self._config.get('mysql_pool_timeout', 30),
+            history_max_records=self._config.get('history_max_records', 1000),
             governance_proof_verifier=self._history_proof_verifier,
         )
         if not self._mysql_client.connect():
@@ -238,23 +327,23 @@ class ApplicationContext:
         """初始化 Embedding Factory"""
         from core.embedding_factory import EmbeddingFactory
         self._embedding_factory = EmbeddingFactory(
-            provider=self.config.get('embedding_provider', 'dashscope'),
-            model=self.config.get('embedding_model', 'text-embedding-v1'),
-            api_key=self.config.get('embedding_api_key', ''),
-            api_base=self.config.get('embedding_api_base', '')
+            provider=self._config.get('embedding_provider', 'dashscope'),
+            model=self._config.get('embedding_model', 'text-embedding-v1'),
+            api_key=self._config.get('embedding_api_key', ''),
+            api_base=self._config.get('embedding_api_base', '')
         )
-        logger.info(f"Embedding 工厂初始化：{self.config.get('embedding_provider')}/{self.config.get('embedding_model')}")
+        logger.info(f"Embedding 工厂初始化：{self._config.get('embedding_provider')}/{self._config.get('embedding_model')}")
 
     def _init_retriever(self):
         """初始化知识检索器"""
         from core.retrieval.bm25_tfidf import KnowledgeRetriever
         self._knowledge_retriever = KnowledgeRetriever(
-            config=self._retriever_config(self.config),
+            config=self._retriever_config(self._config),
             embedding_factory=self._embedding_factory
         )
 
     @staticmethod
-    def _retriever_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    def _retriever_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         return {
             'bm25_k1': config.get('bm25_k1', 1.5),
             'bm25_b': config.get('bm25_b', 0.75),
@@ -269,7 +358,7 @@ class ApplicationContext:
         }
 
     @staticmethod
-    def _generator_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    def _generator_config(config: Mapping[str, Any]) -> Dict[str, Any]:
         return {
             'enable_rewrite': False,
             'few_shot_enabled': config.get('few_shot_enabled', True),
@@ -280,7 +369,9 @@ class ApplicationContext:
             'sql_query_max_rows': config.get('sql_query_max_rows', 500),
             'sql_query_timeout_ms': config.get('sql_query_timeout_ms', 10000),
             'sql_scope_enforcement': config.get('sql_scope_enforcement', True),
-            'sql_blocked_tables': config.get('sql_blocked_tables'),
+            'sql_blocked_tables': _thaw_config_value(
+                config.get('sql_blocked_tables')
+            ),
             'prompt_max_length': config.get('prompt_max_length', 4000),
             'history_max_records': config.get('history_max_records', 1000),
             'governed_history_binding_ttl_seconds': config.get(
@@ -293,13 +384,13 @@ class ApplicationContext:
         from core.chain.sql_chain import SQLGenerationChain
         self._sql_chain = SQLGenerationChain(
             llm=self._llm,
-            dialect=self.config.get('sql_dialect', 'mysql'),
-            retrieval_top_k=self.config.get('retrieval_top_k', 5),
-            prompt_max_length=self.config.get('prompt_max_length', 4000),
+            dialect=self._config.get('sql_dialect', 'mysql'),
+            retrieval_top_k=self._config.get('retrieval_top_k', 5),
+            prompt_max_length=self._config.get('prompt_max_length', 4000),
         )
 
     @staticmethod
-    def _resolve_semantic_model_dir(config: Dict[str, Any]) -> Path:
+    def _resolve_semantic_model_dir(config: Mapping[str, Any]) -> Path:
         from core.semantic.storage import lexical_absolute, validate_no_symlink_path
 
         model_dir = Path(config.get('semantic_model_dir', 'semantic_models'))
@@ -312,13 +403,13 @@ class ApplicationContext:
         )
 
     @staticmethod
-    def _validate_candidate_config(config: Dict[str, Any]) -> None:
+    def _validate_candidate_config(config: Mapping[str, Any]) -> None:
         try:
             validate_runtime_config(config)
         except RuntimeConfigurationError as exc:
             raise ApplicationConfigurationError(str(exc)) from None
 
-    def _build_governance_components(self, config: Dict[str, Any]):
+    def _build_governance_components(self, config: Mapping[str, Any]):
         """Compile and validate a complete candidate pair before publication."""
         self._validate_candidate_config(config)
         if not config.get('semantic_governance_enabled', False):
@@ -368,7 +459,7 @@ class ApplicationContext:
 
     def _init_governance(self) -> None:
         """Initialize the optional governed snapshot and pipeline."""
-        registry, pipeline = self._build_governance_components(self.config)
+        registry, pipeline = self._build_governance_components(self._config)
         self._semantic_registry = registry
         self._correctness_pipeline = pipeline
 
@@ -378,7 +469,7 @@ class ApplicationContext:
         llm,
         knowledge_retriever,
         sql_chain,
-        config: Dict[str, Any],
+        config: Mapping[str, Any],
         correctness_pipeline,
     ):
         from core.sql.generator import SQLGenerator
@@ -403,7 +494,7 @@ class ApplicationContext:
             llm=self._llm,
             knowledge_retriever=self._knowledge_retriever,
             sql_chain=self._sql_chain,
-            config=self.config,
+            config=self._config,
             correctness_pipeline=self._correctness_pipeline,
         )
 
@@ -438,7 +529,7 @@ class ApplicationContext:
 
     @staticmethod
     def _validate_component_graph(
-        config: Dict[str, Any],
+        config: Mapping[str, Any],
         *,
         llm,
         knowledge_retriever,
@@ -481,7 +572,7 @@ class ApplicationContext:
 
     def _publish_component_graph(
         self,
-        candidate_config: Dict[str, Any],
+        candidate_config: Mapping[str, Any],
         *,
         llm,
         embedding_factory,
@@ -493,8 +584,9 @@ class ApplicationContext:
     ) -> None:
         """Publish a fully built graph only after checking its governance binding."""
         with self._reload_lock:
+            published_config = _freeze_config(_thaw_config(candidate_config))
             self._validate_component_graph(
-                candidate_config,
+                published_config,
                 llm=llm,
                 knowledge_retriever=knowledge_retriever,
                 sql_chain=sql_chain,
@@ -502,7 +594,7 @@ class ApplicationContext:
                 correctness_pipeline=correctness_pipeline,
                 sql_generator=sql_generator,
             )
-            self._config = candidate_config
+            self._config = published_config
             self._llm = llm
             self._embedding_factory = embedding_factory
             self._knowledge_retriever = knowledge_retriever
@@ -522,7 +614,7 @@ class ApplicationContext:
             from core.llm_factory import create_llm
 
             snapshot = self._snapshot_component_graph()
-            candidate_config = {**snapshot.config, **updates}
+            candidate_config = _merge_config(snapshot.config, updates)
             self._validate_candidate_config(candidate_config)
             candidate_llm = create_llm(
                 provider=candidate_config.get('llm_provider', 'openai'),
@@ -564,7 +656,7 @@ class ApplicationContext:
             from core.retrieval.bm25_tfidf import KnowledgeRetriever
 
             snapshot = self._snapshot_component_graph()
-            candidate_config = {**snapshot.config, **updates}
+            candidate_config = _merge_config(snapshot.config, updates)
             self._validate_candidate_config(candidate_config)
             candidate_embedding = EmbeddingFactory(
                 provider=candidate_config.get('embedding_provider', 'dashscope'),
@@ -630,7 +722,7 @@ class ApplicationContext:
             from core.retrieval.bm25_tfidf import KnowledgeRetriever
 
             snapshot = self._snapshot_component_graph()
-            candidate_config = {**snapshot.config, **updates}
+            candidate_config = _merge_config(snapshot.config, updates)
             candidate_registry, candidate_pipeline = (
                 self._build_governance_components(candidate_config)
             )
@@ -674,7 +766,7 @@ class ApplicationContext:
     def _populate_retriever(
         self,
         retriever,
-        config: Dict[str, Any],
+        config: Mapping[str, Any],
         *,
         correctness_pipeline=_CURRENT_GOVERNANCE_PIPELINE,
     ) -> None:
@@ -717,8 +809,8 @@ class ApplicationContext:
 
     def _load_knowledge_base(self):
         """加载知识库到检索器；磁盘索引缓存需显式开启以避免读到旧图谱。"""
-        index_cache_enabled = self.config.get('index_cache_enabled', False)
-        index_dir = self.config.get('index_cache_dir', 'data/index_cache')
+        index_cache_enabled = self._config.get('index_cache_enabled', False)
+        index_dir = self._config.get('index_cache_dir', 'data/index_cache')
         if index_cache_enabled:
             try:
                 if self._knowledge_retriever.load_index(index_dir):
@@ -729,7 +821,7 @@ class ApplicationContext:
 
         # 缓存未命中，从数据源重建
         try:
-            neo4j_enabled = self.config.get('neo4j_enabled', False)
+            neo4j_enabled = self._config.get('neo4j_enabled', False)
             if neo4j_enabled and self._neo4j_client and self._neo4j_client.driver:
                 self._load_knowledge_from_neo4j()
             else:
@@ -780,7 +872,7 @@ class ApplicationContext:
 
     def _load_few_shot_history(self):
         """从已验证或执行成功的历史记录构建 Few-Shot 索引。"""
-        if not self.config.get('few_shot_enabled', True):
+        if not self._config.get('few_shot_enabled', True):
             return
         if self._correctness_pipeline is not None:
             self._knowledge_retriever.build_few_shot_index([])

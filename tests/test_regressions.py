@@ -1023,6 +1023,146 @@ def test_disconnected_neo4j_falls_back_to_mysql_schema():
     assert schema["columns"] == [{"column_name": "id"}]
 
 
+def test_application_context_detaches_constructor_config_recursively():
+    from core.app_context import ApplicationContext
+
+    supplied_config = {
+        "semantic_governance_enabled": False,
+        "sql_blocked_tables": ["payments"],
+        "policy": {"roles": [{"name": "analyst"}]},
+    }
+    context = ApplicationContext(supplied_config)
+
+    supplied_config["sql_blocked_tables"].append("secrets")
+    supplied_config["policy"]["roles"][0]["name"] = "admin"
+    supplied_config["new_key"] = "outside"
+
+    assert context.config == {
+        "semantic_governance_enabled": False,
+        "sql_blocked_tables": ["payments"],
+        "policy": {"roles": [{"name": "analyst"}]},
+    }
+
+
+def test_application_context_config_getter_returns_deep_mutable_copy():
+    from core.app_context import ApplicationContext
+
+    context = ApplicationContext(
+        {
+            "semantic_governance_enabled": False,
+            "sql_blocked_tables": ["payments"],
+            "policy": {"roles": [{"name": "analyst"}]},
+        }
+    )
+
+    exposed_config = context.config
+    exposed_config["sql_blocked_tables"].append("secrets")
+    exposed_config["policy"]["roles"][0]["name"] = "admin"
+    exposed_config["new_key"] = "outside"
+
+    assert context.config == {
+        "semantic_governance_enabled": False,
+        "sql_blocked_tables": ["payments"],
+        "policy": {"roles": [{"name": "analyst"}]},
+    }
+
+
+def test_application_context_snapshot_config_is_recursively_immutable():
+    from types import MappingProxyType
+
+    from core.app_context import ApplicationContext
+
+    context = ApplicationContext(
+        {
+            "semantic_governance_enabled": False,
+            "sql_blocked_tables": ["payments"],
+            "policy": {"roles": [{"name": "analyst"}]},
+        }
+    )
+    snapshot_config = context._snapshot_component_graph().config
+
+    assert isinstance(snapshot_config, MappingProxyType)
+    with pytest.raises(TypeError):
+        snapshot_config["new_key"] = "inside"
+    with pytest.raises(AttributeError):
+        snapshot_config["sql_blocked_tables"].append("secrets")
+    with pytest.raises(TypeError):
+        snapshot_config["policy"]["roles"][0]["name"] = "admin"
+
+
+def test_application_context_config_assignment_cannot_bypass_graph_reload():
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    context = ApplicationContext(
+        {"llm_model": "old-model", "semantic_governance_enabled": False}
+    )
+    old_llm = object()
+    old_chain = object()
+    old_retriever = object()
+    old_generator = object()
+    context._llm = old_llm
+    context._sql_chain = old_chain
+    context._knowledge_retriever = old_retriever
+    context._sql_generator = old_generator
+
+    with pytest.raises(ApplicationConfigurationError, match="只读"):
+        context.config = {
+            "llm_model": "bypassed-model",
+            "semantic_governance_enabled": False,
+        }
+
+    assert context.config == {
+        "llm_model": "old-model",
+        "semantic_governance_enabled": False,
+    }
+    assert context.llm is old_llm
+    assert context.sql_chain is old_chain
+    assert context.knowledge_retriever is old_retriever
+    assert context.sql_generator is old_generator
+
+
+def test_governance_reload_detaches_and_freezes_nested_updates(monkeypatch):
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationContext
+
+    context = ApplicationContext({"semantic_governance_enabled": False})
+    context._llm = object()
+    context._sql_chain = object()
+    context._embedding_factory = object()
+    context._knowledge_retriever = object()
+    candidate_retriever = SimpleNamespace(retriever=SimpleNamespace())
+    candidate_configs = []
+    context._build_governance_components = lambda _config: (None, None)
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: candidate_retriever,
+    )
+
+    def build_generator(**components):
+        candidate_configs.append(components["config"])
+        return SimpleNamespace(
+            llm=components["llm"],
+            knowledge_retriever=components["knowledge_retriever"],
+            sql_chain=components["sql_chain"],
+            correctness_pipeline=components["correctness_pipeline"],
+        )
+
+    monkeypatch.setattr(context, "_build_sql_generator", build_generator)
+    monkeypatch.setattr(context, "_populate_retriever", Mock())
+    blocked_tables = ["payments"]
+
+    context.reload_governance(sql_blocked_tables=blocked_tables)
+    blocked_tables.append("secrets")
+
+    assert context.config["sql_blocked_tables"] == ["payments"]
+    assert list(candidate_configs[0]["sql_blocked_tables"]) == ["payments"]
+    with pytest.raises(TypeError):
+        candidate_configs[0]["new_key"] = "inside"
+    with pytest.raises(AttributeError):
+        candidate_configs[0]["sql_blocked_tables"].append("secrets")
+
+
 def test_llm_reload_failure_keeps_previous_session_components(monkeypatch):
     import core.llm_factory
     from core.app_context import ApplicationContext
@@ -1097,11 +1237,13 @@ def test_model_reload_rejects_governance_updates_without_partial_publication(
     context._embedding_factory = old_embedding
     context._knowledge_retriever = old_retriever
     context._sql_generator = old_generator
+    old_config_generation = context._snapshot_component_graph().config
 
     with pytest.raises(ApplicationConfigurationError, match="reload_governance"):
         getattr(context, reload_name)(**(legal_update | governance_update))
 
-    assert context.config is old_config
+    assert context.config == old_config
+    assert context._snapshot_component_graph().config is old_config_generation
     assert context.llm is old_llm
     assert context.sql_chain is old_chain
     assert context.embedding_factory is old_embedding
@@ -1138,11 +1280,13 @@ def test_model_reload_rejects_unknown_updates_without_partial_publication(
     context._embedding_factory = old_embedding
     context._knowledge_retriever = old_retriever
     context._sql_generator = old_generator
+    old_config_generation = context._snapshot_component_graph().config
 
     with pytest.raises(ApplicationConfigurationError, match="reload_governance"):
         getattr(context, reload_name)(**(legal_update | {"unowned_runtime_key": 1}))
 
-    assert context.config is old_config
+    assert context.config == old_config
+    assert context._snapshot_component_graph().config is old_config_generation
     assert context.llm is old_llm
     assert context.sql_chain is old_chain
     assert context.embedding_factory is old_embedding
@@ -1166,6 +1310,7 @@ def test_governance_reload_rejects_inconsistent_candidate_component_graph(monkey
     context._knowledge_retriever = old_retriever
     context._sql_generator = old_generator
     context._embedding_factory = object()
+    old_config_generation = context._snapshot_component_graph().config
 
     candidate_registry = object()
     candidate_pipeline = SimpleNamespace(registry=object())
@@ -1195,7 +1340,8 @@ def test_governance_reload_rejects_inconsistent_candidate_component_graph(monkey
         context.reload_governance(semantic_governance_enabled=True)
 
     populate_retriever.assert_not_called()
-    assert context.config is old_config
+    assert context.config == old_config
+    assert context._snapshot_component_graph().config is old_config_generation
     assert context.semantic_registry is old_registry
     assert context.correctness_pipeline is old_pipeline
     assert context.knowledge_retriever is old_retriever
@@ -1275,6 +1421,7 @@ def test_embedding_reload_rejects_invalid_graph_before_population(monkeypatch):
     context._embedding_factory = old_embedding
     context._knowledge_retriever = old_retriever
     context._sql_generator = old_generator
+    old_config_generation = context._snapshot_component_graph().config
     candidate_embedding = Mock()
     candidate_retriever = SimpleNamespace(retriever=SimpleNamespace())
     monkeypatch.setattr(
@@ -1305,7 +1452,8 @@ def test_embedding_reload_rejects_invalid_graph_before_population(monkeypatch):
 
     populate_retriever.assert_not_called()
     candidate_embedding.clear_cache.assert_called_once_with()
-    assert context.config is old_config
+    assert context.config == old_config
+    assert context._snapshot_component_graph().config is old_config_generation
     assert context.llm is old_llm
     assert context.sql_chain is old_chain
     assert context.embedding_factory is old_embedding
