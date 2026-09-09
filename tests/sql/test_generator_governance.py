@@ -9,6 +9,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -1639,8 +1640,13 @@ def test_governance_reload_builds_candidate_then_atomically_replaces_pair(
     context._semantic_registry = old_registry
     context._correctness_pipeline = object()
     context._sql_generator = old_generator
-    candidate_generator = object()
-    build_generator = Mock(return_value=candidate_generator)
+    candidate_generator = SimpleNamespace()
+
+    def build_generator(**kwargs):
+        candidate_generator.correctness_pipeline = kwargs["correctness_pipeline"]
+        return candidate_generator
+
+    build_generator = Mock(side_effect=build_generator)
     monkeypatch.setattr(
         context, "_build_sql_generator", build_generator, raising=False
     )
@@ -1667,7 +1673,15 @@ def test_governance_pipeline_receives_configured_sql_max_length(
     context._llm = Mock()
     context._knowledge_retriever = Mock()
     context._sql_chain = Mock()
-    monkeypatch.setattr(context, "_build_sql_generator", Mock(return_value=object()))
+    monkeypatch.setattr(
+        context,
+        "_build_sql_generator",
+        Mock(
+            side_effect=lambda **kwargs: SimpleNamespace(
+                correctness_pipeline=kwargs["correctness_pipeline"]
+            )
+        ),
+    )
 
     context.reload_governance(
         **(_governance_config(tmp_path) | {"sql_max_length": 37})
@@ -1733,7 +1747,7 @@ def test_governance_reload_starts_with_empty_process_local_few_shot(monkeypatch)
     candidate_pipeline = _pipeline()
     candidate_retriever = Mock()
     candidate_retriever.retriever = Mock()
-    candidate_generator = object()
+    candidate_generator = SimpleNamespace()
     context = ApplicationContext({"few_shot_enabled": True})
     context._mysql_client = Mock(engine=object())
     context._mysql_client.get_table_schema.return_value = []
@@ -1746,7 +1760,12 @@ def test_governance_reload_starts_with_empty_process_local_few_shot(monkeypatch)
     context._build_governance_components = Mock(
         return_value=(candidate_pipeline.registry, candidate_pipeline)
     )
-    context._build_sql_generator = Mock(return_value=candidate_generator)
+
+    def build_generator(**kwargs):
+        candidate_generator.correctness_pipeline = kwargs["correctness_pipeline"]
+        return candidate_generator
+
+    context._build_sql_generator = Mock(side_effect=build_generator)
     monkeypatch.setattr(
         "core.retrieval.bm25_tfidf.KnowledgeRetriever",
         Mock(return_value=candidate_retriever),

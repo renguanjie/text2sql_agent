@@ -113,6 +113,13 @@ class SemanticModel(FrozenModel):
     terms: Annotated[tuple[SemanticTerm, ...], BeforeValidator(_yaml_tuple)] = ()
     policies: SemanticPolicies = SemanticPolicies()
 
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: Any) -> int:
+        if type(value) is not int:
+            raise ValueError("schema_version 必须是整数")
+        return value
+
     @field_validator("model_version")
     @classmethod
     def validate_semver(cls, value: str) -> str:

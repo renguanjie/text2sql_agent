@@ -4,7 +4,7 @@ import re
 import subprocess
 import sys
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import numpy as np
@@ -1045,6 +1045,281 @@ def test_llm_reload_failure_keeps_previous_session_components(monkeypatch):
     assert context.llm is old_llm
     assert context.sql_chain is old_chain
     assert context.sql_generator is old_generator
+
+
+@pytest.mark.parametrize(
+    ("reload_name", "legal_update"),
+    [
+        ("reload_llm", {"llm_model": "candidate-model"}),
+        ("reload_embedding", {"embedding_model": "candidate-model"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "governance_update",
+    [
+        {"semantic_governance_enabled": True},
+        {"semantic_model_dir": "candidate-models"},
+        {"semantic_datasource": "candidate-source"},
+        {"semantic_context_max_chars": 1024},
+        {"semantic_context_max_items": 12},
+        {"sql_repair_max_attempts": 0},
+        {"sql_explain_enabled": True},
+        {"sql_explain_timeout_ms": 500},
+        {"sql_explain_max_estimated_rows": 1000},
+        {"sql_dialect": "postgres"},
+    ],
+)
+def test_model_reload_rejects_governance_updates_without_partial_publication(
+    reload_name, legal_update, governance_update
+):
+    """Model reloads must not publish a config that its pipeline did not rebuild."""
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    old_config = {
+        "llm_provider": "old-provider",
+        "llm_model": "old-model",
+        "embedding_provider": "old-provider",
+        "embedding_model": "old-model",
+        "semantic_governance_enabled": False,
+        "sql_explain_enabled": False,
+        "sql_dialect": "mysql",
+    }
+    context = ApplicationContext(old_config)
+    old_llm = object()
+    old_chain = object()
+    old_embedding = SimpleNamespace(clear_cache=lambda: None)
+    old_retriever = object()
+    old_generator = SimpleNamespace(correctness_pipeline=None)
+    context._llm = old_llm
+    context._sql_chain = old_chain
+    context._embedding_factory = old_embedding
+    context._knowledge_retriever = old_retriever
+    context._sql_generator = old_generator
+
+    with pytest.raises(ApplicationConfigurationError, match="reload_governance"):
+        getattr(context, reload_name)(**(legal_update | governance_update))
+
+    assert context.config is old_config
+    assert context.llm is old_llm
+    assert context.sql_chain is old_chain
+    assert context.embedding_factory is old_embedding
+    assert context.knowledge_retriever is old_retriever
+    assert context.sql_generator is old_generator
+
+
+@pytest.mark.parametrize(
+    ("reload_name", "legal_update"),
+    [
+        ("reload_llm", {"llm_model": "candidate-model"}),
+        ("reload_embedding", {"embedding_model": "candidate-model"}),
+    ],
+)
+def test_model_reload_rejects_unknown_updates_without_partial_publication(
+    reload_name, legal_update
+):
+    """An unowned key cannot piggyback on a valid model reload."""
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    old_config = {
+        "semantic_governance_enabled": False,
+        "sql_explain_enabled": False,
+        "sql_dialect": "mysql",
+    }
+    context = ApplicationContext(old_config)
+    old_llm = object()
+    old_chain = object()
+    old_embedding = SimpleNamespace(clear_cache=lambda: None)
+    old_retriever = object()
+    old_generator = SimpleNamespace(correctness_pipeline=None)
+    context._llm = old_llm
+    context._sql_chain = old_chain
+    context._embedding_factory = old_embedding
+    context._knowledge_retriever = old_retriever
+    context._sql_generator = old_generator
+
+    with pytest.raises(ApplicationConfigurationError, match="reload_governance"):
+        getattr(context, reload_name)(**(legal_update | {"unowned_runtime_key": 1}))
+
+    assert context.config is old_config
+    assert context.llm is old_llm
+    assert context.sql_chain is old_chain
+    assert context.embedding_factory is old_embedding
+    assert context.knowledge_retriever is old_retriever
+    assert context.sql_generator is old_generator
+
+
+def test_governance_reload_rejects_inconsistent_candidate_component_graph(monkeypatch):
+    """A governance-enabled config is publishable only with one matching graph."""
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationConfigurationError, ApplicationContext
+
+    old_config = {"semantic_governance_enabled": True}
+    old_registry = object()
+    old_pipeline = SimpleNamespace(registry=old_registry)
+    old_retriever = object()
+    old_generator = SimpleNamespace(correctness_pipeline=old_pipeline)
+    context = ApplicationContext(old_config)
+    context._semantic_registry = old_registry
+    context._correctness_pipeline = old_pipeline
+    context._knowledge_retriever = old_retriever
+    context._sql_generator = old_generator
+    context._embedding_factory = object()
+
+    candidate_registry = object()
+    candidate_pipeline = SimpleNamespace(registry=candidate_registry)
+    context._build_governance_components = lambda _config: (
+        candidate_registry,
+        candidate_pipeline,
+    )
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: SimpleNamespace(retriever=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        context,
+        "_build_sql_generator",
+        lambda **_kwargs: SimpleNamespace(correctness_pipeline=None),
+    )
+
+    with pytest.raises(ApplicationConfigurationError, match="组件图"):
+        context.reload_governance(semantic_governance_enabled=True)
+
+    assert context.config is old_config
+    assert context.semantic_registry is old_registry
+    assert context.correctness_pipeline is old_pipeline
+    assert context.knowledge_retriever is old_retriever
+    assert context.sql_generator is old_generator
+
+
+def test_governance_reload_disable_publishes_no_governance_residue(monkeypatch):
+    """Disabling governance clears every governed member of the published graph."""
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationContext
+
+    old_registry = object()
+    old_pipeline = SimpleNamespace(registry=old_registry)
+    context = ApplicationContext({"semantic_governance_enabled": True})
+    context._semantic_registry = old_registry
+    context._correctness_pipeline = old_pipeline
+    context._embedding_factory = object()
+    context._knowledge_retriever = object()
+    context._sql_generator = SimpleNamespace(correctness_pipeline=old_pipeline)
+    context._build_governance_components = lambda _config: (None, None)
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: SimpleNamespace(retriever=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        context,
+        "_build_sql_generator",
+        lambda **_kwargs: SimpleNamespace(correctness_pipeline=None),
+    )
+
+    context.reload_governance(semantic_governance_enabled=False)
+
+    assert context.config["semantic_governance_enabled"] is False
+    assert context.semantic_registry is None
+    assert context.correctness_pipeline is None
+    assert context.sql_generator.correctness_pipeline is None
+
+
+def test_llm_reload_accepts_its_whitelisted_updates(monkeypatch):
+    """The LLM UI's documented updates still replace only the LLM chain."""
+    import core.llm_factory
+    from core.app_context import ApplicationContext
+
+    context = ApplicationContext(
+        {
+            "llm_provider": "old-provider",
+            "llm_model": "old-model",
+            "semantic_governance_enabled": False,
+            "sql_explain_enabled": False,
+            "sql_dialect": "mysql",
+        }
+    )
+    old_embedding = SimpleNamespace(clear_cache=lambda: None)
+    old_retriever = object()
+    new_llm = object()
+    new_chain = object()
+    new_generator = SimpleNamespace(correctness_pipeline=None)
+    context._embedding_factory = old_embedding
+    context._knowledge_retriever = old_retriever
+    monkeypatch.setattr(core.llm_factory, "create_llm", lambda **_kwargs: new_llm)
+    sql_chain_module = ModuleType("core.chain.sql_chain")
+    sql_chain_module.SQLGenerationChain = lambda **_kwargs: new_chain
+    monkeypatch.setitem(sys.modules, "core.chain.sql_chain", sql_chain_module)
+    monkeypatch.setattr(context, "_build_sql_generator", lambda **_kwargs: new_generator)
+
+    context.reload_llm(
+        llm_provider="new-provider",
+        llm_model="new-model",
+        llm_api_key="key",
+        llm_base_url="https://example.test",
+    )
+
+    assert context.config["llm_provider"] == "new-provider"
+    assert context.config["llm_model"] == "new-model"
+    assert context.llm is new_llm
+    assert context.sql_chain is new_chain
+    assert context.sql_generator is new_generator
+    assert context.embedding_factory is old_embedding
+    assert context.knowledge_retriever is old_retriever
+
+
+def test_embedding_reload_accepts_its_whitelisted_updates(monkeypatch):
+    """The embedding UI's documented updates still rebuild its retrieval chain."""
+    import core.embedding_factory
+    import core.retrieval.bm25_tfidf
+    from core.app_context import ApplicationContext
+
+    context = ApplicationContext(
+        {
+            "embedding_provider": "old-provider",
+            "embedding_model": "old-model",
+            "semantic_governance_enabled": False,
+            "sql_explain_enabled": False,
+            "sql_dialect": "mysql",
+        }
+    )
+    old_llm = object()
+    old_chain = object()
+    old_embedding = SimpleNamespace(clear_cache=lambda: None)
+    old_retriever = object()
+    new_embedding = SimpleNamespace(clear_cache=lambda: None)
+    new_retriever = SimpleNamespace(retriever=SimpleNamespace())
+    new_generator = SimpleNamespace(correctness_pipeline=None)
+    context._llm = old_llm
+    context._sql_chain = old_chain
+    context._embedding_factory = old_embedding
+    context._knowledge_retriever = old_retriever
+    monkeypatch.setattr(
+        core.embedding_factory, "EmbeddingFactory", lambda **_kwargs: new_embedding
+    )
+    monkeypatch.setattr(
+        core.retrieval.bm25_tfidf,
+        "KnowledgeRetriever",
+        lambda **_kwargs: new_retriever,
+    )
+    monkeypatch.setattr(context, "_build_sql_generator", lambda **_kwargs: new_generator)
+
+    context.reload_embedding(
+        embedding_provider="new-provider",
+        embedding_model="new-model",
+        embedding_api_key="key",
+        embedding_api_base="https://example.test",
+        faiss_embedding_dim=768,
+    )
+
+    assert context.config["embedding_provider"] == "new-provider"
+    assert context.config["embedding_model"] == "new-model"
+    assert context.config["faiss_embedding_dim"] == 768
+    assert context.embedding_factory is new_embedding
+    assert context.knowledge_retriever is new_retriever
+    assert context.sql_generator is new_generator
+    assert context.llm is old_llm
+    assert context.sql_chain is old_chain
 
 
 def test_plain_multiline_sql_is_not_truncated_to_first_line():
