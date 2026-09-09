@@ -1,6 +1,7 @@
 import json
 import re
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -161,7 +162,9 @@ def test_contracts_are_deeply_immutable():
         elapsed_ms=0,
     )
     report = EvaluationReport(
-        model="local-demo",
+        model_sha256=(
+            "sha256:bf67c55e1add70240ce7df7e7d0634da60c988a0f014da0dd635efc8136d9872"
+        ),
         model_parameters=(ModelParameter(name="temperature", value=0),),
         datasource="demo",
         dialect="mysql",
@@ -179,7 +182,7 @@ def test_contracts_are_deeply_immutable():
     with pytest.raises(ValidationError):
         case.id = "changed"
     with pytest.raises(ValidationError):
-        report.model = "changed"
+        report.model_sha256 = "changed"
     with pytest.raises(TypeError):
         report.model_parameters[0] = ModelParameter(name="seed", value=1)
 
@@ -1166,6 +1169,115 @@ def test_report_fingerprints_model_revision_in_every_content_mode(
     }
 
 
+@pytest.mark.parametrize("include_content", [False, True])
+def test_report_hashes_top_level_model_before_any_report_representation(
+    snapshot: SemanticSnapshot,
+    tmp_path: Path,
+    include_content: bool,
+):
+    """Break caught: a raw top-level model identifier surviving in report state."""
+    raw_model = "safe-local-model"
+    evaluator = GoldenEvaluator(
+        snapshot,
+        model=raw_model,
+        include_content=include_content,
+    )
+    report = evaluator.evaluate_results(
+        [(_case(), _result("SELECT id FROM example_orders"))]
+    )
+    dumped = report.model_dump(mode="json")
+    serialized = report.model_dump_json()
+    path = evaluator.write_report(
+        report,
+        tmp_path / f"model-{include_content}.json",
+    )
+
+    assert "model" not in dumped
+    assert dumped["model_sha256"] == (
+        "sha256:fe95ccd637cec097499b3465847754091a4f6e6d17abd2ba61ea662e07d6fe65"
+    )
+    for representation in (
+        repr(evaluator),
+        repr(report),
+        serialized,
+        path.read_text("utf-8"),
+    ):
+        assert raw_model not in representation
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "",
+        "   ",
+        "password=private-model",
+        "token=private-model",
+        "safe\nmodel",
+        "m" * 129,
+    ],
+)
+def test_top_level_model_rejects_unbounded_or_sensitive_values_without_echo(
+    snapshot: SemanticSnapshot,
+    model: str,
+):
+    """Break caught: hashing an obvious credential carrier instead of rejecting it."""
+    with pytest.raises(GoldenConfigurationError) as caught:
+        GoldenEvaluator(snapshot, model=model)
+
+    assert caught.value.code == "INVALID_MODEL_ID"
+    if model:
+        assert model not in str(caught.value)
+
+
+def test_report_writer_revalidates_model_digest_and_git_commit_before_overwrite(
+    evaluator: GoldenEvaluator,
+    tmp_path: Path,
+):
+    """Break caught: model_copy injecting raw identity metadata into an existing report."""
+    report = evaluator.evaluate_results(
+        [(_case(), _result("SELECT id FROM example_orders"))]
+    )
+    path = tmp_path / "existing-identities.json"
+    sentinel = b'{"existing":true}\n'
+    path.write_bytes(sentinel)
+
+    invalid_updates = (
+        {"model_sha256": "password=private-model"},
+        {"model_sha256": "sha256:" + "A" * 64},
+        {"git_commit": "token=private-commit"},
+        {"git_commit": "A" * 40},
+        {"model": "password=private-model"},
+    )
+    for update in invalid_updates:
+        with pytest.raises(GoldenConfigurationError) as copy_error:
+            report.model_copy(update=update)
+        assert copy_error.value.code == "INVALID_REPORT"
+        assert all(str(value) not in str(copy_error.value) for value in update.values())
+
+        tampered = super(EvaluationReport, report).model_copy(update=update)
+        with pytest.raises(GoldenConfigurationError) as caught:
+            evaluator.write_report(tampered, path)
+        assert caught.value.code == "INVALID_REPORT"
+        assert path.read_bytes() == sentinel
+
+
+@pytest.mark.parametrize(
+    "git_commit",
+    ["", "main", "token=private-commit", "A" * 40, "a" * 39, "b" * 65],
+)
+def test_evaluator_rejects_noncanonical_git_commit_without_echo(
+    snapshot: SemanticSnapshot,
+    git_commit: str,
+):
+    """Break caught: caller-controlled revision text entering report metadata."""
+    with pytest.raises(GoldenConfigurationError) as caught:
+        GoldenEvaluator(snapshot, git_commit=git_commit)
+
+    assert caught.value.code == "INVALID_GIT_COMMIT"
+    if git_commit:
+        assert git_commit not in str(caught.value)
+
+
 def test_generated_result_rejects_contradictory_or_blank_success_payloads():
     """Break caught: accepting a claimed success that validation says is non-executable."""
     for sql, executable, valid in (("SELECT 1", False, False), ("   ", True, True)):
@@ -1351,7 +1463,9 @@ def test_report_enforces_case_counts_rates_rules_and_content_flags():
         elapsed_ms=0,
     )
     base = {
-        "model": "local-demo",
+        "model_sha256": (
+            "sha256:bf67c55e1add70240ce7df7e7d0634da60c988a0f014da0dd635efc8136d9872"
+        ),
         "datasource": "demo",
         "dialect": "mysql",
         "semantic_version": "1.0.0",
@@ -1679,6 +1793,30 @@ def test_git_commit_lookup_has_stable_fallback(monkeypatch, tmp_path: Path):
     assert get_git_commit(tmp_path) == "unknown"
 
 
+@pytest.mark.parametrize(
+    ("stdout", "expected"),
+    [
+        ("a" * 40 + "\n", "a" * 40),
+        ("b" * 64 + "\n", "b" * 64),
+        ("A" * 40 + "\n", "unknown"),
+        ("token=private-commit\n", "unknown"),
+    ],
+)
+def test_git_commit_lookup_accepts_only_canonical_sha_lengths(
+    monkeypatch,
+    tmp_path: Path,
+    stdout: str,
+    expected: str,
+):
+    """Break caught: normalizing or reporting arbitrary subprocess output as a Git SHA."""
+    from core.evaluation import golden
+
+    completed = Mock(stdout=stdout)
+    monkeypatch.setattr(golden.subprocess, "run", Mock(return_value=completed))
+
+    assert get_git_commit(tmp_path) == expected
+
+
 def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
     snapshot: SemanticSnapshot, tmp_path: Path, capsys
 ):
@@ -1820,17 +1958,37 @@ def test_cli_exit_codes_distinguish_failed_evaluation_from_configuration_error(
             str(compiled),
         ]
     )
+    secret_model = "password=private-model"
+    invalid_model = main(
+        [
+            "--cases",
+            str(suite_path),
+            "--results",
+            str(result_path),
+            "--output",
+            str(output),
+            "--model",
+            secret_model,
+            "--semantic-version",
+            "1.0.0",
+            "--compiled-root",
+            str(compiled),
+        ]
+    )
     console = capsys.readouterr()
 
     assert failed == 1
     assert malformed == 2
     assert invalid_revision == 2
     assert invalid_revision_without_existing_output == 2
+    assert invalid_model == 2
     assert output.read_bytes() == original_report
     assert not missing_output.exists()
     assert json.loads(original_report)["failed"] == 1
     assert opaque_revision not in console.out + console.err
     assert opaque_revision.encode() not in original_report
+    assert secret_model not in console.out + console.err
+    assert secret_model.encode() not in original_report
 
 
 def test_repository_golden_suite_has_required_anonymous_coverage():

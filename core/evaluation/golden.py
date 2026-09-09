@@ -59,6 +59,9 @@ _ASSERTION_CODES = frozenset(
 )
 _REPORT_ERROR_CODES = PUBLIC_SQL_RESULT_ERROR_CODES | {"EVALUATION_SQL_INVALID"}
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
+_MODEL_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_GIT_COMMIT = re.compile(r"(?:unknown|[0-9a-f]{40}|[0-9a-f]{64})")
+_MODEL_ID_MAX_LENGTH = 128
 _MODEL_REVISION_INPUT_NAME = "model_revision"
 _MODEL_REVISION_DIGEST_NAME = "model_revision_sha256"
 _MODEL_PARAMETER_INPUT_ALLOWLIST = frozenset(
@@ -240,6 +243,17 @@ def _is_safe_model_revision(value: str) -> bool:
     return all(
         _is_safe_revision_atom(atom)
         for atom in re.split(r"[.-]", value)
+    )
+
+
+def _is_safe_model_id(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value.strip()
+        and len(value) <= _MODEL_ID_MAX_LENGTH
+        and not any(unicodedata.category(char).startswith("C") for char in value)
+        and not _SENSITIVE_PARAMETER_TEXT.search(value)
+        and not _CREDENTIAL_VALUE.search(value)
     )
 
 
@@ -575,7 +589,7 @@ class CaseResult(FrozenModel):
 
 class EvaluationReport(FrozenModel):
     schema_version: StrictInt = 1
-    model: StrictStr
+    model_sha256: StrictStr
     model_parameters: tuple[ModelParameter, ...] = ()
     datasource: StrictStr
     dialect: Literal["mysql"]
@@ -589,6 +603,20 @@ class EvaluationReport(FrozenModel):
     cases: tuple[CaseResult, ...]
     elapsed_ms: StrictInt
     content_included: StrictBool = False
+
+    @field_validator("model_sha256")
+    @classmethod
+    def validate_model_digest(cls, value: str) -> str:
+        if not _MODEL_DIGEST.fullmatch(value):
+            raise ValueError("invalid model digest")
+        return value
+
+    @field_validator("git_commit")
+    @classmethod
+    def validate_git_commit(cls, value: str) -> str:
+        if not _GIT_COMMIT.fullmatch(value):
+            raise ValueError("invalid git commit")
+        return value
 
     @model_validator(mode="after")
     def validate_report(self) -> "EvaluationReport":
@@ -660,13 +688,37 @@ class EvaluationReport(FrozenModel):
             case.pop("elapsed_ms", None)
         return payload
 
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, object] | None = None,
+        deep: bool = False,
+    ) -> "EvaluationReport":
+        if update is not None and {
+            "model",
+            "model_sha256",
+            "git_commit",
+        }.intersection(update):
+            payload = {
+                name: getattr(self, name)
+                for name in type(self).model_fields
+            }
+            payload.update(update)
+            try:
+                return type(self).model_validate(payload)
+            except Exception:
+                raise GoldenConfigurationError("INVALID_REPORT") from None
+        return super().model_copy(update=update, deep=deep)
+
 
 def _revalidate_report(report: EvaluationReport) -> EvaluationReport:
     """Rebuild a report from primitives so copied nested models cannot bypass validation."""
     try:
+        if set(report.__dict__) != set(EvaluationReport.model_fields):
+            raise ValueError("unexpected report state")
         payload = {
             "schema_version": report.schema_version,
-            "model": report.model,
+            "model_sha256": report.model_sha256,
             "model_parameters": tuple(
                 {"name": parameter.name, "value": parameter.value}
                 for parameter in report.model_parameters
@@ -817,8 +869,8 @@ def get_git_commit(repo_root: Path) -> str:
             text=True,
             timeout=5,
         )
-        commit = completed.stdout.strip().casefold()
-        return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else "unknown"
+        commit = completed.stdout.strip()
+        return commit if _GIT_COMMIT.fullmatch(commit) and commit != "unknown" else "unknown"
     except Exception:
         return "unknown"
 
@@ -833,10 +885,12 @@ class GoldenEvaluator:
         git_commit: str = "unknown",
         include_content: bool = False,
     ):
-        if not model.strip():
+        if not _is_safe_model_id(model):
             raise GoldenConfigurationError("INVALID_MODEL_ID")
+        if not isinstance(git_commit, str) or not _GIT_COMMIT.fullmatch(git_commit):
+            raise GoldenConfigurationError("INVALID_GIT_COMMIT")
         self.snapshot = snapshot
-        self.model = model
+        self.model_sha256 = f"sha256:{_fingerprint(model)}"
         self.model_parameters = tuple(sorted(model_parameters, key=lambda item: item.name))
         self.git_commit = git_commit
         self.include_content = include_content
@@ -1022,7 +1076,7 @@ class GoldenEvaluator:
         total = len(scored)
         elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
         return EvaluationReport(
-            model=self.model,
+            model_sha256=self.model_sha256,
             model_parameters=self.model_parameters,
             datasource=self.snapshot.datasource,
             dialect=self.snapshot.dialect,
