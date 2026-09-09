@@ -128,19 +128,31 @@ text2sql_agent/
 ### 1. 环境准备
 
 ```bash
-# Python 3.9+
-python --version
-
-# 创建虚拟环境
+# 使用项目验证过的 Python 3.11 创建隔离环境
+python3.11 --version
 cd /Users/rgj/PycharmProjects/text2sql_agent
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+python3.11 -m venv .venv
+source .venv/bin/activate
+
+# Windows PowerShell:
+# py -3.11 -m venv .venv
+# .\.venv\Scripts\Activate.ps1
+```
+
+如果系统未提供 `python3.11`，可使用已安装的 [uv](https://docs.astral.sh/uv/) 获取同一版本；`--seed` 会在 `.venv` 中安装 `pip`，使后续命令保持一致：
+
+```bash
+uv venv --python 3.11 --seed .venv
+source .venv/bin/activate
 ```
 
 ### 2. 安装依赖
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+
+# 发布前运行 Ruff 门禁时，在同一个已激活环境安装已验收的版本
+python -m pip install ruff==0.15.20
 ```
 
 **新增依赖说明**:

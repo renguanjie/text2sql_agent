@@ -2,6 +2,16 @@
 
 正确性内核以 Git 中的 YAML 为唯一人工语义真相源。它为 SQL 生成提供紧凑中文上下文，并在生成与执行前执行确定性校验。Neo4j 仅是已发布快照的派生检索索引：图不可用会影响召回，但不能替代、修改或覆盖 Git 语义，更不能授权执行。
 
+以下命令均假定在项目根目录、使用 README 推荐的已激活 `.venv` 执行：
+
+```bash
+source .venv/bin/activate
+
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+```
+
+因此手册统一使用 `python`、`pytest`、`ruff`，而不混用宿主解释器或硬编码虚拟环境路径。首次准备环境时，请按 README 使用 `python3.11 -m venv .venv`（或 `uv venv --python 3.11 --seed .venv`）、激活环境、`python -m pip install -r requirements.txt`，并在执行发布门禁前运行 `python -m pip install ruff==0.15.20`。该版本与仓库已验收的规则集一致；不固定版本会随 Ruff 新规则改变门禁结果。`uv` 创建的未 seed 环境没有 `pip`；应重建为上述 `--seed` 形式或用 `uv pip` 安装，而不要退回宿主 Python。
+
 ## 1. 默认值与边界
 
 以下配置来自 `config.py` 与 `env.example`；默认均兼容旧行为。
@@ -26,14 +36,14 @@
 2. 编译并执行交叉引用校验：
 
    ```bash
-   .venv/bin/python scripts/compile_semantic_models.py semantic_models/default.yaml
+   python scripts/compile_semantic_models.py semantic_models/default.yaml
    ```
 
    成功输出的格式为 `datasource@model_version content_sha256`。编译器写入 `semantic_models/.compiled/<datasource>/<model_version>.json`，并原子更新 `semantic_models/.compiled/manifest.json` 中的 `active` 映射。激活版本由该清单决定，不按文件时间推断。
 3. 检查已激活版本与摘要：
 
    ```bash
-   .venv/bin/python -m json.tool semantic_models/.compiled/manifest.json
+   python -m json.tool semantic_models/.compiled/manifest.json
    ```
 
    相同 YAML 与编译器版本应产生相同 `content_sha256`；`compiled_at` 不参与内容摘要。若编译失败，不会生成部分快照或替换已加载的有效快照。
@@ -45,7 +55,7 @@
 完成编译与清单检查后，才可将**已激活的编译快照**发布为图检索索引：
 
 ```bash
-.venv/bin/python scripts/publish_semantic_model.py default \
+python scripts/publish_semantic_model.py default \
   --compiled-root semantic_models/.compiled
 ```
 
@@ -56,7 +66,7 @@
 默认关闭示例：
 
 ```bash
-SEMANTIC_GOVERNANCE_ENABLED=false SQL_EXPLAIN_ENABLED=false streamlit run app.py
+SEMANTIC_GOVERNANCE_ENABLED=false SQL_EXPLAIN_ENABLED=false python -m streamlit run app.py
 ```
 
 启用语义治理、不启用数据库预检：
@@ -67,7 +77,7 @@ SEMANTIC_MODEL_DIR=semantic_models \
 SEMANTIC_DATASOURCE=default \
 SQL_REPAIR_MAX_ATTEMPTS=1 \
 SQL_EXPLAIN_ENABLED=false \
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 启用 MySQL `EXPLAIN` 预检时，使用同一只读连接和超时限制；它必须依赖已启用的治理：
@@ -77,7 +87,7 @@ SEMANTIC_GOVERNANCE_ENABLED=true \
 SQL_EXPLAIN_ENABLED=true \
 SQL_EXPLAIN_TIMEOUT_MS=3000 \
 SQL_EXPLAIN_MAX_ESTIMATED_ROWS=100000 \
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 现有进程可由拥有 `ApplicationContext` 的运维代码调用 `reload_governance(...)`。它会先候选构建（编译、加载、校验、新生成器），成功后一次替换注册表/管线/生成器；失败时旧的不可变对象图继续服务。
@@ -110,9 +120,9 @@ context.reload_governance(
 
 ```bash
 git checkout <已审查提交> -- semantic_models/default.yaml
-.venv/bin/python scripts/compile_semantic_models.py semantic_models/default.yaml
-.venv/bin/python -m json.tool semantic_models/.compiled/manifest.json
-.venv/bin/python scripts/publish_semantic_model.py default \
+python scripts/compile_semantic_models.py semantic_models/default.yaml
+python -m json.tool semantic_models/.compiled/manifest.json
+python scripts/publish_semantic_model.py default \
   --compiled-root semantic_models/.compiled
 ```
 
@@ -120,10 +130,20 @@ git checkout <已审查提交> -- semantic_models/default.yaml
 
 ## 7. Golden Set 离线评估
 
-Golden 用例在 `eval/golden/`；生成结果和报告是私有运行产物，分别写入已忽略的 `eval/results/` 与 `eval/reports/`。评测不会调用 LLM 或数据库：
+Golden 用例在 `eval/golden/`；生成结果和报告是私有运行产物，分别写入已忽略的 `eval/results/` 与 `eval/reports/`。评测不会调用 LLM 或数据库。仓库跟踪的 `eval/examples/default-results.example.json` 是与默认七个匿名用例、`default@1.1.0` 严格匹配的 CLI smoke 输入；它只证明评测链路可运行，**不是**模型质量基准，也不应替代真实模型输出。
+
+先编译当前 Git 源，再创建忽略目录并复制匿名示例：
 
 ```bash
-.venv/bin/python scripts/evaluate_golden.py \
+python scripts/compile_semantic_models.py semantic_models/default.yaml
+mkdir -p eval/results eval/reports
+cp eval/examples/default-results.example.json eval/results/default-results.json
+```
+
+随后执行评测：
+
+```bash
+python scripts/evaluate_golden.py \
   --cases eval/golden/default.yaml \
   --results eval/results/default-results.json \
   --output eval/reports/default-report.json \
@@ -131,7 +151,35 @@ Golden 用例在 `eval/golden/`；生成结果和报告是私有运行产物，�
   --semantic-version 1.1.0
 ```
 
-退出码为：`0` 全部用例通过，`1` 已完成评测但至少一例不通过，`2` 配置/输入/快照/I/O 无效。默认报告只保存问题与 SQL 指纹、稳定错误码和摘要元数据；模型版本修订仅以 `model_revision_sha256` 摘要表示。只有明确传入 `--include-content` 才会把完整问题和 SQL 写入本地调试报告，且该文件应按敏感数据保护。
+该匿名 smoke 输入应以退出码 `0` 完成。退出码为：`0` 全部用例通过，`1` 已完成评测但至少一例不通过，`2` 配置/输入/快照/I/O 无效。默认报告只保存问题与 SQL 指纹、稳定错误码和摘要元数据；模型版本修订仅以 `model_revision_sha256` 摘要表示。只有明确传入 `--include-content` 才会把完整问题和 SQL 写入本地调试报告，且该文件应按敏感数据保护。
+
+### 从真实生成结果导出窄评测输入
+
+真实评测应调用启用治理的 `SQLGenerator.generate_sql(...)` 或 `await SQLGenerator.generate_sql_async(...)`，并把其**公共结果映射**转换为严格的离线输入。当前代码没有结果导出 CLI；请在调用方使用受限序列化器，而不是把完整运行时对象、日志或历史记录写入文件。
+
+外层 JSON 只允许 `schema_version`（固定 `1`）、`datasource`、`dialect`（`mysql`）、`semantic_version` 和 `results`。每个 `results` 项只允许 `id`（Golden case ID）、`sql`、`status`、`executable`、`semantic_version`、`repair_attempts` 和 `validation`；`validation` 只允许 `valid` 与 `issues`，每个 issue 只保留稳定 `code`。不要复制 `user_query`、`error`、issue `message`、原始数据库异常、日志、连接信息、凭据或任何未知字段。
+
+例如调用方可对每一个已知 case ID 取治理生成结果，并构造如下最小项（`result` 是上述公共 payload）：
+
+```python
+safe_result = {
+    "id": case_id,
+    "sql": result.get("sql"),
+    "status": result["status"],
+    "executable": result["executable"],
+    "semantic_version": result.get("semantic_version"),
+    "repair_attempts": result.get("repair_attempts"),
+    "validation": {
+        "valid": result["validation"].get("valid"),
+        "issues": [
+            {"code": issue["code"]}
+            for issue in result["validation"].get("issues", [])
+        ],
+    },
+}
+```
+
+将这些项放入上述外层 envelope 后，再传给现有 `scripts/evaluate_golden.py`；加载器会拒绝不匹配的 case ID、数据源、方言、语义版本、结果状态或任意未知字段。
 
 ## 8. 稳定错误码
 
@@ -174,4 +222,4 @@ Golden 用例在 `eval/golden/`；生成结果和报告是私有运行产物，�
 | 图检索结果与 YAML 不一致 | 重新编译、检查清单激活版本，再显式发布；Neo4j 不可作为覆盖 Git 的修复入口。 |
 | Golden CLI 返回 `2` | 检查 cases/results 格式、case/result ID、语义版本、已激活快照和输出路径。 |
 
-发布前至少运行 `.venv/bin/pytest -q`、`ruff check .`、`.venv/bin/python -m compileall -q core tests scripts`、编译器两次和 `git diff --check`。所有编译快照、评测结果、报告、日志、凭据和 IDE 文件都不得提交。
+发布前至少运行 `pytest -q`、`ruff check .`、`python -m compileall -q core tests scripts`、编译器两次和 `git diff --check`。所有编译快照、评测结果、报告、日志、凭据和 IDE 文件都不得提交。

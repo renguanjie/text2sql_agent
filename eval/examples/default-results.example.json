@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "datasource": "default",
+  "dialect": "mysql",
+  "semantic_version": "1.1.0",
+  "results": [
+    {
+      "id": "default-dimension-001",
+      "sql": "SELECT status FROM example_orders",
+      "status": "success",
+      "executable": true,
+      "validation": {"valid": true, "issues": []}
+    },
+    {
+      "id": "default-metric-001",
+      "sql": "SELECT SUM(amount) FROM example_orders",
+      "status": "success",
+      "executable": true,
+      "validation": {"valid": true, "issues": []}
+    },
+    {
+      "id": "default-month-001",
+      "sql": "SELECT DATE_FORMAT(created_at, '%Y-%m'), SUM(amount) FROM example_orders GROUP BY DATE_FORMAT(created_at, '%Y-%m')",
+      "status": "success",
+      "executable": true,
+      "validation": {"valid": true, "issues": []}
+    },
+    {
+      "id": "default-relationship-001",
+      "sql": "SELECT c.segment FROM example_orders AS o JOIN example_customers AS c ON o.customer_id = c.id",
+      "status": "success",
+      "executable": true,
+      "validation": {"valid": true, "issues": []}
+    },
+    {
+      "id": "default-filter-001",
+      "sql": "SELECT status FROM example_orders WHERE status = 'complete'",
+      "status": "success",
+      "executable": true,
+      "validation": {"valid": true, "issues": []}
+    },
+    {
+      "id": "default-policy-001",
+      "sql": "SELECT contact_token FROM example_customers",
+      "status": "rejected",
+      "executable": false,
+      "validation": {
+        "valid": false,
+        "issues": [{"code": "POLICY_DENIED"}]
+      }
+    },
+    {
+      "id": "default-hallucination-001",
+      "sql": "SELECT made_up FROM example_orders",
+      "status": "rejected",
+      "executable": false,
+      "validation": {
+        "valid": false,
+        "issues": [{"code": "UNKNOWN_COLUMN"}]
+      }
+    }
+  ]
+}
