@@ -7,6 +7,12 @@ from collections.abc import Mapping
 from math import isfinite
 from typing import Any
 
+from core.provider_catalog import (
+    EMBEDDING_PROVIDERS,
+    LLM_PROVIDERS,
+    provider_requires_api_key,
+)
+
 
 class RuntimeConfigurationError(ValueError):
     """Configuration error whose message contains keys, never supplied values."""
@@ -178,6 +184,40 @@ def _validate_number(
     return float(value)
 
 
+# 提供商与凭据的配对规则。只对目录内已知且声明需要密钥的提供商生效：
+# `core/llm_factory.create_llm` 对未知 provider 是有意的容错回退，
+# `reload_llm` 的原子性测试也依赖这一宽容语义，收紧会同时破坏两者。
+_PROVIDER_CREDENTIAL_RULES = (
+    ("llm_provider", "llm_api_key", "LLM_PROVIDER", "LLM_API_KEY", LLM_PROVIDERS),
+    (
+        "embedding_provider",
+        "embedding_api_key",
+        "EMBEDDING_PROVIDER",
+        "EMBEDDING_API_KEY",
+        EMBEDDING_PROVIDERS,
+    ),
+)
+
+
+def _validate_provider_credentials(config: Mapping[str, Any]) -> None:
+    """要求需要密钥的已知提供商必须同时给出非空密钥。
+
+    错误消息只含配置键名、不含任何取值，符合 RuntimeConfigurationError 的约定。
+    """
+    for provider_key, secret_key, public_provider, public_secret, catalog in (
+        _PROVIDER_CREDENTIAL_RULES
+    ):
+        if provider_key not in config:
+            continue
+        if not provider_requires_api_key(catalog, config[provider_key]):
+            continue
+        secret = config.get(secret_key)
+        if not isinstance(secret, str) or not secret.strip():
+            raise RuntimeConfigurationError(
+                f"{public_provider} 指定的提供商需要非空的 {public_secret}"
+            )
+
+
 def validate_runtime_config(config: Mapping[str, Any]) -> None:
     """Apply one fail-closed startup and runtime configuration contract."""
     for internal_key, public_key in _BOOLEAN_CONFIG_KEYS.items():
@@ -216,6 +256,8 @@ def validate_runtime_config(config: Mapping[str, Any]) -> None:
             raise RuntimeConfigurationError(
                 "SQL_REPAIR_MAX_ATTEMPTS 必须是 0 或 1 的整数"
             )
+
+    _validate_provider_credentials(config)
 
     if "history_max_records" in config:
         validate_history_max_records(

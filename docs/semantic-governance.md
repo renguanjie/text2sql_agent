@@ -124,6 +124,21 @@ python -m streamlit run app.py
 
 LLM 的 provider/model/key/base URL 必须使用 `reload_llm(...)`；Embedding 的 provider/model/key/base/dimension 必须使用 `reload_embedding(...)`。检索预算、连接、普通运行时开关等其他配置不能通过 `reload_governance(...)` 部分发布，必须完整重启应用。
 
+### 4.1 前端设置面板
+
+系统信息页的「🛡️ 语义治理与执行预检」面板（`app/pages/governance_settings.py`）把 `reload_governance(...)` 的 18 个白名单键全部暴露为可热重载的控件，其中 16 项可编辑，`semantic_model_dir` 与 `sql_dialect` 只读展示——语义治理第一阶段仅支持 `mysql`，改方言需编辑 `.env` 后重启。
+
+面板分四组：语义治理（总开关、数据源、上下文预算、一次纠错上限）、MySQL EXPLAIN 预检（开关、超时、估算扫描行数上限）、执行范围与安全（行数/超时/SQL 长度上限、范围强制、禁用表）、高级（prepared capability 与 history binding 的容量与 TTL）。
+
+提交路径为「前置校验 → 只发送变化项 → 事务式重载」：
+
+- 前置校验在 `core/utils/governance_settings.py` 中复刻 `validate_runtime_config` 的取值范围与跨字段规则。这是必要的，因为 `_build_governance_components` 会把后端的一切失败收敛为泛化的 `语义治理配置无效`，只有前端能给出具体原因。`EXPLAIN` 开关在治理关闭时直接禁用，不等提交才报错。
+- 只有实际变化的键会被发送，避免无谓地重建整个组件图。
+- 保存成功后控件状态被标记清理，下一轮渲染从新的 `ctx.config` 只读快照重新播种，因此界面始终显示已生效的值而非残留输入。
+- `ApplicationConfigurationError` 的消息按设计只含配置键名、不含取值，可直接展示；其他异常只提示查看 `logs/app.log` 中的错误编号，不回显原始消息。
+
+该面板刻意不调用 `st.rerun()`：重跑会使结果反馈与控件状态分离，且 Streamlit 的 `AppTest` 会因按钮状态被重复投递而无限重跑，导致保存链路无法被测试。`tests/test_governance_panel.py` 以 `AppTest` 真实渲染面板并覆盖保存、校验拦截、异常呈现与恢复默认路径。
+
 生成阶段的 prepared capability 默认最多保留 256 个、120 秒，并在消费或放弃时
 原子删除；达到上限会稳定地拒绝新请求。受治理历史 binding 默认 900 秒过期，
 容量不超过 `HISTORY_MAX_RECORDS`（并有 4096 的进程内硬上限），只保存带进程随机密钥

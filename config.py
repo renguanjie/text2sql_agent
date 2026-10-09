@@ -15,88 +15,16 @@ from core.config_validation import (
     validate_runtime_config,
 )
 
+# 提供商目录定义在 core/provider_catalog.py，此处重新导出以保持既有导入路径
+# （`from config import LLM_PROVIDERS`）；core/config_validation.py 也依赖它
+# 来校验"提供商是否需要 API Key"。
+from core.provider_catalog import EMBEDDING_PROVIDERS, LLM_PROVIDERS
+
 # 加载环境变量
 load_dotenv()
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent
-
-# ==================== 模型目录 ====================
-
-# 支持的 LLM 提供商及推荐模型
-LLM_PROVIDERS = {
-    "openai": {
-        "label": "OpenAI",
-        "default_model": "gpt-4o",
-        "needs_api_key": True,
-        "needs_base_url": False,
-        "default_base_url": "",
-    },
-    "ollama": {
-        "label": "Ollama (本地)",
-        "default_model": "gemma3:e4b",
-        "needs_api_key": False,
-        "needs_base_url": True,
-        "default_base_url": "http://localhost:11434",
-    },
-    "anthropic": {
-        "label": "Anthropic (Claude)",
-        "default_model": "claude-sonnet-4-20250514",
-        "needs_api_key": True,
-        "needs_base_url": False,
-        "default_base_url": "",
-    },
-    "dashscope": {
-        "label": "DashScope (通义千问)",
-        "default_model": "qwen-max",
-        "needs_api_key": True,
-        "needs_base_url": True,
-        "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    },
-    "deepseek": {
-        "label": "DeepSeek (深度求索)",
-        "default_model": "deepseek-chat",
-        "needs_api_key": True,
-        "needs_base_url": True,
-        "default_base_url": "https://api.deepseek.com/v1",
-    },
-    "zhipu": {
-        "label": "智谱 AI",
-        "default_model": "glm-4-flash",
-        "needs_api_key": True,
-        "needs_base_url": True,
-        "default_base_url": "https://open.bigmodel.cn/api/paas/v4",
-    },
-    "azure": {
-        "label": "Azure OpenAI",
-        "default_model": "gpt-4o",
-        "needs_api_key": True,
-        "needs_base_url": True,
-        "default_base_url": "",
-    },
-}
-
-# 支持的 Embedding 模型提供商
-EMBEDDING_PROVIDERS = {
-    "dashscope": {
-        "label": "DashScope (通义千问)",
-        "default_model": "text-embedding-v3",
-        "dimensions": 1024,
-        "needs_api_key": True,
-    },
-    "openai": {
-        "label": "OpenAI",
-        "default_model": "text-embedding-3-large",
-        "dimensions": 3072,
-        "needs_api_key": True,
-    },
-    "ollama": {
-        "label": "Ollama (本地)",
-        "default_model": "bge-m3:latest",
-        "dimensions": 1024,
-        "needs_api_key": False,
-    },
-}
 
 # ==================== MySQL 配置 ====================
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
@@ -241,6 +169,10 @@ def validate_config():
             "history_auto_save": HISTORY_AUTO_SAVE,
             "history_max_records": HISTORY_MAX_RECORDS,
             "sql_dialect": SQL_DIALECT,
+            "llm_provider": LLM_PROVIDER,
+            "llm_api_key": LLM_API_KEY,
+            "embedding_provider": EMBEDDING_PROVIDER,
+            "embedding_api_key": EMBEDDING_API_KEY,
             "mysql_port": MYSQL_PORT,
             "mysql_pool_size": MYSQL_POOL_SIZE,
             "mysql_max_overflow": MYSQL_MAX_OVERFLOW,
@@ -291,12 +223,10 @@ def validate_config():
     if EMBEDDING_PROVIDER not in EMBEDDING_PROVIDERS:
         errors.append(f"未知的 Embedding 提供商：{EMBEDDING_PROVIDER}，支持的提供商：{list(EMBEDDING_PROVIDERS.keys())}")
 
-    # 验证需要 API Key 的提供商
-    if LLM_PROVIDERS.get(LLM_PROVIDER, {}).get("needs_api_key") and not LLM_API_KEY:
-        errors.append(f"LLM 提供商 {LLM_PROVIDER} 需要配置 LLM_API_KEY")
-
-    if EMBEDDING_PROVIDERS.get(EMBEDDING_PROVIDER, {}).get("needs_api_key") and not EMBEDDING_API_KEY:
-        errors.append(f"Embedding 提供商 {EMBEDDING_PROVIDER} 需要配置 EMBEDDING_API_KEY")
+    # 「提供商需要 API Key」的校验已上移到 validate_runtime_config，
+    # 这样启动和 reload_llm/reload_embedding 热重载走的是同一条规则。
+    # 上面两条「未知提供商」检查刻意只保留在启动路径：热重载对未知 provider
+    # 是容错回退，且其原子性测试依赖该语义。
 
     if errors:
         from loguru import logger
