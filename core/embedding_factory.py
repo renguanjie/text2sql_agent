@@ -27,11 +27,6 @@ class EmbeddingProviderError(EmbeddingError):
     pass
 
 
-class EmbeddingDimensionMismatchError(EmbeddingError):
-    """Embedding 维度不匹配错误"""
-    pass
-
-
 class EmbeddingFactory:
     """Embedding 模型工厂"""
 
@@ -388,41 +383,3 @@ class EmbeddingFactory:
         """获取缓存大小"""
         return len(self._cache)
 
-
-# ==================== 向后兼容（已废弃，请使用 ApplicationContext） ====================
-# 保留全局单例以兼容旧代码，新功能应使用 ApplicationContext
-
-_embedding_factory: Optional[EmbeddingFactory] = None
-
-
-def get_embedding_factory(provider: str = "dashscope",
-                          model: str = "text-embedding-v1",
-                          api_key: Optional[str] = None,
-                          api_base: Optional[str] = None) -> EmbeddingFactory:
-    """
-    获取或创建 Embedding 工厂单例
-
-    .. deprecated:: 1.4
-        此函数已废弃，请使用 `ApplicationContext` 管理组件生命周期。
-        保留此函数仅为向后兼容，新功能不应使用。
-
-    Args:
-        provider: 提供商
-        model: 模型名称
-        api_key: API 密钥
-        api_base: API 基础 URL
-
-    Returns:
-        EmbeddingFactory: 工厂实例
-    """
-    import warnings
-    warnings.warn(
-        "get_embedding_factory() 已废弃，请使用 ApplicationContext 代替。"
-        "此函数将在未来版本中移除。",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    global _embedding_factory
-    if _embedding_factory is None:
-        _embedding_factory = EmbeddingFactory(provider, model, api_key, api_base)
-    return _embedding_factory

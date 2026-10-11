@@ -102,28 +102,3 @@ class SchemaExtractResult(BaseModel):
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式"""
         return self.model_dump()
-
-
-# ==================== 辅助枚举 ====================
-
-class DatabaseType(str):
-    """支持的数据库类型"""
-    MYSQL = "mysql"
-    ORACLE = "oracle"
-    SPARK = "spark"
-    POSTGRESQL = "postgresql"
-
-
-class ExtractorType(str):
-    """抽取器类型"""
-    LIVE_DB = "live_db"
-    OFFLINE_DDL = "offline_ddl"
-    OFFLINE_JSON = "offline_json"
-
-
-class JoinType(str):
-    """JOIN 类型"""
-    INNER = "INNER JOIN"
-    LEFT = "LEFT JOIN"
-    RIGHT = "RIGHT JOIN"
-    FULL = "FULL OUTER JOIN"

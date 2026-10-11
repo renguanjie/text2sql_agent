@@ -1006,37 +1006,3 @@ class MySQLClient:
             }
         return {}
 
-
-# ==================== 向后兼容（已废弃，请使用 ApplicationContext） ====================
-# 保留全局单例以兼容旧代码，新功能应使用 ApplicationContext
-
-_mysql_client: Optional[MySQLClient] = None
-
-
-def get_mysql_client(host: str, port: int, user: str, password: str,
-                     database: str, pool_size: int = 10,
-                     max_overflow: int = 20, pool_timeout: int = 30) -> MySQLClient:
-    """
-    获取或创建 MySQL 客户端单例（带连接池配置）
-
-    .. deprecated:: 请使用 ApplicationContext 管理组件生命周期
-
-    Args:
-        host: 主机
-        port: 端口
-        user: 用户名
-        password: 密码
-        database: 数据库名
-        pool_size: 连接池大小，默认 10
-        max_overflow: 最大溢出连接数，默认 20
-        pool_timeout: 获取连接超时时间（秒），默认 30
-
-    Returns:
-        MySQLClient: 客户端实例
-    """
-    global _mysql_client
-    if _mysql_client is None:
-        _mysql_client = MySQLClient(host, port, user, password, database,
-                                    pool_size, max_overflow, pool_timeout)
-        _mysql_client.connect()
-    return _mysql_client

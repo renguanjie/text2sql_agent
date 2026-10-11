@@ -143,7 +143,6 @@ required_files = [
     'core/history/mysql_client.py',
     'core/llm_factory.py',
     'app/__init__.py',
-    'app/pages/history.py',
     'tests/test_core.py'
 ]
 
@@ -174,8 +173,7 @@ files_to_check = [
     'core/chain/sql_chain.py',
     'core/sql/generator.py',
     'core/sql/validator.py',
-    'app.py',
-    'app/pages/history.py'
+    'app.py'
 ]
 
 syntax_errors = []

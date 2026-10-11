@@ -2,7 +2,7 @@
 LLM 工厂模块
 创建和配置各种 LLM 实例
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Any
 from loguru import logger
 import os
 
@@ -173,27 +173,3 @@ def _create_anthropic_llm(model: str, api_key: Optional[str],
         logger.error("需要安装 langchain-anthropic: pip install langchain-anthropic")
         raise
 
-
-def get_llm_from_config(config: Optional[Dict] = None) -> Any:
-    """
-    从配置创建 LLM
-
-    Args:
-        config: 配置字典
-
-    Returns:
-        LLM 实例
-    """
-    from config import (
-        LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
-    )
-
-    config = config or {}
-
-    return create_llm(
-        provider=config.get('provider', LLM_PROVIDER),
-        model=config.get('model', LLM_MODEL),
-        api_key=config.get('api_key', LLM_API_KEY),
-        base_url=config.get('base_url', LLM_BASE_URL),
-        temperature=config.get('temperature', 0.1)
-    )

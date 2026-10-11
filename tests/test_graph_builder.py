@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from loguru import logger
 from config import NEO4J_ENABLED, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
-from core.knowledge.neo4j_client import get_neo4j_client
+from core.knowledge.neo4j_client import Neo4jClient
 from core.graph_builder import run_pipeline, GraphBuilderPipeline
 from core.graph_builder.extractors.offline_json_extractor import OfflineJSONExtractor
 
@@ -180,7 +180,9 @@ def test_full_pipeline_with_neo4j():
     ddl_path.write_text(ddl_content, encoding="utf-8")
 
     try:
-        neo4j_client = get_neo4j_client(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+        # 已废弃的全局单例 get_neo4j_client 已移除；测试自行管理客户端生命周期
+        neo4j_client = Neo4jClient(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+        neo4j_client.connect()
 
         stats = run_pipeline(
             source_type="offline",

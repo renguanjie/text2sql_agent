@@ -1334,36 +1334,3 @@ class Neo4jClient:
         logger.info(f"同步了 {count} 条元数据到 MySQL")
         return count
 
-
-# ==================== 向后兼容（已废弃，请使用 ApplicationContext） ====================
-# 保留全局单例以兼容旧代码，新功能应使用 ApplicationContext
-
-_neo4j_client: Optional[Neo4jClient] = None
-
-
-def get_neo4j_client(uri: str, user: str, password: str,
-                     database: str = "neo4j",
-                     max_connection_pool_size: int = 50,
-                     connection_timeout: int = 30) -> Neo4jClient:
-    """
-    获取或创建 Neo4j 客户端单例（带连接池配置）
-
-    .. deprecated:: 请使用 ApplicationContext 管理组件生命周期
-
-    Args:
-        uri: Neo4j URI
-        user: 用户名
-        password: 密码
-        database: 数据库名
-        max_connection_pool_size: 最大连接池大小，默认 50
-        connection_timeout: 连接超时时间（秒），默认 30
-
-    Returns:
-        Neo4jClient: 客户端实例
-    """
-    global _neo4j_client
-    if _neo4j_client is None:
-        _neo4j_client = Neo4jClient(uri, user, password, database,
-                                    max_connection_pool_size, connection_timeout)
-        _neo4j_client.connect()
-    return _neo4j_client

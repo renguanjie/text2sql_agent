@@ -4,7 +4,6 @@
 """
 import os
 from pathlib import Path
-from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -37,12 +36,6 @@ MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "text2sql_db")
 MYSQL_POOL_SIZE = parse_env_int("MYSQL_POOL_SIZE", 10)  # 连接池大小
 MYSQL_MAX_OVERFLOW = parse_env_int("MYSQL_MAX_OVERFLOW", 20)  # 最大溢出连接数
 MYSQL_POOL_TIMEOUT = parse_env_int("MYSQL_POOL_TIMEOUT", 30)  # 获取连接超时时间（秒）
-
-# MySQL 连接 URL
-MYSQL_URI = (
-    f"mysql+mysqlconnector://{quote_plus(MYSQL_USER)}:{quote_plus(MYSQL_PASSWORD)}"
-    f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
-)
 
 # ==================== Neo4j 配置 ====================
 NEO4J_ENABLED = parse_env_bool("NEO4J_ENABLED", False)
