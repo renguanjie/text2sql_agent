@@ -47,6 +47,8 @@ from config import (
     LLM_MODEL,
     LLM_PROVIDER,
     LLM_PROVIDERS,
+    LOG_FILE,
+    LOG_LEVEL,
     MAX_PREPARED_REQUESTS,
     MYSQL_DATABASE,
     MYSQL_HOST,
@@ -219,16 +221,17 @@ def get_knowledge_graph_template() -> dict:
         ]
     }
 
-# 配置日志
+# 配置日志（级别与路径由 LOG_LEVEL / LOG_FILE 控制；此前两者被定义却从未被读取，
+# 导致 .env 里的日志级别配置完全不起作用，且文件 sink 恒为 DEBUG）
 logger.remove()
 logger.add(
     make_safe_streamlit_sink(st.write),
-    level="INFO",
+    level=LOG_LEVEL,
     format=safe_log_format,
 )
 logger.add(
-    project_root / "logs" / "app.log",
-    level="DEBUG",
+    LOG_FILE,
+    level=LOG_LEVEL,
     rotation="1 day",
     format=safe_log_format,
 )
@@ -1393,7 +1396,7 @@ with tab4:
     # 日志
     st.markdown("#### 📝 最近日志")
     try:
-        log_file = project_root / "logs" / "app.log"
+        log_file = Path(LOG_FILE)
         if log_file.exists():
             with open(log_file, 'r', encoding='utf-8') as f:
                 logs = f.readlines()[-20:]
