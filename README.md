@@ -1,6 +1,12 @@
-# Text2SQL 智能体
+<p align="center">
+  <img src="assets/logo.png" alt="溯算编程 Logo" width="220">
+</p>
+
+# 溯算编程 · Text2SQL 智能体
 
 基于本地知识库的 SQL 智能生成系统
+
+**出品**: 溯算编程
 
 > **最新版本**: v1.4
 > **核心升级**: 多模型 UI 热切换 + 安全加固 + SQL 注入防护 + 全链路代码质量优化

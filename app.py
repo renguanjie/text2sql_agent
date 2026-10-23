@@ -13,6 +13,10 @@ import streamlit as st
 project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
+# 品牌资源
+LOGO_PATH = project_root / "assets" / "logo.png"
+LOGO_ICON_PATH = project_root / "assets" / "logo_icon.png"
+
 import uuid
 
 from loguru import logger
@@ -238,14 +242,14 @@ logger.add(
 
 # ==================== 页面配置 ====================
 st.set_page_config(
-    page_title="Text2SQL 智能体",
-    page_icon="📊",
+    page_title="溯算编程 · Text2SQL 智能体",
+    page_icon=str(LOGO_ICON_PATH),
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
         'Get Help': 'https://github.com/renguanjie/text2sql-agent',
         'Report a bug': 'https://github.com/renguanjie/text2sql-agent/issues',
-        'About': '# Text2SQL 智能体\n基于本地知识库的 SQL 智能生成系统\n\n核心技术：BM25+FAISS 检索 + LangChain + SQLFluff'
+        'About': '# 溯算编程 · Text2SQL 智能体\n基于本地知识库的 SQL 智能生成系统\n\n核心技术：BM25+FAISS 检索 + LangChain + SQLFluff'
     }
 )
 
@@ -695,6 +699,8 @@ def _render_model_config_panel():
 
 # ==================== 侧边栏 ====================
 with st.sidebar:
+    if LOGO_PATH.exists():
+        st.image(LOGO_PATH, width=160)
     st.title("⚙️ 控制中心")
 
     # 系统状态卡片
@@ -935,7 +941,7 @@ with st.sidebar:
     # 关于
     st.markdown("### ℹ️ 关于")
     st.markdown("""
-    **Text2SQL 智能体 v1.0**
+    **溯算编程 · Text2SQL 智能体 v1.0**
 
     基于本地知识库的 SQL 智能生成系统
 
@@ -947,12 +953,12 @@ with st.sidebar:
     """)
 
     st.markdown("---")
-    st.caption("© 2026 Text2SQL Agent")
+    st.caption("© 2026 溯算编程")
 
 
 # ==================== 主界面 ====================
 # 主标题
-st.markdown('<p class="main-title">📊 Text2SQL 智能体</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-title">📊 溯算编程 · Text2SQL 智能体</p>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">基于本地知识库的 SQL 智能生成系统</p>', unsafe_allow_html=True)
 
 # 选项卡
@@ -1411,7 +1417,7 @@ with tab4:
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #999; padding: 20px 0;'>"
-    "Text2SQL 智能体 v1.0 | 基于本地知识库的 SQL 智能生成系统 | © 2026"
+    "溯算编程 · Text2SQL 智能体 v1.0 | 基于本地知识库的 SQL 智能生成系统 | © 2026 溯算编程"
     "</div>",
     unsafe_allow_html=True
 )
