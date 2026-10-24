@@ -86,7 +86,7 @@ if 'neon_engine' not in st.session_state:
 # ==================== 侧边栏 ====================
 with st.sidebar:
     if LOGO_PATH.exists():
-        st.image(LOGO_PATH, width=160)
+        st.image(str(LOGO_PATH), width=160)
     st.title("⚙️ 配置")
 
     # 数据库配置
@@ -173,7 +173,7 @@ with st.sidebar:
                     st.info(f"结果：{item['result']}")
 
 # ==================== 主页面 ====================
-st.markdown('<h1 class="main-title">📊 溯算编程 · Text2SQL 智能体 - Neon 版</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-title">溯算编程 · Text2SQL 智能体 - Neon 版</h1>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">基于阿里云 Qwen-Max + Neo4j 知识库的 SQL 智能生成系统</p>', unsafe_allow_html=True)
 
 # ==================== 功能选择 ====================
