@@ -16,10 +16,11 @@ def normalize_relationships(neo4j_client) -> int:
     Returns:
         int: 更新的关系数量
     """
-    # 1. 查询所有 CONNECTS 关系
+    # 1. 查询所有 CONNECTS 关系（含 database_id，分组按库隔离）
     result = neo4j_client.execute_query("""
         MATCH (from:Table)-[r:CONNECTS]->(to:Table)
-        RETURN from.name as from_table, to.name as to_table,
+        RETURN from.database_id as from_db_id, from.name as from_table,
+               to.database_id as to_db_id, to.name as to_table,
                r.from_column as from_column, r.to_column as to_column,
                r.weight as current_weight, r.occurrence_count as occurrence_count,
                r.source as source, id(r) as rel_id
@@ -29,23 +30,23 @@ def normalize_relationships(neo4j_client) -> int:
         logger.info("没有需要规范化的 CONNECTS 关系")
         return 0
 
-    # 2. 按 (from_table, to_table) 分组
+    # 2. 按 (源库, 源表, 目标库, 目标表) 分组
     table_pairs: Dict[tuple, List[Dict]] = {}
     for row in result:
-        key = (row['from_table'], row['to_table'])
+        key = (row.get('from_db_id'), row['from_table'], row.get('to_db_id'), row['to_table'])
         if key not in table_pairs:
             table_pairs[key] = []
         table_pairs[key].append(row)
 
     # 3. 对每组平分权重
     updated_count = 0
-    for (from_table, to_table), rels in table_pairs.items():
+    for (from_db_id, from_table, to_db_id, to_table), rels in table_pairs.items():
         n = len(rels)
         if n == 0:
             continue
         weight = 1.0 / n
         for rel in rels:
-            neo4j_client.execute_query(
+            neo4j_client._execute_write(
                 """
                 MATCH ()-[r:CONNECTS]->()
                 WHERE id(r) = $rel_id
@@ -88,20 +89,49 @@ def rebalance_with_history(history_joins: List[Dict], neo4j_client,
         if not (from_table and to_table and from_column and to_column):
             continue
 
+        # 历史 JOIN 不携带数据库信息：每端确定性匹配唯一一张同名表
+        #（database_id 最小者），避免跨库串挂或一对多扩散
+        pick_from = neo4j_client.execute_query(
+            """
+            MATCH (from:Table {name: $from_table})
+            RETURN from.database_id as database_id
+            ORDER BY from.database_id
+            LIMIT 1
+            """,
+            {"from_table": from_table}
+        )
+        pick_to = neo4j_client.execute_query(
+            """
+            MATCH (to:Table {name: $to_table})
+            RETURN to.database_id as database_id
+            ORDER BY to.database_id
+            LIMIT 1
+            """,
+            {"to_table": to_table}
+        )
+        from_db_id = pick_from[0]["database_id"] if pick_from else None
+        to_db_id = pick_to[0]["database_id"] if pick_to else None
+
         # 检查该关系是否已存在
         existing = neo4j_client.execute_query(
             """
             MATCH (from:Table {name: $from_table})-[r:CONNECTS {
                 from_column: $from_column, to_column: $to_column
             }]->(to:Table {name: $to_table})
+            WHERE ($from_db_id IS NULL OR from.database_id = $from_db_id)
+              AND ($to_db_id IS NULL OR to.database_id = $to_db_id)
             RETURN r.weight as weight, r.occurrence_count as occurrence_count,
                    r.join_type as join_type
+            ORDER BY from.database_id, to.database_id
+            LIMIT 1
             """,
             {
                 "from_table": from_table,
                 "to_table": to_table,
                 "from_column": from_column,
-                "to_column": to_column
+                "to_column": to_column,
+                "from_db_id": from_db_id,
+                "to_db_id": to_db_id,
             }
         )
 
@@ -112,11 +142,13 @@ def rebalance_with_history(history_joins: List[Dict], neo4j_client,
             new_weight = old_weight * (1 - eta) + eta
             new_count = old_count + 1
 
-            neo4j_client.execute_query(
+            neo4j_client._execute_write(
                 """
                 MATCH (from:Table {name: $from_table})-[r:CONNECTS {
                     from_column: $from_column, to_column: $to_column
                 }]->(to:Table {name: $to_table})
+                WHERE ($from_db_id IS NULL OR from.database_id = $from_db_id)
+                  AND ($to_db_id IS NULL OR to.database_id = $to_db_id)
                 SET r.weight = $new_weight,
                     r.occurrence_count = $new_count,
                     r.source = 'history_extracted',
@@ -127,6 +159,8 @@ def rebalance_with_history(history_joins: List[Dict], neo4j_client,
                     "to_table": to_table,
                     "from_column": from_column,
                     "to_column": to_column,
+                    "from_db_id": from_db_id,
+                    "to_db_id": to_db_id,
                     "new_weight": min(new_weight, 1.0),
                     "new_count": new_count
                 }
@@ -138,29 +172,34 @@ def rebalance_with_history(history_joins: List[Dict], neo4j_client,
             # 新关系：获取当前表对的关系数
             pair_count_result = neo4j_client.execute_query(
                 """
-                MATCH (:Table {name: $from_table})-[:CONNECTS]->(:Table {name: $to_table})
+                MATCH (f:Table {name: $from_table})-[:CONNECTS]->(:Table {name: $to_table})
+                WHERE ($from_db_id IS NULL OR f.database_id = $from_db_id)
                 RETURN count(*) as count
                 """,
-                {"from_table": from_table, "to_table": to_table}
+                {"from_table": from_table, "to_table": to_table, "from_db_id": from_db_id}
             )
             existing_count = pair_count_result[0]["count"] if pair_count_result else 0
             new_weight = 1.0 / (existing_count + 1)
 
             # 收缩已有关系的权重
             if existing_count > 0:
-                neo4j_client.execute_query(
+                neo4j_client._execute_write(
                     """
                     MATCH (from:Table {name: $from_table})-[r:CONNECTS]->(to:Table {name: $to_table})
+                    WHERE ($from_db_id IS NULL OR from.database_id = $from_db_id)
+                      AND ($to_db_id IS NULL OR to.database_id = $to_db_id)
                     SET r.weight = r.weight * (1 - $new_weight)
                     """,
-                    {"from_table": from_table, "to_table": to_table, "new_weight": new_weight}
+                    {"from_table": from_table, "to_table": to_table,
+                     "from_db_id": from_db_id, "to_db_id": to_db_id,
+                     "new_weight": new_weight}
                 )
 
-            # 创建新关系
-            neo4j_client.execute_query(
+            # 创建新关系（端点按确定性选择的数据库限定）
+            neo4j_client._execute_write(
                 """
-                MATCH (from:Table {name: $from_table})
-                MATCH (to:Table {name: $to_table})
+                MATCH (from:Table {name: $from_table, database_id: $from_db_id})
+                MATCH (to:Table {name: $to_table, database_id: $to_db_id})
                 MERGE (from)-[r:CONNECTS {
                     from_column: $from_column, to_column: $to_column
                 }]->(to)
@@ -174,6 +213,8 @@ def rebalance_with_history(history_joins: List[Dict], neo4j_client,
                 {
                     "from_table": from_table,
                     "to_table": to_table,
+                    "from_db_id": from_db_id,
+                    "to_db_id": to_db_id,
                     "from_column": from_column,
                     "to_column": to_column,
                     "join_type": join_type,

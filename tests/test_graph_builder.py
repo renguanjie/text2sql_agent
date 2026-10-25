@@ -15,6 +15,7 @@ from loguru import logger
 from config import NEO4J_ENABLED, NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
 from core.knowledge.neo4j_client import Neo4jClient
 from core.graph_builder import run_pipeline, GraphBuilderPipeline
+from core.graph_builder.extractors.offline_extractor import OfflineExtractor
 from core.graph_builder.extractors.offline_json_extractor import OfflineJSONExtractor
 
 # 配置日志
@@ -149,6 +150,54 @@ def test_offline_json_extractor_preserves_multi_database_metadata(tmp_path):
     assert result.relationships[0].to_database == "sales"
     assert result.relationships[0].to_database_id == 10
     assert result.concepts[0].mapped_tables == ["orders"]
+
+
+def test_offline_extractor_column_types_and_nullable(tmp_path):
+    """括号类型不得损坏；显式 NULL/DEFAULT NULL 可空，NOT NULL 与主键不可空。"""
+    ddl_path = tmp_path / "types.sql"
+    ddl_path.write_text("""
+    CREATE TABLE sample (
+        name VARCHAR(100) NOT NULL COMMENT '名称',
+        price DECIMAL(18,2) DEFAULT 0 COMMENT '价格',
+        note TEXT DEFAULT NULL COMMENT '备注',
+        flag TINYINT NULL COMMENT '显式可空',
+        id BIGINT PRIMARY KEY COMMENT '主键'
+    ) COMMENT='样例表';
+    """, encoding="utf-8")
+
+    result = OfflineExtractor(ddl_path=str(ddl_path)).extract()
+    columns = {c.name: c for c in result.tables[0].columns}
+
+    assert columns["name"].data_type == "VARCHAR"
+    assert columns["name"].is_nullable is False
+    assert columns["price"].data_type == "DECIMAL"
+    assert columns["price"].is_nullable is True
+    assert columns["note"].is_nullable is True
+    assert columns["flag"].is_nullable is True
+    assert columns["id"].is_nullable is False
+
+
+def test_offline_extractor_multi_database_ddl(tmp_path):
+    """USE 语句与 db.table 限定名应把表归到正确的数据库。"""
+    ddl_path = tmp_path / "multi_db.sql"
+    ddl_path.write_text("""
+    CREATE DATABASE sales;
+    CREATE DATABASE finance;
+    USE sales;
+    CREATE TABLE orders (order_id BIGINT PRIMARY KEY) COMMENT='订单';
+    CREATE TABLE finance.invoice (invoice_id BIGINT PRIMARY KEY) COMMENT='发票';
+    USE finance;
+    CREATE TABLE account (account_id BIGINT PRIMARY KEY) COMMENT='账户';
+    """, encoding="utf-8")
+
+    result = OfflineExtractor(ddl_path=str(ddl_path)).extract()
+    by_name = {t.name: t for t in result.tables}
+
+    assert {d.name for d in result.databases} == {"sales", "finance"}
+    assert by_name["orders"].database == "sales"
+    assert by_name["invoice"].database == "finance"
+    assert by_name["account"].database == "finance"
+    assert all(t.database_id for t in result.tables)
 
 
 def test_full_pipeline_with_neo4j():
