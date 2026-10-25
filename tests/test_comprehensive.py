@@ -83,7 +83,7 @@ class TestConfig:
             SQL_DIALECT,
         )
         assert MYSQL_PORT == 3306
-        assert MYSQL_DATABASE == 'text2sql_db'
+        assert MYSQL_DATABASE == 'business_db'
         assert 'bolt://' in NEO4J_URI
         assert RETRIEVAL_TOP_K == 5
         assert SQL_DIALECT == 'mysql'

@@ -22,7 +22,7 @@ LLM_PROVIDERS: dict[str, dict[str, Any]] = {
     },
     "ollama": {
         "label": "Ollama (本地)",
-        "default_model": "gemma3:e4b",
+        "default_model": "gemma4:E4B",
         "needs_api_key": False,
         "needs_base_url": True,
         "default_base_url": "http://localhost:11434",
