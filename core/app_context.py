@@ -830,6 +830,7 @@ class ApplicationContext:
                     metadata_list.append({
                         'node_type': 'table', 'name': name,
                         'description': table.get('description', ''),
+                        'database_id': table.get('database_id'),
                     })
         elif self._mysql_client and self._mysql_client.engine:
             for table in self._mysql_client.get_table_schema():
@@ -840,6 +841,7 @@ class ApplicationContext:
                     metadata_list.append({
                         'node_type': 'table', 'name': name,
                         'description': table.get('table_comment', ''),
+                        'database_id': table.get('database_id'),
                     })
         if documents:
             retriever.retriever.index_documents(documents, metadata_list)
@@ -891,7 +893,8 @@ class ApplicationContext:
                 metadata_list.append({
                     'node_type': 'table',
                     'name': table.get('name', ''),
-                    'description': table.get('description', '')
+                    'description': table.get('description', ''),
+                    'database_id': table.get('database_id'),
                 })
         if documents:
             self._knowledge_retriever.retriever.index_documents(documents, metadata_list)

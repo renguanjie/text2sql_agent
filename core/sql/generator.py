@@ -1348,7 +1348,8 @@ def create_sql_generator(
             metadata.append({
                 'node_type': 'table',
                 'name': table.get('name', ''),
-                'description': table.get('description', '')
+                'description': table.get('description', ''),
+                'database_id': table.get('database_id'),
             })
 
     # 3. 创建 SQL 生成链
