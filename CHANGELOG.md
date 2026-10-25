@@ -52,5 +52,15 @@
 ### Verified
 
 - 全量回归：`934 passed, 16 skipped`。
+- MySQL 真实集成测试（`TEXT2SQL_RUN_DB_TESTS=1`）：6 个全绿，
+  跑后 `table_schema`/`column_schema`/`sql_generation_history` 零测试残留。
 - 端到端：检索（命中 risk_blacklist）→ SQL 生成 → 执行 → 历史回写，
   在干净图谱 + 新配置下全链路通过。
+
+### Fixed（本轮补充）
+
+- `fix(mysql)`：`table_schema` 建表 DDL 缺失 `properties` 列，
+  新增幂等迁移 `_migrate_table_schema()` 为旧库补列；
+  `upsert_table_schema` 失败时不再静默返回 True（`raise_on_error=True`）。
+- `test(mysql)`：集成测试连接串改读 `config`，
+  自带夹具播种/清理，不再硬编码 `localhost`/`text2sql_db`。

@@ -108,6 +108,7 @@ _MANAGEMENT_TABLE_DDL = (
         id BIGINT AUTO_INCREMENT PRIMARY KEY,
         table_name VARCHAR(255) NOT NULL COMMENT '表名',
         table_comment VARCHAR(500) COMMENT '表注释',
+        properties JSON COMMENT '扩展属性 (JSON 格式)',
         database_name VARCHAR(100) DEFAULT 'text2sql_db' COMMENT '数据库名',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -233,6 +234,7 @@ class MySQLClient:
                 conn.execute(text("SELECT 1"))
             self._ensure_management_tables()
             self._migrate_history_schema()
+            self._migrate_table_schema()
             logger.info(
                 "MySQL 连接池初始化成功：endpoint_id={}, port={}, "
                 "pool_size={}, max_overflow={}",
@@ -304,6 +306,28 @@ class MySQLClient:
                  semantic_version, semantic_content_sha256,
                  validation_status, execution_status, created_at)
                 """,
+            )
+
+    def _migrate_table_schema(self) -> None:
+        """为已存在的 table_schema 表幂等补齐 properties 列（旧库缺该列会导致 upsert 静默失败）。"""
+        column_rows = self.execute_query(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = :database_name
+              AND TABLE_NAME = 'table_schema'
+            """,
+            {"database_name": self.database},
+            raise_on_error=True,
+        )
+        existing_columns = {
+            row.get("column_name") for row in column_rows if row.get("column_name")
+        }
+        if "properties" not in existing_columns:
+            self._apply_history_schema_change(
+                "ALTER TABLE table_schema "
+                "ADD COLUMN properties JSON COMMENT '扩展属性 (JSON 格式)' "
+                "AFTER table_comment"
             )
 
     def _apply_history_schema_change(self, query: str) -> None:
@@ -503,7 +527,9 @@ class MySQLClient:
             "table_comment": table_comment,
             "properties": json.dumps(properties) if properties else None
         }
-        result = self.execute_update(query, params)
+        # raise_on_error=True：写失败必须显式抛错，
+        # 否则返回 0 会被 >= 0 吞掉，造成同步静默丢失
+        result = self.execute_update(query, params, raise_on_error=True)
         return result >= 0
 
     def upsert_column_schema(self, table_name: str, column_name: str,
