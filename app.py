@@ -500,8 +500,19 @@ def _reseed_model_widgets(prefix: str) -> None:
     面板顶部；标记由上一次保存/恢复动作设置。
     """
     flag = f"_{prefix}_reseed"
-    if not st.session_state.pop(flag, False):
+    if not st.session_state.get(flag, False):
         return
+    # 本轮若由保存/恢复按钮触发，cfg_* 里是用户随点击一并提交的新值，
+    # 此刻清除会用旧配置覆盖它，导致本次保存静默写回旧模型；保留标记，
+    # 待下一轮（无按钮触发）再重新播种。
+    save_key, reset_key = (
+        ("btn_save_llm", "btn_reset_llm")
+        if prefix == "llm"
+        else ("btn_save_emb", "btn_reset_emb")
+    )
+    if st.session_state.get(save_key) or st.session_state.get(reset_key):
+        return
+    st.session_state.pop(flag, None)
     for key in list(st.session_state.keys()):
         if key.startswith(f"cfg_{prefix}_"):
             st.session_state.pop(key, None)
