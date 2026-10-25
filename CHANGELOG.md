@@ -62,5 +62,8 @@
 - `fix(mysql)`：`table_schema` 建表 DDL 缺失 `properties` 列，
   新增幂等迁移 `_migrate_table_schema()` 为旧库补列；
   `upsert_table_schema` 失败时不再静默返回 True（`raise_on_error=True`）。
+- `fix(mysql)`：其余 4 处 `execute_update` 失败静默写法统一改 `raise_on_error=True`
+  （`upsert_column_schema`、`update_sql_execution`、`save_feedback`×2、
+  `generator.fix_sql` 历史更新），写失败立即显式报错。
 - `test(mysql)`：集成测试连接串改读 `config`，
   自带夹具播种/清理，不再硬编码 `localhost`/`text2sql_db`。

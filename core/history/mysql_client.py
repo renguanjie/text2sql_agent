@@ -578,7 +578,7 @@ class MySQLClient:
             "is_nullable": 1 if is_nullable else 0,
             "is_primary_key": 1 if is_primary_key else 0
         }
-        result = self.execute_update(query, params)
+        result = self.execute_update(query, params, raise_on_error=True)
         return result >= 0
 
     def save_sql_history(self, user_query: str, generated_sql: str,
@@ -902,7 +902,7 @@ class MySQLClient:
             params["generated_sql"] = generated_sql
         if expected_user_query is not None:
             params["expected_user_query"] = expected_user_query
-        result = self.execute_update(query, params)
+        result = self.execute_update(query, params, raise_on_error=True)
         return result > 0
 
     def get_history_list(self, session_id: Optional[str] = None,
@@ -1103,7 +1103,8 @@ class MySQLClient:
         if feedback_score:
             self.execute_update(
                 "UPDATE sql_generation_history SET feedback_score = :feedback_score WHERE id = :history_id",
-                {"feedback_score": feedback_score, "history_id": history_id}
+                {"feedback_score": feedback_score, "history_id": history_id},
+                raise_on_error=True,
             )
 
         query = """
@@ -1118,7 +1119,7 @@ class MySQLClient:
             "feedback_comment": feedback_comment,
             "corrected_sql": corrected_sql
         }
-        result = self.execute_update(query, params)
+        result = self.execute_update(query, params, raise_on_error=True)
         return result > 0
 
     def get_statistics(self) -> Dict:

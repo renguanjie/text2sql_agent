@@ -1299,6 +1299,7 @@ class SQLGenerator:
                SET generated_sql = :generated_sql, validation_status = 'pending'
                WHERE id = :history_id""",
             {"generated_sql": fix_result['sql'], "history_id": history_id},
+            raise_on_error=True,
         )
         return self.execute_sql(fix_result['sql'], history_id)
 
