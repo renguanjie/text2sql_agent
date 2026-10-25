@@ -788,10 +788,10 @@ with st.sidebar:
         try:
             stats = neo4j.execute_query("""
                 MATCH (n)
-                OPTIONAL MATCH ()-[r]-()
+                OPTIONAL MATCH (n)-[r]-()
                 RETURN
                     count(DISTINCT n) as nodes,
-                    count(r) as relationships
+                    count(DISTINCT r) as relationships
             """)
             if stats:
                 st.caption(f"节点：{stats[0].get('nodes', 0)} | 关系：{stats[0].get('relationships', 0)}")

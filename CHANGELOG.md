@@ -65,5 +65,9 @@
 - `fix(mysql)`：其余 4 处 `execute_update` 失败静默写法统一改 `raise_on_error=True`
   （`upsert_column_schema`、`update_sql_execution`、`save_feedback`×2、
   `generator.fix_sql` 历史更新），写失败立即显式报错。
+- `fix(ui)`：侧栏知识库统计 Cypher 把关系与节点行做笛卡尔积
+  （`OPTIONAL MATCH ()-[r]-()` 未绑定节点），显示值 = 节点数 × 关系数；
+  改为 `OPTIONAL MATCH (n)-[r]-()` + `count(DISTINCT r)`，
+  真实 101 节点 / 100 关系不再显示为 20200。
 - `test(mysql)`：集成测试连接串改读 `config`，
   自带夹具播种/清理，不再硬编码 `localhost`/`text2sql_db`。
