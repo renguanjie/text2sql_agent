@@ -21,6 +21,7 @@ import uuid
 
 from loguru import logger
 
+from app.ui_icons import icon, icon_header, icon_line, inject_icon_styles
 from config import (
     BM25_B,
     BM25_K1,
@@ -252,6 +253,9 @@ st.set_page_config(
         'About': '# 溯算编程 · Text2SQL 智能体\n基于本地知识库的 SQL 智能生成系统\n\n核心技术：BM25+FAISS 检索 + LangChain + SQLFluff'
     }
 )
+
+# 图标组件基础样式（幂等，对齐 Bootstrap Reboot 的克制基线风格）
+inject_icon_styles()
 
 # ==================== 自定义 CSS 样式 ====================
 st.markdown("""
@@ -520,7 +524,7 @@ def _reseed_model_widgets(prefix: str) -> None:
 
 def _render_model_config_panel():
     """渲染模型配置 UI 面板（LLM + Embedding）"""
-    st.markdown("### ️ 模型配置")
+    st.markdown(icon_header("模型配置", "sliders-horizontal", level=3), unsafe_allow_html=True)
     st.caption("切换大语言模型或向量模型后点击保存，系统将自动重载相关组件。")
 
     # 清理必须早于任何控件实例化
@@ -613,19 +617,19 @@ def _render_model_config_panel():
                 if ok:
                     # ctx.config 已成为唯一真相源；只需让控件在下一轮重新播种
                     st.session_state["_llm_reseed"] = True
-                    st.success(f"✅ LLM 已切换为：{detail}")
+                    st.success(f"LLM 已切换为：{detail}")
                 else:
                     st.error(detail)
 
         with col_reset_llm:
-            if st.button("️ 恢复默认 LLM 配置", use_container_width=True, key="btn_reset_llm"):
+            if st.button("恢复默认 LLM 配置", use_container_width=True, key="btn_reset_llm"):
                 with st.spinner("正在恢复 .env 默认 LLM 配置..."):
                     ok, detail = _apply_llm_config(
                         LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL
                     )
                 if ok:
                     st.session_state["_llm_reseed"] = True
-                    st.success(f"✅ 已恢复 .env 默认 LLM：{detail}")
+                    st.success(f"已恢复 .env 默认 LLM：{detail}")
                 else:
                     st.error(f"恢复默认失败，当前生效配置保持不变。{detail}")
 
@@ -674,7 +678,7 @@ def _render_model_config_panel():
 
         col_save_emb, col_reset_emb = st.columns([1, 1])
         with col_save_emb:
-            if st.button("💾 保存并重新加载 Embedding", use_container_width=True, type="primary", key="btn_save_emb"):
+            if st.button("保存并重新加载 Embedding", use_container_width=True, type="primary", key="btn_save_emb"):
                 new_emb_provider = selected_emb_provider
                 new_emb_model = st.session_state.get("cfg_emb_model", emb_provider_info["default_model"])
                 entered_emb_key = st.session_state.get("cfg_emb_api_key", "")
@@ -691,19 +695,19 @@ def _render_model_config_panel():
 
                 if ok:
                     st.session_state["_emb_reseed"] = True
-                    st.success(f"✅ Embedding 已切换为：{detail}")
+                    st.success(f"Embedding 已切换为：{detail}")
                 else:
                     st.error(detail)
 
         with col_reset_emb:
-            if st.button("↩️ 恢复默认 Embedding 配置", use_container_width=True, key="btn_reset_emb"):
+            if st.button("↩恢复默认 Embedding 配置", use_container_width=True, key="btn_reset_emb"):
                 with st.spinner("正在恢复 .env 默认 Embedding 配置..."):
                     ok, detail = _apply_embedding_config(
                         EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_API_KEY
                     )
                 if ok:
                     st.session_state["_emb_reseed"] = True
-                    st.success(f"✅ 已恢复 .env 默认 Embedding：{detail}")
+                    st.success(f"已恢复 .env 默认 Embedding：{detail}")
                 else:
                     st.error(f"恢复默认失败，当前生效配置保持不变。{detail}")
 
@@ -712,37 +716,37 @@ def _render_model_config_panel():
 with st.sidebar:
     if LOGO_PATH.exists():
         st.image(str(LOGO_PATH), width=160)
-    st.title("⚙️ 控制中心")
+    st.markdown(icon_header("控制中心", "settings", level=1, size=22), unsafe_allow_html=True)
 
     # 系统状态卡片
-    st.markdown("### 📊 系统状态")
+    st.markdown(icon_header("系统状态", "activity", level=3), unsafe_allow_html=True)
     ctx = st.session_state.app_context
     if st.session_state.initialized and ctx:
-        st.success("✅ 系统已初始化")
+        st.success("系统已初始化")
 
         col1, col2 = st.columns(2)
         with col1:
             if NEO4J_ENABLED:
-                st.markdown("🔗 **Neo4j**")
+                st.markdown(icon_line("Neo4j", "network"), unsafe_allow_html=True)
                 st.caption("已启用" if ctx.neo4j_client and ctx.neo4j_client.driver else "未连接")
             else:
-                st.markdown("📄 **MySQL 模式**")
+                st.markdown(icon_line("MySQL 模式", "database"), unsafe_allow_html=True)
                 st.caption("元数据模式")
         with col2:
-            st.markdown("💾 **MySQL**")
+            st.markdown(icon_line("MySQL", "database"), unsafe_allow_html=True)
             st.caption("已连接" if ctx.mysql_client else "未连接")
 
-        st.markdown("🔌 **Embedding**")
+        st.markdown(icon_line("Embedding", "plug"), unsafe_allow_html=True)
         st.caption(f"{EMBEDDING_PROVIDER}/{EMBEDDING_MODEL}")
 
-        st.markdown("🎯 **Few-Shot**")
+        st.markdown(icon_line("Few-Shot", "target"), unsafe_allow_html=True)
         st.caption(f"{'已启用' if FEW_SHOT_ENABLED else '禁用'} (top {FEW_SHOT_TOP_K})")
     else:
-        st.warning("⚠️ 系统未初始化")
+        st.warning("系统未初始化")
         with st.spinner("正在初始化系统..."):
             init_result = initialize_system()
             if init_result:
-                st.success("✅ 初始化成功!")
+                st.success("初始化成功!")
                 st.rerun()
             else:
                 st.error(
@@ -753,7 +757,7 @@ with st.sidebar:
     st.divider()
 
     # 重新初始化系统按钮
-    if st.button("🔄 重新初始化系统", use_container_width=True, type="secondary"):
+    if st.button("重新初始化系统", use_container_width=True, type="secondary"):
         if ctx:
             ctx.reset()
         for key in ['initialized', 'app_context']:
@@ -765,12 +769,12 @@ with st.sidebar:
     st.divider()
 
     # 会话信息
-    st.markdown("### 💬 会话信息")
+    st.markdown(icon_header("会话信息", "messages-square", level=3), unsafe_allow_html=True)
     st.code(f"{st.session_state.session_id[:12]}...", language="text")
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("🗑️ 清空历史", use_container_width=True):
+        if st.button("清空历史", use_container_width=True):
             st.session_state.history = []
             st.session_state.last_sql = None
             st.session_state.last_result = None
@@ -781,7 +785,7 @@ with st.sidebar:
     st.divider()
 
     # 知识库管理
-    st.markdown("### 🗄️ 知识库管理")
+    st.markdown(icon_header("知识库管理", "archive", level=3), unsafe_allow_html=True)
 
     if NEO4J_ENABLED and ctx and ctx.neo4j_client and ctx.neo4j_client.driver:
         neo4j = ctx.neo4j_client
@@ -800,14 +804,14 @@ with st.sidebar:
 
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("📤 导出", use_container_width=True, type="secondary"):
+            if st.button("导出", use_container_width=True, type="secondary"):
                 if st.session_state.initialized:
                     with st.spinner("正在导出知识库..."):
                         export_data = neo4j.export_knowledge_graph()
                         if export_data:
                             json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
                             st.download_button(
-                                label="📥 点击下载 JSON 文件",
+                                label="点击下载 JSON 文件",
                                 data=json_str,
                                 file_name=f"knowledge_graph_{st.session_state.session_id[:8]}.json",
                                 mime="application/json",
@@ -815,7 +819,7 @@ with st.sidebar:
                             )
         with col2:
             st.download_button(
-                label="⬇️ 下载模板",
+                label="下载模板",
                 data=json.dumps(get_knowledge_graph_template(), ensure_ascii=False, indent=2),
                 file_name="knowledge_graph_template.json",
                 mime="application/json",
@@ -844,7 +848,7 @@ with st.sidebar:
             if import_data is None:
                 st.warning("格式异常，是否下载模板后按模板调整？")
                 st.download_button(
-                    label="⬇️ 下载知识图谱 JSON 模板",
+                    label="下载知识图谱 JSON 模板",
                     data=json.dumps(get_knowledge_graph_template(), ensure_ascii=False, indent=2),
                     file_name="knowledge_graph_template.json",
                     mime="application/json",
@@ -858,7 +862,7 @@ with st.sidebar:
                         st.write(f"- {error}")
                     st.warning("是否下载模板后按模板调整？")
                     st.download_button(
-                        label="⬇️ 下载知识图谱 JSON 模板",
+                        label="下载知识图谱 JSON 模板",
                         data=json.dumps(get_knowledge_graph_template(), ensure_ascii=False, indent=2),
                         file_name="knowledge_graph_template.json",
                         mime="application/json",
@@ -879,7 +883,7 @@ with st.sidebar:
                             + "。请确认是否覆盖这些数据库的现有图谱。"
                         )
                         confirm_import = st.checkbox(
-                            "✓ 确认覆盖已存在数据库图谱",
+                            "确认覆盖已存在数据库图谱",
                             key="confirm_overwrite_import_kg"
                         )
                         import_clicked = st.button(
@@ -907,7 +911,7 @@ with st.sidebar:
                                 st.error(f"导入失败：{result['error']}")
                             else:
                                 st.success(
-                                    f"✅ 导入完成：{result['nodes']} 个节点，"
+                                    f"导入完成：{result['nodes']} 个节点，"
                                     f"{result['relationships']} 个关系"
                                 )
                                 if ctx:
@@ -921,10 +925,10 @@ with st.sidebar:
         with col_clear1:
             if "confirm_clear_kg" not in st.session_state:
                 st.session_state.confirm_clear_kg = False
-            clear_confirm = st.checkbox("✓ 确认清除", key="confirm_clear_kg",
+            clear_confirm = st.checkbox("确认清除", key="confirm_clear_kg",
                                         help="勾选后点击清除按钮将删除所有知识图谱数据")
         with col_clear2:
-            clear_btn = st.button("🗑️ 清除知识库", use_container_width=True, type="secondary",
+            clear_btn = st.button("清除知识库", use_container_width=True, type="secondary",
                                  disabled=not clear_confirm)
 
         if clear_btn:
@@ -934,7 +938,7 @@ with st.sidebar:
                     if "error" in result:
                         st.error(f"清除失败：{result['error']}")
                     else:
-                        st.success(f"✅ 已删除 {result['nodes']} 个节点，{result['relationships']} 个关系")
+                        st.success(f"已删除 {result['nodes']} 个节点，{result['relationships']} 个关系")
                         if ctx:
                             ctx.reset()
                         for key in ['initialized', 'app_context']:
@@ -950,17 +954,17 @@ with st.sidebar:
     st.divider()
 
     # 关于
-    st.markdown("### ℹ️ 关于")
+    st.markdown(icon_header("关于", "info", level=3), unsafe_allow_html=True)
     st.markdown("""
     **溯算编程 · Text2SQL 智能体 v1.0**
 
     基于本地知识库的 SQL 智能生成系统
 
     **核心技术**:
-    - 🔍 BM25 + FAISS 混合检索
-    - 🤖 LangChain + LLM 智能生成
-    - ✅ SQLFluff 语法校验
-    - 💾 Neo4j/MySQL 双模式
+    - BM25 + FAISS 混合检索
+    - LangChain + LLM 智能生成
+    - SQLFluff 语法校验
+    - Neo4j/MySQL 双模式
     """)
 
     st.markdown("---")
@@ -973,12 +977,12 @@ st.markdown('<p class="main-title">溯算编程 · Text2SQL 智能体</p>', unsa
 st.markdown('<p class="subtitle">基于本地知识库的 SQL 智能生成系统</p>', unsafe_allow_html=True)
 
 # 选项卡
-tab1, tab2, tab3, tab4 = st.tabs(["🔮 SQL 生成", "📜 执行历史", "🏗️ 知识图谱构建", "ℹ️ 系统信息"])
+tab1, tab2, tab3, tab4 = st.tabs(["SQL 生成", "执行历史", "知识图谱构建", "系统信息"])
 
 # ==================== Tab 1: SQL 生成 ====================
 with tab1:
     # 输入区域 - 使用卡片样式
-    st.markdown("### 📝 自然语言转 SQL")
+    st.markdown(icon_header("自然语言转 SQL", "square-pen", level=3), unsafe_allow_html=True)
 
     # 数据库选择
     db_options = []
@@ -1000,7 +1004,7 @@ with tab1:
             # 默认选择第一个数据库
             default_idx = 0
             selected_db_label = st.selectbox(
-                "🗄️ 选择数据库",
+                "选择数据库",
                 options=db_labels,
                 index=default_idx if len(db_labels) > 0 else 0,
                 key="selected_database",
@@ -1012,13 +1016,13 @@ with tab1:
             selected_db_info = next((db for db in db_list if db["database_id"] == selected_db_id), None)
             selected_db_type = selected_db_info["db_type"] if selected_db_info else "mysql"
         else:
-            st.selectbox("🗄️ 选择数据库", options=["暂无数据库"], disabled=True)
+            st.selectbox("选择数据库", options=["暂无数据库"], disabled=True)
             selected_db_id = None
             selected_db_type = "mysql"
 
     with col1:
         user_query = st.text_area(
-            "💭 请输入您的查询需求",
+            "请输入您的查询需求",
             placeholder="例如：查询所有订单金额大于 100 的用户",
             height=120,
             key="user_query",
@@ -1028,7 +1032,7 @@ with tab1:
     with col2:
         st.markdown("""
         <div class="stCard">
-        <h4>💡 示例查询</h4>
+        <h4>示例查询</h4>
         <ul style="padding-left: 20px; line-height: 2;">
         <li>查询所有用户</li>
         <li>查询订单数量</li>
@@ -1044,15 +1048,15 @@ with tab1:
     col1, col2, col3 = st.columns([1, 1, 1])
 
     with col1:
-        generate_btn = st.button("🚀 生成 SQL", type="primary", use_container_width=True)
+        generate_btn = st.button("生成 SQL", type="primary", use_container_width=True)
     with col2:
         execute_btn = st.button(
-            "▶️ 执行 SQL",
+            "▶执行 SQL",
             use_container_width=True,
             disabled=execution_is_disabled(st.session_state.last_result),
         )
     with col3:
-        copy_btn = st.button("📋 复制 SQL", use_container_width=True)
+        copy_btn = st.button("复制 SQL", use_container_width=True)
 
     # 生成 SQL
     if generate_btn and user_query:
@@ -1070,7 +1074,7 @@ with tab1:
                 db_info = ctx.sql_generator.dialect_detector.get_database_info(detected_db_id) if detected_db_id else None
                 db_name = db_info.get('name', '未知') if db_info else '默认数据库'
 
-            st.info(f"🎯 检测到目标数据库：**{db_name}** ({detected_dialect.upper()})")
+            st.info(f"检测到目标数据库：**{db_name}** ({detected_dialect.upper()})")
 
             with st.spinner("正在生成 SQL..."):
                 result = ctx.sql_generator.generate_sql(
@@ -1084,11 +1088,11 @@ with tab1:
             # 检查是否检索到知识
             if result.get('matched_knowledge') is not None and len(result.get('matched_knowledge', [])) == 0:
                 st.warning("""
-                ⚠️ **未检索到相关知识库内容**
+                **未检索到相关知识库内容**
 
                 可能的原因：
                 1. 知识库为空或未初始化 - 请先在"知识图谱构建"页面导入 DDL 文件
-                2. 知识库索引未刷新 - 请点击侧边栏的 **"🔄 重新初始化系统"** 按钮
+                2. 知识库索引未刷新 - 请点击侧边栏的 **"重新初始化系统"** 按钮
                 3. 查询问题与知识库内容不匹配 - 尝试调整查询措辞
                 """)
 
@@ -1098,7 +1102,7 @@ with tab1:
 
                 # 显示思考过程（CoT）
                 if result.get('thinking'):
-                    with st.expander("🧠 思考过程（CoT）", expanded=False):
+                    with st.expander("思考过程（CoT）", expanded=False):
                         st.markdown(result['thinking'])
 
                 # 显示生成的 SQL
@@ -1106,7 +1110,7 @@ with tab1:
 
                 # 显示匹配的知识
                 if result.get('matched_knowledge'):
-                    with st.expander("📚 匹配的知识"):
+                    with st.expander("匹配的知识"):
                         for knowledge in result['matched_knowledge']:
                             st.markdown(f"- **{knowledge['name']}** (类型：{knowledge['node_type']}, 相似度：{knowledge['score']:.4f})")
 
@@ -1115,15 +1119,15 @@ with tab1:
                     result['sql'], dialect=detected_dialect
                 )
                 if validation['valid']:
-                    st.success("✅ SQL 校验通过")
+                    st.success("SQL 校验通过")
                 else:
                     structured = structured_validation_messages(result)
                     if structured:
                         for message in structured:
-                            st.warning(f"⚠️ SQL 校验问题：{message}")
+                            st.warning(f"SQL 校验问题：{message}")
                     else:
                         st.warning(
-                            f"⚠️ SQL 校验问题：{', '.join(validation.get('errors', []))}"
+                            f"SQL 校验问题：{', '.join(validation.get('errors', []))}"
                         )
 
                 # 添加到历史
@@ -1150,7 +1154,7 @@ with tab1:
                     'Connection' in error_msg or 'connection' in error_msg.lower()
                 ):
                     st.error("""
-                    ⚠️ **LLM 服务连接失败**
+                    **LLM 服务连接失败**
 
                     可能的原因：
                     1. 网络连接问题 - 请检查网络连接
@@ -1169,7 +1173,7 @@ with tab1:
 
     # 显示当前 SQL
     if st.session_state.last_sql:
-        st.markdown("### 📄 生成的 SQL")
+        st.markdown(icon_header("生成的 SQL", "file-code", level=3), unsafe_allow_html=True)
         sql_container = st.container()
         with sql_container:
             st.code(st.session_state.last_sql, language='sql', line_numbers=False)
@@ -1178,10 +1182,10 @@ with tab1:
                 st.session_state.last_result
             )
             for message in persisted_validation:
-                st.warning(f"⚠️ SQL 校验问题：{message}")
+                st.warning(f"SQL 校验问题：{message}")
 
             if copy_btn:
-                st.info("💡 点击代码块右上角的复制按钮即可复制 SQL")
+                st.info("点击代码块右上角的复制按钮即可复制 SQL")
 
     # 执行 SQL
     if execute_btn and st.session_state.last_sql and ctx and ctx.sql_generator:
@@ -1202,7 +1206,7 @@ with tab1:
             )
 
         if exec_result.get('status') == 'success':
-            st.success(f"✅ 执行成功，返回 {exec_result.get('row_count', 0)} 条记录")
+            st.success(f"执行成功，返回 {exec_result.get('row_count', 0)} 条记录")
             if exec_result.get('truncated'):
                 st.warning(f"结果超过安全上限，仅显示前 {SQL_QUERY_MAX_ROWS} 条")
 
@@ -1212,16 +1216,16 @@ with tab1:
                 st.dataframe(data, use_container_width=True, height=300)
         else:
             for message in public_failure_messages(exec_result):
-                st.error(f"❌ 执行失败：{message}")
+                st.error(f"执行失败：{message}")
 
     # 无输入提示
     if generate_btn and not user_query:
-        st.warning("⚠️ 请输入查询内容")
+        st.warning("请输入查询内容")
 
 
 # ==================== Tab 2: 执行历史 ====================
 with tab2:
-    st.markdown("### 📜 执行历史")
+    st.markdown(icon_header("执行历史", "history", level=3), unsafe_allow_html=True)
     
     if st.session_state.history:
         # 统计信息
@@ -1243,7 +1247,7 @@ with tab2:
                 with col1:
                     st.markdown(f"**查询:** `{item['query']}`")
                 with col2:
-                    status_icon = "✅" if item.get('status') == 'success' else "⏳"
+                    status_icon = "成功" if item.get('status') == 'success' else "执行中"
                     st.markdown(f"**状态:** {status_icon}")
                 
                 st.code(item['sql'], language='sql', line_numbers=False)
@@ -1251,15 +1255,15 @@ with tab2:
                 # 操作按钮
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    if st.button("📥 使用此 SQL", key=f"use_{i}", use_container_width=True):
+                    if st.button("使用此 SQL", key=f"use_{i}", use_container_width=True):
                         st.session_state.last_sql = item['sql']
                         st.session_state.last_result = item
                         st.rerun()
                 with col2:
-                    if st.button("📋 复制", key=f"copy_{i}", use_container_width=True):
+                    if st.button("复制", key=f"copy_{i}", use_container_width=True):
                         st.success("已复制到剪贴板")
                 with col3:
-                    if st.button("🗑️ 删除", key=f"delete_{i}", use_container_width=True):
+                    if st.button("删除", key=f"delete_{i}", use_container_width=True):
                         st.session_state.history.pop(len(st.session_state.history) - 1 - i)
                         st.rerun()
                 with col4:
@@ -1305,7 +1309,7 @@ with tab2:
                         else:
                             st.warning("Neo4j 未连接，无法增强")
     else:
-        st.info("💡 暂无历史记录，快去生成第一条 SQL 吧！")
+        st.info("暂无历史记录，快去生成第一条 SQL 吧！")
 
 
 # ==================== Tab 3: 知识图谱构建 ====================
@@ -1314,7 +1318,7 @@ with tab3:
     show_kg_builder()
 
 with tab4:
-    st.markdown("### ℹ️ 系统信息")
+    st.markdown(icon_header("系统信息", "info", level=3), unsafe_allow_html=True)
 
     # 读取当前生效的配置（ctx.config 快照，未初始化时回落到 .env）
     _active = _active_model_config()
@@ -1325,7 +1329,7 @@ with tab4:
     _current_emb_model = _active['embedding_model']
 
     # 系统状态卡片
-    st.markdown("#### 🔧 配置信息")
+    st.markdown(icon_header("配置信息", "sliders-horizontal", level=4), unsafe_allow_html=True)
     config_col1, config_col2 = st.columns(2)
     with config_col1:
         # LLM 配置展示（显示当前生效值 + 标签）
@@ -1396,7 +1400,7 @@ with tab4:
     st.divider()
 
     # 统计信息
-    st.markdown("#### 📊 统计信息")
+    st.markdown(icon_header("统计信息", "bar-chart-3", level=4), unsafe_allow_html=True)
     if ctx and ctx.sql_generator:
         stats = ctx.sql_generator.get_statistics()
         
@@ -1411,7 +1415,7 @@ with tab4:
     st.divider()
     
     # 日志
-    st.markdown("#### 📝 最近日志")
+    st.markdown(icon_header("最近日志", "file-text", level=4), unsafe_allow_html=True)
     try:
         log_file = Path(LOG_FILE)
         if log_file.exists():

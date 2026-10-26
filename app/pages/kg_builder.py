@@ -5,6 +5,7 @@
 # ruff: noqa: E402
 import re
 
+from app.ui_icons import icon, icon_header, icon_line, inject_icon_styles
 import streamlit as st
 from pathlib import Path
 import sys
@@ -47,15 +48,15 @@ def _refresh_app_context():
 def render_graph_builder():
     """渲染知识图谱构建页面"""
 
-    st.markdown("""
+    st.markdown(f"""
     <div class="hero-wrapper">
-        <p class="main-title">🏗️ 知识图谱构建</p>
+        <p class="main-title">{icon("workflow", size=26, vertical_align="-0.2em")} 知识图谱构建</p>
         <p class="subtitle">企业级知识图谱自动构建工具 - 支持多源数据融合 + AI 语义增强</p>
         <div class="badge-row">
-            <span class="badge">📁 DDL 文件</span>
-            <span class="badge">💾 活体数据库</span>
-            <span class="badge">🤖 AI 增强</span>
-            <span class="badge">🕒 UNWIND+MERGE</span>
+            <span class="badge">{icon("folder", size=13)} DDL 文件</span>
+            <span class="badge">{icon("database", size=13)} 活体数据库</span>
+            <span class="badge">{icon("bot", size=13)} AI 增强</span>
+            <span class="badge">{icon("history", size=13)} UNWIND+MERGE</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -69,17 +70,17 @@ def render_graph_builder():
         st.session_state.kg_neo4j_client = None
         st.session_state.kg_connected = False
         if not app_ctx:
-            st.warning("⚠️ 系统未初始化，请先在主页面完成初始化")
+            st.warning("系统未初始化，请先在主页面完成初始化")
 
     # 选项卡
-    tab1, tab2, tab3 = st.tabs(["📁 DDL/JSON 文件构建", "💾 活体数据库构建", "📊 图谱状态"])
+    tab1, tab2, tab3 = st.tabs(["DDL/JSON 文件构建", "活体数据库构建", "图谱状态"])
 
     # ==================== Tab 1: DDL/JSON 文件构建 ====================
     with tab1:
-        st.markdown("### 📁 从 DDL/JSON 文件构建知识图谱")
+        st.markdown(icon_header("从 DDL/JSON 文件构建知识图谱", "folder", level=3), unsafe_allow_html=True)
 
         st.info("""
-        💡 **支持格式**：
+        **支持格式**：
         - **DDL 文件** (.sql, .txt)：标准的 MySQL CREATE TABLE 语句
         - **JSON 文件** (.json)：结构化元数据定义
 
@@ -114,7 +115,7 @@ def render_graph_builder():
         enable_ai = st.checkbox("启用 AI 增强", value=True,
                                help="使用 LLM 自动推断表关系和生成业务标签")
 
-        if st.button("🚀 开始构建", type="primary", use_container_width=True):
+        if st.button("开始构建", type="primary", use_container_width=True):
             if uploaded_file is None:
                 st.warning("请先上传 DDL 或 JSON 文件")
             else:
@@ -176,7 +177,7 @@ def render_graph_builder():
                         progress_bar.progress(100)
 
                         # 显示结果
-                        st.success("✅ 知识图谱构建完成！")
+                        st.success("知识图谱构建完成！")
 
                         # 统计信息
                         col1, col2, col3, col4 = st.columns(4)
@@ -190,7 +191,7 @@ def render_graph_builder():
                             st.metric("关系", len(pipeline.result.relationships) if pipeline.result else 0)
 
                         # 详细信息
-                        with st.expander("📋 查看详细统计", expanded=False):
+                        with st.expander("查看详细统计", expanded=False):
                             st.json({
                                 "extract": {
                                     "databases": len(pipeline.result.databases) if pipeline.result else 0,
@@ -201,13 +202,13 @@ def render_graph_builder():
                             })
 
                         # 图谱统计
-                        st.markdown("#### 🕒 Neo4j 图谱当前状态")
+                        st.markdown(icon_header("Neo4j 图谱当前状态", "activity", level=4), unsafe_allow_html=True)
                         st.write(f"- 表节点：{stats.get('Table', 0)}")
                         st.write(f"- 字段节点：{stats.get('Column', 0)}")
                         st.write(f"- 关系边：{stats.get('Relationships', 0)}")
 
                         # 构建成功后自动重置应用上下文，刷新检索索引
-                        st.success("✅ 构建成功！正在刷新检索索引...")
+                        st.success("构建成功！正在刷新检索索引...")
                         _refresh_app_context()
 
                 except UploadValidationError as e:
@@ -220,10 +221,10 @@ def render_graph_builder():
 
     # ==================== Tab 2: 活体数据库构建 ====================
     with tab2:
-        st.markdown("### 💾 从活体数据库构建知识图谱")
+        st.markdown(icon_header("从活体数据库构建知识图谱", "database", level=3), unsafe_allow_html=True)
 
         st.warning("""
-        ⚠️ **注意事项**
+        **注意事项**
         - 需要提供数据库连接 URI
         - 将读取 INFORMATION_SCHEMA 获取元数据
         - 当前活体抽取支持 MySQL；其他方言可通过 DDL/JSON 文件导入
@@ -242,7 +243,7 @@ def render_graph_builder():
 
         enable_ai_db = st.checkbox("启用 AI 增强", value=True, key="ai_db")
 
-        if st.button("🚀 连接并构建", type="primary", use_container_width=True, key="build_db"):
+        if st.button("连接并构建", type="primary", use_container_width=True, key="build_db"):
             if not db_host or not db_user:
                 st.warning("请填写完整的数据库连接信息")
             else:
@@ -289,7 +290,7 @@ def render_graph_builder():
                         stats = pipeline.load(st.session_state.kg_neo4j_client)
                         progress_bar.progress(100)
 
-                        st.success("✅ 知识图谱构建完成！")
+                        st.success("知识图谱构建完成！")
 
                         col1, col2, col3, col4 = st.columns(4)
                         with col1:
@@ -302,7 +303,7 @@ def render_graph_builder():
                             st.metric("关系", stats.get('enrichment', {}).get('relationships', 0))
 
                         # 构建成功后自动重置应用上下文，刷新检索索引
-                        st.success("✅ 构建成功！正在刷新检索索引...")
+                        st.success("构建成功！正在刷新检索索引...")
                         _refresh_app_context()
 
                 except Exception as e:
@@ -310,11 +311,11 @@ def render_graph_builder():
 
     # ==================== Tab 3: 图谱状态 ====================
     with tab3:
-        st.markdown("### 📊 Neo4j 图谱状态")
+        st.markdown(icon_header("Neo4j 图谱状态", "bar-chart-3", level=3), unsafe_allow_html=True)
 
         if st.session_state.kg_connected and st.session_state.kg_neo4j_client:
             # 刷新按钮
-            if st.button("🔄 刷新统计", use_container_width=True):
+            if st.button("刷新统计", use_container_width=True):
                 st.rerun()
 
             # 获取图谱统计
@@ -377,10 +378,10 @@ def render_graph_builder():
             except Exception as e:
                 st.error(f"查询失败：{e}")
         else:
-            st.warning("⚠️ Neo4j 未连接，请先在侧边栏配置连接")
+            st.warning("Neo4j 未连接，请先在侧边栏配置连接")
 
     # ==================== 帮助信息 ====================
-    with st.expander("❓ 使用帮助"):
+    with st.expander("使用帮助"):
         st.markdown("""
         ### 知识图谱构建模块说明
 

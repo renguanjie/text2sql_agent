@@ -4,6 +4,7 @@
 使正确性内核可以热开关，而不必修改 .env 后重启。
 """
 # ruff: noqa: E402
+from app.ui_icons import icon, icon_header, icon_line, inject_icon_styles
 import streamlit as st
 from pathlib import Path
 import sys
@@ -134,7 +135,7 @@ def apply_governance_config(updates: dict) -> tuple[bool, str]:
         log_safe_exception("governance_config_reload", e)
         return False, "配置未生效，详情请查看 logs/app.log 中的错误编号"
     logger.info(f"语义治理配置已更新：{sorted(updates)}")
-    return True, f"✅ 已应用 {len(updates)} 项治理配置变更"
+    return True, f"已应用 {len(updates)} 项治理配置变更"
 
 
 def _collect_desired() -> dict:
@@ -190,7 +191,7 @@ def _submit(current: dict, desired: dict, ctx=None) -> None:
 
 def show_governance_settings() -> None:
     """渲染语义治理与执行预检设置面板。"""
-    st.markdown("### 🛡️ 语义治理与执行预检")
+    st.markdown(icon_header("语义治理与执行预检", "shield-check", level=3), unsafe_allow_html=True)
 
     ctx = st.session_state.get("app_context")
     current = current_governance_config(ctx)
@@ -349,11 +350,11 @@ def show_governance_settings() -> None:
 
     col_save, col_reset = st.columns([1, 1])
     with col_save:
-        if st.button("💾 保存并重新加载治理配置", use_container_width=True,
+        if st.button("保存并重新加载治理配置", use_container_width=True,
                      type="primary", key="btn_save_gov"):
             _submit(current, _collect_desired(), ctx)
 
     with col_reset:
-        if st.button("↩️ 恢复 .env 默认治理配置", use_container_width=True,
+        if st.button("↩恢复 .env 默认治理配置", use_container_width=True,
                      key="btn_reset_gov"):
             _submit(current, governance_defaults(), ctx)

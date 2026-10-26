@@ -69,5 +69,12 @@
   （`OPTIONAL MATCH ()-[r]-()` 未绑定节点），显示值 = 节点数 × 关系数；
   改为 `OPTIONAL MATCH (n)-[r]-()` + `count(DISTINCT r)`，
   真实 101 节点 / 100 关系不再显示为 20200。
+- `feat(ui)`：图标体系从 emoji 升级为 Fluent Color 内联 SVG
+  （新增 `app/ui_icons.py`，19 个图标，MIT 协议，零外部请求，
+  https://github.com/microsoft/fluentui-system-icons ，
+  微软 Fluent UI 彩色圆角风格，经 Iconify 抓取 24px 版本）；
+  彩色固定配色，不再继承文本色；
+  节标题 / 侧栏状态行换 SVG 图标（UIkit iconnav 的等距排列风格），
+  按钮、页签、反馈消息去除装饰 emoji；kg_builder hero 徽章同步换图标。
 - `test(mysql)`：集成测试连接串改读 `config`，
   自带夹具播种/清理，不再硬编码 `localhost`/`text2sql_db`。
