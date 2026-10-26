@@ -37,6 +37,24 @@ class OfflineExtractor(BaseExtractor):
         self.neo4j_client = neo4j_client
         self._db_id_counter = 0
         self._init_db_counter()
+        # 当前 USE 上下文数据库（按 DDL 语句出现顺序切换）
+        self._current_db_name: Optional[str] = None
+
+    def _ensure_database(self, result: SchemaExtractResult, name: str) -> DatabaseIR:
+        """按名称查找或创建数据库节点，返回对应 DatabaseIR。"""
+        db = next((d for d in result.databases if d.name == name), None)
+        if db is None:
+            db_id = self._get_next_db_id()
+            db = DatabaseIR(
+                id=db_id,
+                database_id=db_id,  # 同时设置 database_id
+                name=name,
+                db_type=self.db_type,
+                db_language="SQL"
+            )
+            result.databases.append(db)
+            logger.info(f"自动创建数据库条目：{name} (ID={db_id})")
+        return db
 
     def _init_db_counter(self):
         """从 Neo4j 获取当前最大的 database_id 并初始化计数器"""
@@ -134,6 +152,7 @@ class OfflineExtractor(BaseExtractor):
             db_id = self._get_next_db_id()
             db = DatabaseIR(
                 id=db_id,
+                database_id=db_id,  # 同时设置 database_id
                 name=db_name,
                 description=db_comment,
                 db_type=detected_type,
@@ -156,7 +175,16 @@ class OfflineExtractor(BaseExtractor):
         statements = self._split_sql_statements(content)
 
         for stmt in statements:
-            if stmt.strip().upper().startswith('CREATE TABLE'):
+            upper_stmt = stmt.strip().upper()
+            # 处理 USE 语句，切换当前数据库上下文
+            if upper_stmt.startswith('USE '):
+                use_match = re.match(r'USE\s+[`"]?(\w+)[`"]?\s*;?', stmt.strip(), re.IGNORECASE)
+                if use_match:
+                    self._current_db_name = use_match.group(1)
+                    self._ensure_database(result, self._current_db_name)
+                    logger.info(f"USE 数据库：{self._current_db_name}")
+                continue
+            if upper_stmt.startswith('CREATE TABLE'):
                 table = self._parse_create_table(stmt, result)
                 if table:
                     result.tables.append(table)
@@ -191,36 +219,50 @@ class OfflineExtractor(BaseExtractor):
         return statements
 
     def _parse_create_table(self, stmt: str, result: SchemaExtractResult) -> Optional[TableIR]:
-        """解析 CREATE TABLE 语句"""
-        # 匹配表名和列定义
+        """解析 CREATE TABLE 语句（支持 `db.table` 限定名与 USE 上下文）"""
+        # 匹配可选的数据库前缀、表名和列定义
         match = re.search(
-            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?(\w+)[`"]?\s*\((.*)\)\s*(?:ENGINE\s*=\s*\w+)?\s*(?:DEFAULT\s+CHARSET\s*=\s*\w+)?\s*(?:COLLATE\s*=\s*\w+)?\s*(?:COMMENT\s*=\s*[\'"](.+?)[\'"])?\s*;',
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[`"]?(\w+)[`"]?\.)?[`"]?(\w+)[`"]?\s*\((.*)\)\s*(?:ENGINE\s*=\s*\w+)?\s*(?:DEFAULT\s+CHARSET\s*=\s*\w+)?\s*(?:COLLATE\s*=\s*\w+)?\s*(?:COMMENT\s*=\s*[\'"](.+?)[\'"])?\s*;',
             stmt, re.IGNORECASE | re.DOTALL
         )
 
         if not match:
             # 尝试简化匹配
             simple_match = re.search(
-                r'CREATE\s+TABLE\s+[`"]?(\w+)[`"]?\s*\((.*)\)',
+                r'CREATE\s+TABLE\s+(?:[`"]?(\w+)[`"]?\.)?[`"]?(\w+)[`"]?\s*\((.*)\)',
                 stmt, re.IGNORECASE | re.DOTALL
             )
             if not simple_match:
                 return None
-            table_name = simple_match.group(1)
-            columns_part = simple_match.group(2)
+            db_prefix = simple_match.group(1)
+            table_name = simple_match.group(2)
+            columns_part = simple_match.group(3)
             table_comment = None
         else:
-            table_name = match.group(1)
-            columns_part = match.group(2)
-            table_comment = match.group(3) if match.group(3) else None
+            db_prefix = match.group(1)
+            table_name = match.group(2)
+            columns_part = match.group(3)
+            table_comment = match.group(4) if match.group(4) else None
 
-        # 确定所属数据库
-        database = self.database_name
-        database_id = None
-        if result.databases:
-            # 使用第一个数据库或匹配的数据库
+        # 确定所属数据库：限定名前缀 > USE 上下文 > 唯一数据库 > 第一个数据库
+        if db_prefix:
+            database = db_prefix
+            self._ensure_database(result, database)
+        elif self._current_db_name:
+            database = self._current_db_name
+        elif len(result.databases) == 1:
             database = result.databases[0].name
-            database_id = result.databases[0].id
+        elif result.databases:
+            database = result.databases[0].name
+            logger.warning(
+                f"表 {table_name} 未指定数据库（无 USE/限定名），"
+                f"归属到第一个数据库 {database}"
+            )
+        else:
+            database = self.database_name
+
+        db = self._ensure_database(result, database)
+        database_id = db.id
 
         table = TableIR(
             name=table_name,
@@ -273,8 +315,8 @@ class OfflineExtractor(BaseExtractor):
                 if current.strip():
                     columns.append(current.strip())
                 current = ""
-                continue
-            current += char
+            else:
+                current += char
 
         if current.strip():
             columns.append(current.strip())
@@ -312,9 +354,12 @@ class OfflineExtractor(BaseExtractor):
         base_type = re.sub(r'\([^)]*\)', '', data_type_raw).upper().strip()
         normalized_type = self.DDL_TYPE_MAP.get(base_type.lower(), base_type)
 
-        # 检查约束
+        # 检查约束：显式 NOT NULL 或主键均为不可空；显式 NULL / DEFAULT NULL 仍为可空
         is_pk = 'PRIMARY KEY' in col_def.upper()
-        is_nullable = 'NOT NULL' not in col_def.upper() and 'NULL' not in col_def.upper()
+        is_nullable = (
+            re.search(r'\bNOT\s+NULL\b', col_def, re.IGNORECASE) is None
+            and not is_pk
+        )
 
         # 检查默认值
         default_match = re.search(r'DEFAULT\s+([\'"]?\w+[\'"]?|\d+|NULL|CURRENT_TIMESTAMP(?:\(\d+\))?|\([^)]+\))', col_def, re.IGNORECASE)

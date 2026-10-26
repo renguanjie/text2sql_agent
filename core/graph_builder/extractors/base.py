@@ -45,14 +45,18 @@ class BaseExtractor(ABC):
                     if col.name.endswith('_id') and not col.is_primary_key:
                         potential_ref = col.name[:-3]
                         for other_table in db_tables.get(table.database, []):
+                            if other_table.name == table.name:
+                                continue  # 排除自环
                             if potential_ref in other_table.name.lower():
                                 rel = RelationshipIR(
                                     from_database=table.database,
+                                    from_database_id=table.database_id,
                                     from_table=table_name,
                                     from_column=col.name,
-                                    to_database=table.database,
+                                    to_database=other_table.database,
+                                    to_database_id=other_table.database_id,
                                     to_table=other_table.name,
-                                    to_column='id',
+                                    to_column=(pk_columns.get(other_table.name) or ['id'])[0],
                                     relationship_type="foreign_key",
                                     join_type="LEFT JOIN"
                                 )

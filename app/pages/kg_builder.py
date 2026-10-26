@@ -3,6 +3,8 @@
 支持从 DDL 文件或活体数据库构建知识图谱
 """
 # ruff: noqa: E402
+import re
+
 import streamlit as st
 from pathlib import Path
 import sys
@@ -17,7 +19,29 @@ from core.graph_builder import GraphBuilderPipeline
 from config import (
     LLM_PROVIDER, LLM_MODEL, LLM_API_KEY, LLM_BASE_URL, UPLOAD_MAX_BYTES
 )
+from core.utils.log_sanitizer import mask_sensitive
 from core.utils.upload_limits import UploadValidationError, read_uploaded_text
+
+
+def _safe_error_message(exc: Exception) -> str:
+    """对用户展示的错误信息脱敏：掩码连接串中的账号密码与常见敏感字段。"""
+    text = str(exc)
+    text = re.sub(r'://[^:@\s/]+:[^@\s/]+@', '://***:***@', text)
+    return mask_sensitive(text)
+
+
+def _refresh_app_context():
+    """知识库变更后重置应用上下文并刷新页面，使检索索引与新图谱保持一致。
+
+    与主页面知识库导入成功后的处理逻辑保持一致。
+    """
+    app_ctx = st.session_state.get('app_context')
+    if app_ctx:
+        app_ctx.reset()
+    for key in ('initialized', 'app_context', 'kg_neo4j_client', 'kg_connected'):
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
 
 
 def render_graph_builder():
@@ -182,18 +206,14 @@ def render_graph_builder():
                         st.write(f"- 字段节点：{stats.get('Column', 0)}")
                         st.write(f"- 关系边：{stats.get('Relationships', 0)}")
 
-                        # 提示用户重新初始化主应用
-                        st.success("""
-                        ✅ **构建成功！**
-
-                        请返回主页面，点击侧边栏的 **"🔄 重新初始化系统"** 按钮来刷新检索索引，
-                        然后才能使用新的知识库进行 SQL 查询。
-                        """)
+                        # 构建成功后自动重置应用上下文，刷新检索索引
+                        st.success("✅ 构建成功！正在刷新检索索引...")
+                        _refresh_app_context()
 
                 except UploadValidationError as e:
                     st.error(f"文件校验失败：{e}")
                 except Exception as e:
-                    st.error(f"构建失败：{e}")
+                    st.error(f"构建失败：{_safe_error_message(e)}")
                 finally:
                     if temp_path is not None and temp_path.exists():
                         temp_path.unlink()
@@ -281,8 +301,12 @@ def render_graph_builder():
                         with col4:
                             st.metric("关系", stats.get('enrichment', {}).get('relationships', 0))
 
+                        # 构建成功后自动重置应用上下文，刷新检索索引
+                        st.success("✅ 构建成功！正在刷新检索索引...")
+                        _refresh_app_context()
+
                 except Exception as e:
-                    st.error(f"构建失败：{e}")
+                    st.error(f"构建失败：{_safe_error_message(e)}")
 
     # ==================== Tab 3: 图谱状态 ====================
     with tab3:

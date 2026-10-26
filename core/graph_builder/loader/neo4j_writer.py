@@ -15,7 +15,7 @@ class Neo4jGraphBuilder:
 
     def build(self, result: SchemaExtractResult) -> Dict[str, int]:
         """
-        执行完整的图谱构建
+        执行完整的图谱构建（写操作全部经 _execute_write，可由调用方收集为原子批次）
 
         装载顺序：
         1. Database - 数据库节点
@@ -23,6 +23,8 @@ class Neo4jGraphBuilder:
         3. Table - 表节点
         4. Column - 字段节点
         5. Relationship - 关系边
+
+        权值规范化依赖写入后的图状态，由调用方在批次提交后单独执行。
         """
         stats = {
             "databases": self.batch_upsert_databases(result.databases),
@@ -31,10 +33,6 @@ class Neo4jGraphBuilder:
             "columns": self.batch_upsert_columns(result.tables),
             "relationships": self.batch_upsert_relationships(result.relationships)
         }
-
-        # 规范化关系权重（平分同一表对之间的多条关系）
-        from .weight_initializer import normalize_relationships
-        stats["weight_normalized"] = normalize_relationships(self.client)
 
         logger.info(f"图谱构建完成：{stats}")
         return stats
@@ -75,10 +73,9 @@ class Neo4jGraphBuilder:
         """
 
         params = {"databases": [db.model_dump() for db in databases]}
-        result = self.client.execute_query(cypher, params)
-        count = result[0]["count"] if result and result[0] else 0
-        logger.info(f"装载 {count} 个数据库节点")
-        return count
+        self.client._execute_write(cypher, params)
+        logger.info(f"装载 {len(databases)} 个数据库节点")
+        return len(databases)
 
     def batch_upsert_concepts(self, concepts: List) -> int:
         """
@@ -104,10 +101,9 @@ class Neo4jGraphBuilder:
         """
 
         params = {"concepts": [c.model_dump() for c in concepts]}
-        result = self.client.execute_query(cypher, params)
-        count = result[0]["count"] if result and result[0] else 0
-        logger.info(f"装载 {count} 个业务概念节点")
-        return count
+        self.client._execute_write(cypher, params)
+        logger.info(f"装载 {len(concepts)} 个业务概念节点")
+        return len(concepts)
 
     def batch_upsert_tables(self, tables: List) -> int:
         """
@@ -147,10 +143,9 @@ class Neo4jGraphBuilder:
         """
 
         params = {"tables": [t.model_dump() for t in tables]}
-        result = self.client.execute_query(cypher, params)
-        count = result[0]["count"] if result and result[0] else 0
-        logger.info(f"装载 {count} 个表节点")
-        return count
+        self.client._execute_write(cypher, params)
+        logger.info(f"装载 {len(tables)} 个表节点")
+        return len(tables)
 
     def batch_upsert_columns(self, tables: List) -> int:
         """
@@ -210,10 +205,9 @@ class Neo4jGraphBuilder:
         """
 
         params = {"columns": all_columns}
-        result = self.client.execute_query(cypher, params)
-        count = result[0]["count"] if result and result[0] else 0
-        logger.info(f"装载 {count} 个字段节点")
-        return count
+        self.client._execute_write(cypher, params)
+        logger.info(f"装载 {len(all_columns)} 个字段节点")
+        return len(all_columns)
 
     def batch_upsert_relationships(self, relationships: List) -> int:
         """
@@ -233,13 +227,22 @@ class Neo4jGraphBuilder:
         if not relationships:
             return 0
 
+        # 每个端点确定性匹配唯一一张表：优先按 database_id 精确匹配，
+        # 未指定时取 database_id 最小的一张同名表，避免跨库串挂或一对多扩散
         cypher = """
         UNWIND $relationships AS rel
-        // 找到源表和目标表（优先使用 database_id，没有则使用 database 名称）
-        MATCH (from:Table {name: rel.from_table})
-        MATCH (to:Table {name: rel.to_table})
-        WHERE (rel.from_database_id IS NULL OR from.database_id = rel.from_database_id)
-          AND (rel.to_database_id IS NULL OR to.database_id = rel.to_database_id)
+        CALL {
+            WITH rel
+            MATCH (from:Table {name: rel.from_table})
+            WHERE rel.from_database_id IS NULL OR from.database_id = rel.from_database_id
+            RETURN from ORDER BY from.database_id LIMIT 1
+        }
+        CALL {
+            WITH rel
+            MATCH (to:Table {name: rel.to_table})
+            WHERE rel.to_database_id IS NULL OR to.database_id = rel.to_database_id
+            RETURN to ORDER BY to.database_id LIMIT 1
+        }
 
         // 创建或更新关系
         MERGE (from)-[r:CONNECTS {
@@ -259,10 +262,9 @@ class Neo4jGraphBuilder:
         """
 
         params = {"relationships": [r.model_dump() for r in relationships]}
-        result = self.client.execute_query(cypher, params)
-        count = result[0]["count"] if result and result[0] else 0
-        logger.info(f"装载 {count} 个关系边")
-        return count
+        self.client._execute_write(cypher, params)
+        logger.info(f"装载 {len(relationships)} 个关系边")
+        return len(relationships)
 
     def link_concepts_to_tables(self, concepts: List) -> int:
         """
@@ -279,9 +281,12 @@ class Neo4jGraphBuilder:
                 cypher = """
                 MATCH (c:BusinessConcept {name: $concept_name})
                 MATCH (t:Table {name: $table_name})
+                WITH c, t
+                ORDER BY t.database_id
+                LIMIT 1
                 MERGE (c)-[:MAPPED_TO]->(t)
                 """
-                self.client.execute_query(cypher, {
+                self.client._execute_write(cypher, {
                     "concept_name": concept.name,
                     "table_name": table_name
                 })
@@ -293,7 +298,7 @@ class Neo4jGraphBuilder:
     def clear_graph(self):
         """清空图谱（危险操作，谨慎使用）"""
         cypher = "MATCH (n) DETACH DELETE n"
-        self.client.execute_query(cypher)
+        self.client._execute_write(cypher)
         logger.warning("图谱已清空")
 
     def get_graph_stats(self) -> Dict[str, int]:

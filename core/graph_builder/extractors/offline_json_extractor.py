@@ -17,9 +17,32 @@ from ..models import (
 class OfflineJSONExtractor(BaseExtractor):
     """离线 JSON 抽取器"""
 
-    def __init__(self, json_path: Optional[str] = None, **kwargs):
+    def __init__(self, json_path: Optional[str] = None, neo4j_client=None, **kwargs):
         super().__init__(**kwargs)
         self.json_path = json_path
+        self.neo4j_client = neo4j_client
+        self._db_id_counter = self._load_max_database_id()
+
+    def _load_max_database_id(self) -> int:
+        """从 Neo4j 读取当前最大的 database_id，避免自动分配的 ID 与已有图谱冲突。"""
+        client = self.neo4j_client
+        if client and getattr(client, 'driver', None):
+            try:
+                result = client.execute_query(
+                    "MATCH (d:Database) RETURN COALESCE(MAX(d.database_id), 0) as max_id"
+                )
+                if result:
+                    max_id = int(result[0].get("max_id") or 0)
+                    logger.info(f"从 Neo4j 加载数据库 ID 计数器：{max_id}")
+                    return max_id
+            except Exception as e:
+                logger.warning(f"无法从 Neo4j 加载数据库 ID 计数器，使用默认值：{e}")
+        return 0
+
+    def _get_next_db_id(self) -> int:
+        """获取下一个数据库 ID（自增，且始终大于已见 ID）。"""
+        self._db_id_counter += 1
+        return self._db_id_counter
 
     def extract(self) -> SchemaExtractResult:
         result = SchemaExtractResult()
@@ -46,12 +69,14 @@ class OfflineJSONExtractor(BaseExtractor):
             result.metadata.update(data["metadata"])
 
         # 解析数据库，保留 JSON 中的 database_id/id，支持多数据库。
-        db_id_counter = 0
+        # 未显式指定 ID 时从 Neo4j 现有最大 ID 续号，防止撞库归并。
         database_id_by_name: Dict[str, int] = {}
         database_name_by_id: Dict[int, str] = {}
         for db_data in data.get("databases", []):
-            db_id_counter += 1
-            db_id = db_data.get("database_id") or db_data.get("id") or db_id_counter
+            db_id = db_data.get("database_id") or db_data.get("id") or self._get_next_db_id()
+            db_id = int(db_id)
+            if db_id > self._db_id_counter:
+                self._db_id_counter = db_id
             db_name = db_data.get("name", f"database_{db_id}")
             db = DatabaseIR(
                 id=db_id,
@@ -67,19 +92,19 @@ class OfflineJSONExtractor(BaseExtractor):
             database_id_by_name[db_name] = db_id
             database_name_by_id[db_id] = db_name
 
-        # 如果没有数据库定义，创建默认数据库
+        # 如果没有数据库定义，创建默认数据库（ID 从 Neo4j 现有最大 ID 续号）
         if not result.databases:
-            db_id_counter = 1
+            default_id = self._get_next_db_id()
             default_db = DatabaseIR(
-                id=db_id_counter,
-                database_id=db_id_counter,
+                id=default_id,
+                database_id=default_id,
                 name="default",
                 db_type="mysql",
                 db_language="SQL"
             )
             result.databases.append(default_db)
-            database_id_by_name["default"] = db_id_counter
-            database_name_by_id[db_id_counter] = "default"
+            database_id_by_name["default"] = default_id
+            database_name_by_id[default_id] = "default"
 
         # 解析表
         for table_data in data.get("tables", []):
@@ -117,7 +142,9 @@ class OfflineJSONExtractor(BaseExtractor):
         if database_id is None and database_name:
             database_id = database_id_by_name.get(database_name)
         if database_id is None:
-            database_id = next(iter(database_name_by_id), 1)
+            database_id = next(iter(database_name_by_id), None)
+        if database_id is None:
+            database_id = self._get_next_db_id()
         if not database_name:
             database_name = database_name_by_id.get(database_id, "default")
 

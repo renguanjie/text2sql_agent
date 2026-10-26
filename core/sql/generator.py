@@ -1299,6 +1299,7 @@ class SQLGenerator:
                SET generated_sql = :generated_sql, validation_status = 'pending'
                WHERE id = :history_id""",
             {"generated_sql": fix_result['sql'], "history_id": history_id},
+            raise_on_error=True,
         )
         return self.execute_sql(fix_result['sql'], history_id)
 
@@ -1348,7 +1349,8 @@ def create_sql_generator(
             metadata.append({
                 'node_type': 'table',
                 'name': table.get('name', ''),
-                'description': table.get('description', '')
+                'description': table.get('description', ''),
+                'database_id': table.get('database_id'),
             })
 
     # 3. 创建 SQL 生成链

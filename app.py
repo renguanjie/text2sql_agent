@@ -13,6 +13,10 @@ import streamlit as st
 project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
+# 品牌资源
+LOGO_PATH = project_root / "assets" / "logo.png"
+LOGO_ICON_PATH = project_root / "assets" / "logo_icon.png"
+
 import uuid
 
 from loguru import logger
@@ -238,14 +242,14 @@ logger.add(
 
 # ==================== 页面配置 ====================
 st.set_page_config(
-    page_title="Text2SQL 智能体",
-    page_icon="📊",
+    page_title="溯算编程 · Text2SQL 智能体",
+    page_icon=str(LOGO_ICON_PATH),
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
         'Get Help': 'https://github.com/renguanjie/text2sql-agent',
         'Report a bug': 'https://github.com/renguanjie/text2sql-agent/issues',
-        'About': '# Text2SQL 智能体\n基于本地知识库的 SQL 智能生成系统\n\n核心技术：BM25+FAISS 检索 + LangChain + SQLFluff'
+        'About': '# 溯算编程 · Text2SQL 智能体\n基于本地知识库的 SQL 智能生成系统\n\n核心技术：BM25+FAISS 检索 + LangChain + SQLFluff'
     }
 )
 
@@ -496,8 +500,19 @@ def _reseed_model_widgets(prefix: str) -> None:
     面板顶部；标记由上一次保存/恢复动作设置。
     """
     flag = f"_{prefix}_reseed"
-    if not st.session_state.pop(flag, False):
+    if not st.session_state.get(flag, False):
         return
+    # 本轮若由保存/恢复按钮触发，cfg_* 里是用户随点击一并提交的新值，
+    # 此刻清除会用旧配置覆盖它，导致本次保存静默写回旧模型；保留标记，
+    # 待下一轮（无按钮触发）再重新播种。
+    save_key, reset_key = (
+        ("btn_save_llm", "btn_reset_llm")
+        if prefix == "llm"
+        else ("btn_save_emb", "btn_reset_emb")
+    )
+    if st.session_state.get(save_key) or st.session_state.get(reset_key):
+        return
+    st.session_state.pop(flag, None)
     for key in list(st.session_state.keys()):
         if key.startswith(f"cfg_{prefix}_"):
             st.session_state.pop(key, None)
@@ -695,6 +710,8 @@ def _render_model_config_panel():
 
 # ==================== 侧边栏 ====================
 with st.sidebar:
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), width=160)
     st.title("⚙️ 控制中心")
 
     # 系统状态卡片
@@ -771,10 +788,10 @@ with st.sidebar:
         try:
             stats = neo4j.execute_query("""
                 MATCH (n)
-                OPTIONAL MATCH ()-[r]-()
+                OPTIONAL MATCH (n)-[r]-()
                 RETURN
                     count(DISTINCT n) as nodes,
-                    count(r) as relationships
+                    count(DISTINCT r) as relationships
             """)
             if stats:
                 st.caption(f"节点：{stats[0].get('nodes', 0)} | 关系：{stats[0].get('relationships', 0)}")
@@ -935,7 +952,7 @@ with st.sidebar:
     # 关于
     st.markdown("### ℹ️ 关于")
     st.markdown("""
-    **Text2SQL 智能体 v1.0**
+    **溯算编程 · Text2SQL 智能体 v1.0**
 
     基于本地知识库的 SQL 智能生成系统
 
@@ -947,12 +964,12 @@ with st.sidebar:
     """)
 
     st.markdown("---")
-    st.caption("© 2026 Text2SQL Agent")
+    st.caption("© 2026 溯算编程")
 
 
 # ==================== 主界面 ====================
 # 主标题
-st.markdown('<p class="main-title">📊 Text2SQL 智能体</p>', unsafe_allow_html=True)
+st.markdown('<p class="main-title">溯算编程 · Text2SQL 智能体</p>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">基于本地知识库的 SQL 智能生成系统</p>', unsafe_allow_html=True)
 
 # 选项卡
@@ -1411,7 +1428,7 @@ with tab4:
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #999; padding: 20px 0;'>"
-    "Text2SQL 智能体 v1.0 | 基于本地知识库的 SQL 智能生成系统 | © 2026"
+    "溯算编程 · Text2SQL 智能体 v1.0 | 基于本地知识库的 SQL 智能生成系统 | © 2026 溯算编程"
     "</div>",
     unsafe_allow_html=True
 )

@@ -6,6 +6,7 @@ Neo4j 图数据库客户端
 import asyncio
 import json
 import uuid
+from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -188,18 +189,46 @@ class Neo4jClient:
             return []
         return self.execute_query(query, parameters, raise_on_error=True)
 
-    def _execute_write_batch(self, writes: List[tuple[str, Dict[str, Any]]]) -> None:
-        """在单个 Neo4j 事务中提交一组写操作。"""
+    def _execute_write_batch(self, writes: List[tuple[str, Dict[str, Any]]],
+                             chunk_size: int = 2000) -> None:
+        """提交一组写操作，大批量自动分批以控制单事务大小。
+
+        chunk_size 以内的写入在单个事务中原子提交；超过时按顺序分多个事务执行，
+        此时整体不再原子，调用方应控制单批规模。
+        """
         if not writes:
             return
 
-        def apply_writes(tx):
-            for query, parameters in writes:
+        def apply_writes(tx, batch):
+            for query, parameters in batch:
                 tx.run(query, parameters).consume()
 
         with self.driver.session(database=self.database) as session:
             writer = getattr(session, "execute_write", None) or session.write_transaction
-            writer(apply_writes)
+            for start in range(0, len(writes), chunk_size):
+                batch = writes[start:start + chunk_size]
+                # 闭包绑定当前分批，保持 execute_write(work) 单函数调用形态
+                writer(lambda tx, batch=batch: apply_writes(tx, batch))
+
+    @contextmanager
+    def atomic_writes(self, chunk_size: int = 2000):
+        """收集块内写操作并在退出时统一提交。
+
+        与 import_knowledge_graph 使用同一收集器；嵌套调用时委托给外层
+        收集器，保证全部写入仍在同一批提交。块内抛异常时不提交任何写入。
+        """
+        if self.driver is None:
+            raise ConnectionError("Neo4j 未连接，无法执行原子写入")
+        if _write_collector.get() is not None:
+            yield
+            return
+        writes: List[tuple[str, Dict[str, Any]]] = []
+        token = _write_collector.set(writes)
+        try:
+            yield
+        finally:
+            _write_collector.reset(token)
+        self._execute_write_batch(writes, chunk_size=chunk_size)
 
     async def execute_query_async(self, query: str, parameters: Optional[Dict] = None) -> List[Dict]:
         """
@@ -219,7 +248,10 @@ class Neo4jClient:
         try:
             async with self.async_driver.session(database=self.database) as session:
                 result = await session.run(query, parameters or {})
-                return [await record.data() for record in result]
+                records = []
+                async for record in result:
+                    records.append(record.data())
+                return records
         except Exception as e:
             safe_error = truncate_log(mask_sensitive(str(e)), 160)
             logger.error(
@@ -264,7 +296,8 @@ class Neo4jClient:
         """
         query = """
         MATCH (t:Table)
-        RETURN t.name AS name, t.description AS description, t.schema AS schema
+        RETURN t.name AS name, coalesce(t.description, t.comment) AS description,
+               t.schema AS schema, t.database_id AS database_id
         """
         return self.execute_query(query)
 
@@ -303,19 +336,26 @@ class Neo4jClient:
         Returns:
             List[Dict]: 字段节点列表
         """
+        column_fields = """
+            c.name AS name, coalesce(c.data_type, c.type) AS type,
+            coalesce(c.description, c.comment) AS description,
+            c.is_primary_key AS is_primary_key, c.is_nullable AS is_nullable
+        """
         if table_name:
-            query = """
-            MATCH (c:Column)-[:BELONGS_TO]->(t:Table)
-            WHERE t.name = $table_name
-            RETURN c.name AS name, c.type AS type, c.description AS description,
-                   c.is_primary_key AS is_primary_key, c.is_nullable AS is_nullable
+            # 新图谱为 (Table)-[:HAS_COLUMN]->(Column)，旧格式为 (Column)-[:BELONGS_TO]->(Table)，两种都兼容
+            query = f"""
+            MATCH (t:Table {{name: $table_name}})
+            OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
+            OPTIONAL MATCH (c2:Column)-[:BELONGS_TO]->(t)
+            WITH [x IN collect(c) + collect(c2) WHERE x IS NOT NULL] as cols
+            UNWIND cols as c
+            RETURN {column_fields}
             """
             return self.execute_query(query, {"table_name": table_name})
         else:
-            query = """
+            query = f"""
             MATCH (c:Column)
-            RETURN c.name AS name, c.type AS type, c.description AS description,
-                   c.is_primary_key AS is_primary_key, c.is_nullable AS is_nullable
+            RETURN {column_fields}
             """
             return self.execute_query(query)
 
@@ -356,35 +396,57 @@ class Neo4jClient:
         """
         获取完整的数据库元数据（表 + 字段 + 关系）
 
+        兼容两种图谱约定：
+        - 新格式：Table-[:HAS_COLUMN]->Column，data_type/description 属性
+        - 旧格式：Column-[:BELONGS_TO]->Table，type/comment 属性
+
         Returns:
-            Dict: 元数据字典
+            Dict: 元数据字典（tables / columns / relationships / table_columns）
         """
-        tables = self.get_table_nodes()
-        columns = self.get_column_nodes()
-        relationships = self.get_relationships()
+        records = self.execute_query("""
+            MATCH (t:Table)
+            OPTIONAL MATCH (c:Column)
+            WHERE (t)-[:HAS_COLUMN]->(c) OR (c)-[:BELONGS_TO]->(t)
+            WITH t, c
+            ORDER BY c.name
+            RETURN t.name AS name,
+                   coalesce(t.description, t.comment) AS description,
+                   t.schema AS schema,
+                   t.database_id AS database_id,
+                   [x IN collect({
+                       name: c.name,
+                       type: coalesce(c.data_type, c.type),
+                       description: coalesce(c.description, c.comment),
+                       is_primary_key: c.is_primary_key,
+                       is_nullable: c.is_nullable
+                   }) WHERE x.name IS NOT NULL] AS columns
+        """)
 
-        # 构建表到字段的映射
-        table_columns = {}
-        for table in tables:
-            table_name = table.get('name')
-            if table_name:
-                table_columns[table_name] = []
-
-        # 通过关系获取每个表的字段
-        for rel in relationships:
-            if rel.get('rel_type') == 'BELONGS_TO':
-                table_name = rel.get('end_name')
-                column_name = rel.get('start_name')
-                if table_name and column_name:
-                    if table_name not in table_columns:
-                        table_columns[table_name] = []
-                    table_columns[table_name].append(column_name)
+        tables = []
+        table_columns: Dict[str, List[str]] = {}
+        table_column_details: Dict[str, List[Dict]] = {}
+        columns_flat: List[Dict] = []
+        for record in records:
+            name = record.get('name')
+            if not name:
+                continue
+            tables.append({
+                'name': name,
+                'description': record.get('description'),
+                'schema': record.get('schema'),
+                'database_id': record.get('database_id'),
+            })
+            cols = record.get('columns') or []
+            table_columns[name] = [c['name'] for c in cols if c.get('name')]
+            table_column_details[name] = [c for c in cols if c.get('name')]
+            columns_flat.extend(cols)
 
         return {
             'tables': tables,
-            'columns': columns,
-            'relationships': relationships,
-            'table_columns': table_columns
+            'columns': columns_flat,
+            'relationships': self.get_relationships(),
+            'table_columns': table_columns,
+            'table_column_details': table_column_details,
         }
 
     def search_knowledge(self, query_text: str, top_k: int = 5) -> List[Dict]:
@@ -456,9 +518,35 @@ class Neo4jClient:
             logger.error("Neo4j 未连接")
             return {}
 
+        # 旧版本写入的节点可能缺少 MERGE 唯一键（database_id/table_name），
+        # 导致导出文件无法通过导入校验；按结构位置回填这些隐含键（幂等）
+        self._backfill_missing_identity_keys()
+
         try:
             nodes = self._export_graph_nodes()
             relationships = self._export_graph_relationships()
+
+            # 回填后仍无法确定唯一键的孤儿节点无法导出/回导，剔除并记录
+            keep_keys = set()
+            exportable_nodes = []
+            dropped = 0
+            for node in nodes:
+                if node["label"] in {"Database", "Table", "Column", "BusinessConcept"} and \
+                        self._missing_node_key_fields(node["label"], node["properties"]):
+                    dropped += 1
+                    continue
+                keep_keys.add(node["key"])
+                exportable_nodes.append(node)
+            if dropped:
+                logger.warning(
+                    f"导出时剔除 {dropped} 个无法确定唯一键的孤儿节点（缺少 database_id/table_name）"
+                )
+            nodes = exportable_nodes
+            relationships = [
+                rel for rel in relationships
+                if rel["start"]["key"] in keep_keys and rel["end"]["key"] in keep_keys
+            ]
+
             databases = [
                 node["properties"]
                 for node in nodes
@@ -944,6 +1032,27 @@ class Neo4jClient:
             datasources.add(top_level)
         return sorted(datasources)
 
+    def _backfill_missing_identity_keys(self) -> None:
+        """回填旧节点缺失的 MERGE 唯一键（database_id/table_name）。
+
+        这些键由图结构唯一确定：Table 归属其父 Database，Column 归属其父 Table。
+        幂等操作，仅补齐缺失值，确保导出的 JSON 可以通过导入校验完成闭环。
+        """
+        try:
+            self._execute_write("""
+                MATCH (d:Database)-[:HAS_TABLE]->(t:Table)
+                WHERE t.database_id IS NULL
+                SET t.database_id = d.database_id
+            """)
+            self._execute_write("""
+                MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
+                WHERE c.database_id IS NULL OR c.table_name IS NULL
+                SET c.database_id = coalesce(c.database_id, t.database_id),
+                    c.table_name = coalesce(c.table_name, t.name)
+            """)
+        except Exception as e:
+            logger.warning(f"回填节点唯一键失败（导出继续，但可能无法回导）：{e}")
+
     def _export_graph_nodes(self) -> List[Dict[str, Any]]:
         records = self.execute_query("""
             MATCH (n)
@@ -1296,7 +1405,7 @@ class Neo4jClient:
 
     def sync_metadata_to_mysql(self, mysql_client) -> int:
         """
-        同步元数据到 MySQL
+        同步元数据到 MySQL（基于 get_schema_metadata，兼容 HAS_COLUMN 与 BELONGS_TO 两种图谱约定）
 
         Args:
             mysql_client: MySQL 客户端实例
@@ -1313,23 +1422,20 @@ class Neo4jClient:
             if table_name:
                 mysql_client.upsert_table_schema(
                     table_name=table_name,
-                    table_comment=table.get('description', ''),
+                    table_comment=table.get('description') or '',
                     properties=table
                 )
                 count += 1
 
-        # 同步字段信息
-        for column in metadata['columns']:
-            # 需要通过关系找到对应的表
-            for rel in metadata['relationships']:
-                if rel.get('rel_type') == 'BELONGS_TO' and rel.get('start_name') == column.get('name'):
-                    mysql_client.upsert_column_schema(
-                        table_name=rel.get('end_name'),
-                        column_name=column.get('name'),
-                        column_type=column.get('type', 'VARCHAR'),
-                        column_comment=column.get('description', '')
-                    )
-                    break
+        # 同步字段信息（直接按表的字段明细同步，不再依赖关系名匹配）
+        for table_name, columns in metadata.get('table_column_details', {}).items():
+            for column in columns:
+                mysql_client.upsert_column_schema(
+                    table_name=table_name,
+                    column_name=column.get('name'),
+                    column_type=column.get('type') or 'VARCHAR',
+                    column_comment=column.get('description') or ''
+                )
 
         logger.info(f"同步了 {count} 条元数据到 MySQL")
         return count

@@ -8,7 +8,7 @@ from .models import SchemaExtractResult
 from .extractors import LiveDBExtractor, OfflineExtractor, OfflineJSONExtractor
 from .enrichment import generate_concepts, infer_relationships
 from .compiler import compile_join_sqls
-from .loader import Neo4jGraphBuilder
+from .loader import Neo4jGraphBuilder, normalize_relationships
 
 
 class GraphBuilderPipeline:
@@ -53,7 +53,7 @@ class GraphBuilderPipeline:
     def extract_from_json(self, json_path: Optional[str] = None) -> SchemaExtractResult:
         if not json_path:
             raise ValueError("必须提供 JSON 文件路径")
-        extractor = OfflineJSONExtractor(json_path=json_path)
+        extractor = OfflineJSONExtractor(json_path=json_path, neo4j_client=self.neo4j_client)
         self.result = extractor.extract()
         if not self.result.tables:
             raise ValueError("JSON 文件中未解析到任何表")
@@ -96,22 +96,56 @@ class GraphBuilderPipeline:
 
         logger.info("开始装载到 Neo4j...")
         loader = Neo4jGraphBuilder(client)
-        stats = loader.build(self.result)
-        expected_counts = {
+        # 全部写操作收集为原子批次统一提交；任一步失败则整批不生效
+        with client.atomic_writes():
+            stats = loader.build(self.result)
+            if self.result.concepts:
+                loader.link_concepts_to_tables(self.result.concepts)
+
+        # 批次提交后用真实图数据校验装载结果
+        stats.update(self._verify_load(client))
+
+        # 权值规范化依赖写入后的图状态，在批次提交后单独执行
+        stats["weight_normalized"] = normalize_relationships(client)
+        return {**stats, **loader.get_graph_stats()}
+
+    def _verify_load(self, client) -> Dict[str, int]:
+        """提交后按 database_id 范围核对实际写入数量，发现缺写立即报错。"""
+        expected = {
             'databases': len(self.result.databases),
             'tables': len(self.result.tables),
-            'columns': sum(len(table.columns) for table in self.result.tables),
+            'columns': sum(len(t.columns) for t in self.result.tables),
             'relationships': len(self.result.relationships),
         }
-        failed_entities = [
-            name for name, expected in expected_counts.items()
-            if expected > 0 and stats.get(name, 0) == 0
+        db_ids = sorted({
+            d.database_id if d.database_id is not None else d.id
+            for d in self.result.databases
+        })
+        db_ids = [x for x in db_ids if x is not None]
+        if not db_ids or not any(expected.values()):
+            return {k: 0 for k in expected}
+
+        rows = client.execute_query("""
+            MATCH (d:Database) WHERE d.database_id IN $db_ids
+            WITH count(DISTINCT d) as databases, collect(DISTINCT d.database_id) as ids
+            MATCH (t:Table) WHERE t.database_id IN ids
+            WITH databases, count(DISTINCT t) as tables, ids
+            MATCH (c:Column) WHERE c.database_id IN ids
+            WITH databases, tables, count(DISTINCT c) as columns, ids
+            MATCH (a:Table)-[r:CONNECTS]->(b:Table) WHERE a.database_id IN ids
+            RETURN databases, tables, columns, count(DISTINCT r) as relationships
+        """, {"db_ids": db_ids})
+        actual = rows[0] if rows else {k: 0 for k in expected}
+        failed = [
+            name for name, exp in expected.items()
+            if exp > 0 and actual.get(name, 0) < exp
         ]
-        if failed_entities:
-            raise RuntimeError(f"Neo4j 装载失败：{', '.join(failed_entities)} 未写入")
-        if self.result.concepts:
-            loader.link_concepts_to_tables(self.result.concepts)
-        return {**stats, **loader.get_graph_stats()}
+        if failed:
+            raise RuntimeError(
+                f"Neo4j 装载校验失败：{', '.join(failed)} 写入数量不足"
+                f"（预期 {expected}，实际 {dict(actual)}）"
+            )
+        return {name: actual.get(name, 0) for name in expected}
 
     def run_full_pipeline(self, source_type: Literal["live_db", "offline"] = "live_db",
                           source_config: Optional[Dict] = None,

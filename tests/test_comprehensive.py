@@ -83,7 +83,7 @@ class TestConfig:
             SQL_DIALECT,
         )
         assert MYSQL_PORT == 3306
-        assert MYSQL_DATABASE == 'text2sql_db'
+        assert MYSQL_DATABASE == 'business_db'
         assert 'bolt://' in NEO4J_URI
         assert RETRIEVAL_TOP_K == 5
         assert SQL_DIALECT == 'mysql'
@@ -230,61 +230,116 @@ class TestMySQLClient:
     def setup_method(self):
         if os.getenv("TEXT2SQL_RUN_DB_TESTS") != "1":
             pytest.skip("设置 TEXT2SQL_RUN_DB_TESTS=1 后运行真实 MySQL 集成测试")
-    
+        # 播种夹具元数据：table_schema/column_schema 由知识库同步流程填充，
+        # 独立运行本测试文件时可能为空，这里自带最小数据集并在 teardown 清理
+        self._seeded_tables = []
+        client = self._make_client()
+        client.connect()
+        try:
+            fixtures = {
+                'users': ['id', 'name', 'created_at'],
+                'orders': ['id', 'user_id', 'amount'],
+                'products': ['id', 'title', 'price'],
+            }
+            for table_name, columns in fixtures.items():
+                exists = client.execute_query(
+                    "SELECT id FROM table_schema WHERE table_name = :t",
+                    {'t': table_name})
+                if exists:
+                    continue  # 已有真实数据，不覆盖、也不清理
+                client.upsert_table_schema(table_name, '集成测试夹具表')
+                for col in columns:
+                    client.upsert_column_schema(table_name, col, 'VARCHAR')
+                self._seeded_tables.append(table_name)
+        finally:
+            client.close()
+
+    def teardown_method(self):
+        # 只清理本测试播种的夹具行，保持业务库干净
+        seeded = getattr(self, '_seeded_tables', None)
+        if not seeded:
+            return
+        client = self._make_client()
+        client.connect()
+        try:
+            for table_name in seeded:
+                rows = client.execute_query(
+                    "SELECT id FROM table_schema WHERE table_name = :t",
+                    {'t': table_name})
+                if not rows:
+                    continue
+                table_id = rows[0]['id']
+                client.execute_update(
+                    "DELETE FROM column_schema WHERE table_id = :id",
+                    {'id': table_id})
+                client.execute_update(
+                    "DELETE FROM table_schema WHERE id = :id",
+                    {'id': table_id})
+        finally:
+            client.close()
+
+    def _make_client(self):
+        """按项目配置构建 MySQL 客户端（避免硬编码连接串）。"""
+        from config import (MYSQL_HOST, MYSQL_PORT, MYSQL_USER,
+                            MYSQL_PASSWORD, MYSQL_DATABASE)
+        from core.history.mysql_client import MySQLClient
+        return MySQLClient(MYSQL_HOST, MYSQL_PORT, MYSQL_USER,
+                           MYSQL_PASSWORD, MYSQL_DATABASE)
+
     def test_21_mysql_connect(self):
         """测试 21: MySQL 连接"""
-        from core.history.mysql_client import MySQLClient
-        client = MySQLClient('localhost', 3306, 'root', 'root', 'text2sql_db')
+        client = self._make_client()
         assert client.connect()
         client.close()
-        
+
     def test_22_mysql_get_statistics(self):
         """测试 22: 获取数据库统计"""
-        from core.history.mysql_client import MySQLClient
-        client = MySQLClient('localhost', 3306, 'root', 'root', 'text2sql_db')
+        client = self._make_client()
         client.connect()
         stats = client.get_statistics()
         assert 'total_history' in stats
         assert 'total_tables' in stats
         assert stats['total_tables'] >= 3
         client.close()
-        
+
     def test_23_mysql_get_table_schema(self):
         """测试 23: 获取表结构"""
-        from core.history.mysql_client import MySQLClient
-        client = MySQLClient('localhost', 3306, 'root', 'root', 'text2sql_db')
+        client = self._make_client()
         client.connect()
         tables = client.get_table_schema()
         assert len(tables) >= 3
         client.close()
-        
+
     def test_24_mysql_get_column_schema(self):
         """测试 24: 获取字段结构"""
-        from core.history.mysql_client import MySQLClient
-        client = MySQLClient('localhost', 3306, 'root', 'root', 'text2sql_db')
+        client = self._make_client()
         client.connect()
         columns = client.get_column_schema('users')
         assert len(columns) >= 3
         client.close()
-        
+
     def test_25_mysql_save_history(self):
-        """测试 25: 保存 SQL 历史"""
-        from core.history.mysql_client import MySQLClient
-        client = MySQLClient('localhost', 3306, 'root', 'root', 'text2sql_db')
+        """测试 25: 保存 SQL 历史（写后清理，避免污染真实库）"""
+        client = self._make_client()
         client.connect()
         history_id = client.save_sql_history(
-            user_query='测试查询',
+            user_query='集成测试写入-可清理',
             generated_sql='SELECT * FROM users',
             validation_status='pass'
         )
         assert history_id is not None
         assert history_id > 0
+        # 清理测试写入的记录，保持业务库干净
+        client.execute_update(
+            "DELETE FROM sql_generation_history WHERE id = :id",
+            {'id': history_id},
+            raise_on_error=True,
+        )
         client.close()
-        
+
     def test_26_mysql_get_history(self):
         """测试 26: 获取历史记录"""
-        from core.history.mysql_client import MySQLClient
-        client = MySQLClient('localhost', 3306, 'root', 'root', 'text2sql_db')
+        client = self._make_client()
         client.connect()
         history = client.get_history_list(limit=10)
         assert isinstance(history, list)

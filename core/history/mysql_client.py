@@ -51,6 +51,120 @@ _HISTORY_GOVERNANCE_COLUMNS = (
 _GOVERNED_FEW_SHOT_INDEX = "idx_governed_few_shot"
 _DUPLICATE_SCHEMA_CHANGE_CODES = frozenset((1060, 1061))
 
+# 管理表的幂等建表语句：连接成功后自动确保存在，
+# 避免手工执行 schema.sql 的部署门槛（与新库指向如 business_db 时历史功能直接可用）。
+_MANAGEMENT_TABLE_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS sql_generation_history (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        session_id VARCHAR(64) COMMENT '会话 ID',
+        user_query TEXT NOT NULL COMMENT '用户自然语言查询',
+        generated_sql TEXT COMMENT '生成的 SQL 语句',
+        sql_dialect VARCHAR(50) DEFAULT 'mysql' COMMENT 'SQL 方言',
+        semantic_datasource VARCHAR(191) NULL COMMENT '语义治理数据源',
+        semantic_dialect VARCHAR(32) NULL COMMENT '语义治理 SQL 方言',
+        semantic_version VARCHAR(64) NULL COMMENT '语义模型版本',
+        semantic_content_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL
+            COMMENT '语义快照内容 SHA-256',
+        governance_validated TINYINT(1) NOT NULL DEFAULT 0
+            COMMENT '是否通过语义治理校验',
+        validation_status VARCHAR(20) DEFAULT 'pending' COMMENT '验证状态：pending/pass/fail',
+        validation_error TEXT COMMENT '验证错误信息',
+        execution_status VARCHAR(20) DEFAULT 'pending' COMMENT '执行状态：pending/success/fail',
+        execution_error TEXT COMMENT '执行错误信息',
+        execution_result JSON COMMENT '执行结果 (脱敏)',
+        matched_knowledge JSON COMMENT '匹配的知识节点 (JSON)',
+        retrieval_query TEXT COMMENT '检索使用的查询向量',
+        feedback_score TINYINT COMMENT '用户反馈评分 (1-5)',
+        feedback_comment TEXT COMMENT '用户反馈备注',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_session (session_id),
+        INDEX idx_created_at (created_at),
+        INDEX idx_validation_status (validation_status),
+        INDEX idx_execution_status (execution_status),
+        INDEX idx_governed_few_shot (
+            governance_validated, semantic_datasource, semantic_dialect,
+            semantic_version, semantic_content_sha256,
+            validation_status, execution_status, created_at
+        )
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    COMMENT='SQL 生成历史表'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS user_feedback (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        history_id BIGINT NOT NULL COMMENT '关联的历史记录 ID',
+        feedback_type VARCHAR(20) NOT NULL COMMENT '反馈类型: like/dislike',
+        feedback_content TEXT COMMENT '反馈内容',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (history_id) REFERENCES sql_generation_history(id) ON DELETE CASCADE,
+        INDEX idx_history_id (history_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    COMMENT='用户反馈表'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS table_schema (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        table_name VARCHAR(255) NOT NULL COMMENT '表名',
+        table_comment VARCHAR(500) COMMENT '表注释',
+        properties JSON COMMENT '扩展属性 (JSON 格式)',
+        database_name VARCHAR(100) DEFAULT 'text2sql_db' COMMENT '数据库名',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY uk_table_name (table_name, database_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    COMMENT='数据表信息表'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS column_schema (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        table_id BIGINT NOT NULL COMMENT '关联的表 ID',
+        column_name VARCHAR(255) NOT NULL COMMENT '字段名',
+        column_type VARCHAR(100) NOT NULL COMMENT '字段类型',
+        is_nullable TINYINT DEFAULT 1 COMMENT '是否可为空',
+        is_primary_key TINYINT DEFAULT 0 COMMENT '是否主键',
+        column_comment VARCHAR(500) COMMENT '字段注释',
+        default_value VARCHAR(255) COMMENT '默认值',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_table_id (table_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    COMMENT='字段信息表'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS knowledge_metadata (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        node_id VARCHAR(255) NOT NULL COMMENT 'Neo4j 节点 ID',
+        node_type VARCHAR(100) NOT NULL COMMENT '节点类型 (表/字段/业务概念)',
+        node_label VARCHAR(255) NOT NULL COMMENT '节点标签/名称',
+        description TEXT COMMENT '节点描述',
+        properties JSON COMMENT '节点属性 (JSON 格式)',
+        related_tables VARCHAR(500) COMMENT '关联的数据表',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_node_type (node_type),
+        INDEX idx_node_label (node_label),
+        INDEX idx_related_tables (related_tables)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    COMMENT='知识库元数据表'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS retrieval_terms (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        term VARCHAR(255) NOT NULL COMMENT '检索词',
+        node_id VARCHAR(255) NOT NULL COMMENT '关联节点 ID',
+        term_type VARCHAR(50) COMMENT '词类型: table/column/concept',
+        weight FLOAT DEFAULT 1.0 COMMENT '权重',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_term (term),
+        INDEX idx_node_id (node_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    COMMENT='检索词表'
+    """,
+)
+
 
 class MySQLClient:
     """MySQL 数据库客户端 - 使用 SQLAlchemy 连接池"""
@@ -118,7 +232,9 @@ class MySQLClient:
             # 验证连接
             with self.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
+            self._ensure_management_tables()
             self._migrate_history_schema()
+            self._migrate_table_schema()
             logger.info(
                 "MySQL 连接池初始化成功：endpoint_id={}, port={}, "
                 "pool_size={}, max_overflow={}",
@@ -140,6 +256,11 @@ class MySQLClient:
                         "mysql_connect_cleanup", cleanup_exc, level="warning"
                     )
             return False
+
+    def _ensure_management_tables(self) -> None:
+        """幂等创建应用管理表，使新指向的数据库无需手工执行 schema.sql。"""
+        for statement in _MANAGEMENT_TABLE_DDL:
+            self.execute_update(statement, raise_on_error=True)
 
     def _migrate_history_schema(self) -> None:
         """Idempotently add governed-history identity columns to an existing table."""
@@ -185,6 +306,28 @@ class MySQLClient:
                  semantic_version, semantic_content_sha256,
                  validation_status, execution_status, created_at)
                 """,
+            )
+
+    def _migrate_table_schema(self) -> None:
+        """为已存在的 table_schema 表幂等补齐 properties 列（旧库缺该列会导致 upsert 静默失败）。"""
+        column_rows = self.execute_query(
+            """
+            SELECT COLUMN_NAME AS column_name
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = :database_name
+              AND TABLE_NAME = 'table_schema'
+            """,
+            {"database_name": self.database},
+            raise_on_error=True,
+        )
+        existing_columns = {
+            row.get("column_name") for row in column_rows if row.get("column_name")
+        }
+        if "properties" not in existing_columns:
+            self._apply_history_schema_change(
+                "ALTER TABLE table_schema "
+                "ADD COLUMN properties JSON COMMENT '扩展属性 (JSON 格式)' "
+                "AFTER table_comment"
             )
 
     def _apply_history_schema_change(self, query: str) -> None:
@@ -384,7 +527,9 @@ class MySQLClient:
             "table_comment": table_comment,
             "properties": json.dumps(properties) if properties else None
         }
-        result = self.execute_update(query, params)
+        # raise_on_error=True：写失败必须显式抛错，
+        # 否则返回 0 会被 >= 0 吞掉，造成同步静默丢失
+        result = self.execute_update(query, params, raise_on_error=True)
         return result >= 0
 
     def upsert_column_schema(self, table_name: str, column_name: str,
@@ -433,7 +578,7 @@ class MySQLClient:
             "is_nullable": 1 if is_nullable else 0,
             "is_primary_key": 1 if is_primary_key else 0
         }
-        result = self.execute_update(query, params)
+        result = self.execute_update(query, params, raise_on_error=True)
         return result >= 0
 
     def save_sql_history(self, user_query: str, generated_sql: str,
@@ -757,7 +902,7 @@ class MySQLClient:
             params["generated_sql"] = generated_sql
         if expected_user_query is not None:
             params["expected_user_query"] = expected_user_query
-        result = self.execute_update(query, params)
+        result = self.execute_update(query, params, raise_on_error=True)
         return result > 0
 
     def get_history_list(self, session_id: Optional[str] = None,
@@ -958,7 +1103,8 @@ class MySQLClient:
         if feedback_score:
             self.execute_update(
                 "UPDATE sql_generation_history SET feedback_score = :feedback_score WHERE id = :history_id",
-                {"feedback_score": feedback_score, "history_id": history_id}
+                {"feedback_score": feedback_score, "history_id": history_id},
+                raise_on_error=True,
             )
 
         query = """
@@ -973,7 +1119,7 @@ class MySQLClient:
             "feedback_comment": feedback_comment,
             "corrected_sql": corrected_sql
         }
-        result = self.execute_update(query, params)
+        result = self.execute_update(query, params, raise_on_error=True)
         return result > 0
 
     def get_statistics(self) -> Dict:

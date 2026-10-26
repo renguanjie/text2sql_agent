@@ -12,6 +12,10 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
+# 品牌资源
+LOGO_PATH = project_root / "assets" / "logo.png"
+LOGO_ICON_PATH = project_root / "assets" / "logo_icon.png"
+
 from config import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
     LLM_API_KEY, LLM_MODEL, LLM_BASE_URL,
@@ -23,8 +27,8 @@ from sqlalchemy import create_engine, text
 
 # ==================== 页面配置 ====================
 st.set_page_config(
-    page_title="Text2SQL 智能体 - Neon 版",
-    page_icon="📊",
+    page_title="溯算编程 · Text2SQL 智能体 - Neon 版",
+    page_icon=str(LOGO_ICON_PATH),
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -81,6 +85,8 @@ if 'neon_engine' not in st.session_state:
 
 # ==================== 侧边栏 ====================
 with st.sidebar:
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), width=160)
     st.title("⚙️ 配置")
 
     # 数据库配置
@@ -167,7 +173,7 @@ with st.sidebar:
                     st.info(f"结果：{item['result']}")
 
 # ==================== 主页面 ====================
-st.markdown('<h1 class="main-title">📊 Text2SQL 智能体 - Neon 版</h1>', unsafe_allow_html=True)
+st.markdown('<h1 class="main-title">溯算编程 · Text2SQL 智能体 - Neon 版</h1>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">基于阿里云 Qwen-Max + Neo4j 知识库的 SQL 智能生成系统</p>', unsafe_allow_html=True)
 
 # ==================== 功能选择 ====================
@@ -325,7 +331,7 @@ with tab3:
     st.header("ℹ️ 关于")
 
     st.markdown("""
-    ### Text2SQL 智能体 - Neon 版
+    ### 溯算编程 · Text2SQL 智能体 - Neon 版
 
     这是一个基于阿里云 Qwen-Max 大模型和 Neo4j 知识库的 SQL 智能生成系统。
 
@@ -369,4 +375,4 @@ with tab3:
 
 # ==================== Footer ====================
 st.divider()
-st.caption("Text2SQL 智能体 - Neon 版 | 基于阿里云 Qwen-Max + Neo4j 知识库")
+st.caption("溯算编程 · Text2SQL 智能体 - Neon 版 | 基于阿里云 Qwen-Max + Neo4j 知识库 | © 2026 溯算编程")

@@ -51,7 +51,7 @@ NEO4J_CONNECTION_TIMEOUT = parse_env_int("NEO4J_CONNECTION_TIMEOUT", 30)  # 连�
 # ==================== LangChain 配置 ====================
 # LLM 模型配置 (支持 OpenAI、本地模型等)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama")
-LLM_MODEL = os.getenv("LLM_MODEL", "gemma3:e4b")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:E4B")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")  # 可选，用于本地模型或代理
 
