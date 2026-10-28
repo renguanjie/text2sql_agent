@@ -713,9 +713,63 @@ def _render_model_config_panel():
 
 
 # ==================== 侧边栏 ====================
+def _render_sidebar_logo() -> None:
+    """侧栏品牌 logo：点击放大全屏，再点击缩小。
+
+    用 components.html（同源 iframe）实现：Streamlit 的 st.markdown 会
+    剥掉内联事件属性且 <script> 不执行，iframe 内不受此限；通过
+    window.frameElement 把 iframe 自身撑满视口来模拟全屏。
+    """
+    import base64
+
+    import streamlit.components.v1 as components
+
+    data = base64.b64encode(LOGO_PATH.read_bytes()).decode()
+    full_path = project_root / "assets" / "logo_full.png"
+    data_full = (
+        base64.b64encode(full_path.read_bytes()).decode()
+        if full_path.exists() else data
+    )
+    components.html(
+        f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+html,body{{margin:0;padding:0;background:transparent;}}
+#ss-logo{{width:160px;cursor:zoom-in;display:block;}}
+</style></head><body>
+<img id="ss-logo" src="data:image/png;base64,{data}" title="点击放大" alt="溯算编程"/>
+<script>
+(function () {{
+  var img = document.getElementById('ss-logo');
+  var frame = window.frameElement;
+  var saved = frame.getAttribute('style') || '';
+  var big = false;
+  img.onclick = function () {{
+    big = !big;
+    if (big) {{
+      frame.style.cssText =
+        'position:fixed;inset:0;width:100vw;height:100vh;z-index:999999;border:0;';
+      document.body.style.background = 'rgba(15,17,26,.88)';
+      img.src = 'data:image/png;base64,{data_full}';
+      // 原图 1312×1199，按视口等比放大到 92%
+      img.style.cssText =
+        'width:min(92vw, 100.7vh);height:auto;cursor:zoom-out;position:absolute;' +
+        'top:50%;left:50%;transform:translate(-50%,-50%);';
+    }} else {{
+      frame.style.cssText = saved;
+      document.body.style.background = 'transparent';
+      img.src = 'data:image/png;base64,{data}';
+      img.style.cssText = 'width:160px;cursor:zoom-in;display:block;';
+    }}
+  }};
+}})();
+</script>
+</body></html>""",
+        height=152,
+    )
+
+
 with st.sidebar:
     if LOGO_PATH.exists():
-        st.image(str(LOGO_PATH), width=160)
+        _render_sidebar_logo()
     st.markdown(icon_header("控制中心", "settings", level=1, size=22), unsafe_allow_html=True)
 
     # 系统状态卡片

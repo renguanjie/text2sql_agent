@@ -65,6 +65,12 @@
 - `fix(mysql)`：其余 4 处 `execute_update` 失败静默写法统一改 `raise_on_error=True`
   （`upsert_column_schema`、`update_sql_execution`、`save_feedback`×2、
   `generator.fix_sql` 历史更新），写失败立即显式报错。
+- `feat(ui)`：侧栏品牌 logo 换新（`assets/logo.png` 缩至 480 宽，
+  `assets/logo_icon.png` 由新图徽标区重裁 128×128 页签图标，
+  `assets/logo_full.png` 保留全分辨率原图）；
+  透明底（RGBA）处理，侧栏白底正常融合；
+  logo 点击放大全屏、再点击缩小（components.html 同源 iframe
+  内通过 frameElement 撑满视口实现，全屏态用全分辨率图）。
 - `fix(ui)`：侧栏知识库统计 Cypher 把关系与节点行做笛卡尔积
   （`OPTIONAL MATCH ()-[r]-()` 未绑定节点），显示值 = 节点数 × 关系数；
   改为 `OPTIONAL MATCH (n)-[r]-()` + `count(DISTINCT r)`，
