@@ -5,6 +5,21 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased] - 2026-10-29
+
+### Fixed
+
+- **图谱状态页"关系边"恒为 0**（`app/pages/kg_builder.py`）
+  统计 Cypher 只匹配 `[r:CONNECTS]` 一种关系类型，而实际装载产生的是
+  `HAS_TABLE` / `HAS_COLUMN`，导致关系边计数永远显示 0。
+  修复：改为统计所有关系类型 `()-[r]->()`。
+
+### Docs
+
+- README 新增"功能展示"小节：自然语言查询全链路、查询输入、执行历史、
+  知识图谱构建、Neo4j 图谱状态、系统信息共 6 张真实运行截图
+  （`docs/screenshots/`）。
+
 ## [Unreleased] - 2026-10-25
 
 ### Fixed

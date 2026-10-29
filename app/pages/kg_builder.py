@@ -325,7 +325,7 @@ def render_graph_builder():
                     OPTIONAL MATCH (t:Table)
                     OPTIONAL MATCH (c:Column)
                     OPTIONAL MATCH (bc:BusinessConcept)
-                    OPTIONAL MATCH ()-[r:CONNECTS]->()
+                    OPTIONAL MATCH ()-[r]->()
                     RETURN
                       count(distinct d) as databases,
                       count(distinct t) as tables,

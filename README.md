@@ -11,6 +11,32 @@
 > **最新版本**: v1.4
 > **核心升级**: 多模型 UI 热切换 + 安全加固 + SQL 注入防护 + 全链路代码质量优化
 
+## 📸 功能展示
+
+**自然语言查询全链路** — 输入"查询所有黑名单用户及其加入时间"，自动生成 SQL 并执行返回结果：
+
+![自然语言查询全链路](docs/screenshots/main-query-flow.png)
+
+**查询输入界面** — 数据库选择、自然语言输入框与示例查询卡片：
+
+![查询输入界面](docs/screenshots/query-input.png)
+
+**执行历史** — 完整的 SQL 生成/执行历史管理，支持复用、复制、删除与一键提取 JOIN 关系增强知识图谱：
+
+![执行历史](docs/screenshots/execution-history.png)
+
+**知识图谱构建** — 支持 DDL/JSON 文件与活体数据库两种构建方式，含 AI 语义增强：
+
+![知识图谱构建](docs/screenshots/kg-builder.png)
+
+**Neo4j 图谱状态** — 实时统计数据库/表/字段/关系边规模与节点分布：
+
+![图谱状态](docs/screenshots/graph-status.png)
+
+**系统信息** — LLM / Embedding 配置、数据库连接状态、混合检索与语义治理一览：
+
+![系统信息](docs/screenshots/system-info.png)
+
 ## 🎯 功能特性
 
 ### 核心功能
